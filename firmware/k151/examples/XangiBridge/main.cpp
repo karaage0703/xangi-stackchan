@@ -38,8 +38,10 @@
 //     DEFAULT_BAUD と一致)。
 
 #include <Avatar.h>
+#include <M5CoreS3.h>
 #include <M5Unified.h>
 #include <Preferences.h>
+#include <esp_camera.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <stdint.h>
@@ -59,6 +61,8 @@ constexpr uint32_t WAV_CHUNK_TIMEOUT_MS = 2000;  // 1 chunk 到着までの最�
 constexpr uint32_t PLAY_POLL_INTERVAL_MS = 50;
 constexpr uint32_t MOUTH_UPDATE_MS   = 80;       // 口パク更新間隔
 constexpr int      WAV_QUEUE_SIZE    = 4;        // WAV キュー slot 数 (ring buffer)
+constexpr uint8_t  JPEG_QUALITY      = 80;       // CAPTURE で frame2jpg に渡す品質 (0-100)
+constexpr size_t   MAX_JPEG_BYTES    = 256 * 1024;  // 想定上限 (320x240 RGB565→JPEG はせいぜい 30KB)
 
 // CoreS3 の UART1 ピン (docs/scservo_protocol.md §1)
 constexpr int8_t SERVO_RX_PIN = 7;
@@ -74,6 +78,7 @@ constexpr uint16_t MOVE_GOAL_TIME_MS = 500;  // setAngle 既定の移動時間
 static uint8_t g_volume = 128;
 static bool    g_servo_ready  = false;
 static bool    g_servo_torque = false;
+static bool    g_camera_ready = false;
 
 enum class State { Booting, Ready, Receiving, Playing, Error };
 static State g_state = State::Booting;
@@ -266,13 +271,89 @@ static void sendAckUnsupported(const char* cmd) {
 // === コマンド処理 ============================================================
 
 static void handleStatus() {
-    Serial.printf("{\"state\":\"%s\",\"volume\":%u,\"version\":\"xangi-bridge-0.4\","
-                  "\"servo\":%s,\"torque\":%s,\"queued\":%d,\"playing\":%s}\n",
+    Serial.printf("{\"state\":\"%s\",\"volume\":%u,\"version\":\"xangi-bridge-0.5\","
+                  "\"servo\":%s,\"torque\":%s,\"camera\":%s,\"queued\":%d,\"playing\":%s}\n",
                   stateStr(g_state), g_volume,
                   g_servo_ready  ? "true" : "false",
                   g_servo_torque ? "true" : "false",
+                  g_camera_ready ? "true" : "false",
                   wavQueueCount(),
                   g_wav_playing ? "true" : "false");
+}
+
+// CAPTURE\n
+// CoreS3 内蔵 GC0308 カメラで 1 フレーム取得 → frame2jpg で JPEG 化 → シリアル送信。
+// プロトコル (詳細は docs/xangi_bridge_protocol.md):
+//   ホスト送信:  CAPTURE\n
+//   ファーム応答 (成功):
+//     IMG:<size>\n
+//     <size bytes JPEG binary>
+//     {"status":"ok","size":N,"format":"jpeg","width":W,"height":H,"captured_at":<ms>}\n
+//   ファーム応答 (失敗):
+//     {"status":"error","error":"..."}\n
+//
+// 注意: GC0308 のデフォルト pixformat は M5CoreS3 ライブラリ実装で RGB565 設定。
+// 320x240 RGB565 = 153600 bytes、JPEG 80 で 5-30KB に圧縮。frame2jpg は ESP-IDF
+// esp32-camera 内蔵のヘルパー。921600bps シリアルなら 30KB JPEG は ~330ms で送信。
+static void handleCapture() {
+    if (!g_camera_ready) {
+        sendAckError("camera not ready");
+        return;
+    }
+
+    avatar.setSpeechText("capturing");
+
+    if (!CoreS3.Camera.get()) {
+        avatar.setSpeechText("");
+        sendAckError("Camera.get failed");
+        return;
+    }
+    camera_fb_t* fb = CoreS3.Camera.fb;
+    if (!fb || !fb->buf || fb->len == 0) {
+        CoreS3.Camera.free();
+        avatar.setSpeechText("");
+        sendAckError("empty frame");
+        return;
+    }
+
+    uint8_t* out_jpg     = nullptr;
+    size_t   out_jpg_len = 0;
+    bool ok = frame2jpg(fb, JPEG_QUALITY, &out_jpg, &out_jpg_len);
+    int width  = fb->width;
+    int height = fb->height;
+    uint32_t captured_at_ms = millis();
+    CoreS3.Camera.free();
+
+    if (!ok || !out_jpg || out_jpg_len == 0) {
+        if (out_jpg) free(out_jpg);
+        avatar.setSpeechText("");
+        sendAckError("frame2jpg failed");
+        return;
+    }
+    if (out_jpg_len > MAX_JPEG_BYTES) {
+        free(out_jpg);
+        avatar.setSpeechText("");
+        sendAckError("jpeg too large");
+        return;
+    }
+
+    // バイナリ送信ヘッダ → JPEG 本体 → ack。ホスト側 (StackchanSerial.capture)
+    // は "IMG:<size>\n" 受けたら <size> bytes バイナリ読み → 行頭が `{` の ack を待つ。
+    Serial.printf("IMG:%u\n", static_cast<unsigned>(out_jpg_len));
+    Serial.flush();
+    // 1 chunk で全部書き出す (256KB 上限なので 921600bps でも数百 ms)。
+    Serial.write(out_jpg, out_jpg_len);
+    Serial.flush();
+    free(out_jpg);
+
+    char extra[160];
+    snprintf(extra, sizeof(extra),
+             "\"size\":%u,\"format\":\"jpeg\",\"width\":%d,\"height\":%d,\"captured_at\":%lu",
+             static_cast<unsigned>(out_jpg_len), width, height,
+             static_cast<unsigned long>(captured_at_ms));
+    sendAckOk(extra);
+
+    avatar.setSpeechText("");
 }
 
 static void handleVolume(const char* arg) {
@@ -548,6 +629,9 @@ static void pollSerialCommand() {
             else if (strncmp(g_line, "MOVE:", 5) == 0) {
                 handleMove(g_line + 5);
             }
+            else if (strcmp(g_line, "CAPTURE") == 0) {
+                handleCapture();
+            }
             else {
                 Serial.printf("{\"status\":\"error\",\"error\":\"unknown command\",\"line\":\"%s\"}\n",
                               g_line);
@@ -604,6 +688,17 @@ void setup() {
         avatar.setSpeechText("no servo");
         Serial.println("[bridge] servo init failed, MOVE will return error");
         delay(800);  // ユーザに状態を見せる
+    }
+
+    // CoreS3 内蔵カメラ (GC0308) 初期化。失敗しても WAV/FACE/MOVE は引き続き
+    // 動く (graceful degradation: CAPTURE のみ unavailable 応答)。M5CoreS3
+    // ライブラリが GC0308 のデフォルト pixformat (RGB565) / 解像度 / I2C 初期化
+    // を内部で行う。Camera.begin() は esp_camera_init() を呼び失敗時 false を返す。
+    g_camera_ready = CoreS3.Camera.begin();
+    Serial.printf("[bridge] camera: %s\n", g_camera_ready ? "ready (GC0308)" : "INIT FAILED");
+    if (!g_camera_ready) {
+        avatar.setSpeechText("no camera");
+        delay(500);
     }
 
     // WAV 再生タスクを core 1 (APP_CPU_NUM) に pin。loop task は core 1 で動く

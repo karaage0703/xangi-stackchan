@@ -1,11 +1,18 @@
 # firmware/k151
 
-M5Stack 公式 StackChan **K151 / K151-R** 用 Arduino (PlatformIO) ファーム。
-xangi の SSE イベントを購読する USB シリアルブリッジと連携する。
+M5Stack CoreS3 系 (K151 / K151-R / CoreS3 単体) + AtomS3R 系 (AtomS3R + Atomic Voice/Echo Base) 用 Arduino (PlatformIO) ファーム。xangi の SSE イベントを購読する USB シリアルブリッジと連携する。
+
+機種ごとに別 example を持つ:
+
+- `examples/XangiBridge/` — CoreS3 系 (K151 / K151-R / CoreS3 単体)、サーボ有無を自動検出、カメラ対応。baud `921600`
+- `examples/AtomVoiceBridge/` — AtomS3R + Atomic Voice Base / Echo Base (ES8311 codec)。サーボ・カメラ非搭載、`MOVE` / `CAPTURE` は unavailable 応答。baud `115200`
+
+両ファームともシリアルプロトコル (STATUS / VOLUME / WAV / FACE) は互換、`STATUS` の `servo` / `camera` フィールドで機種差を識別可能 (graceful degradation 設計)。
 
 ## 依存ライブラリ
 
 - [m5stack/M5Unified](https://github.com/m5stack/M5Unified) (MIT)
+- [m5stack/M5CoreS3](https://github.com/m5stack/M5CoreS3) (MIT) — CoreS3 内蔵カメラ (GC0308) 用、XangiBridge `CAPTURE` 対応
 - `meganetaaan/M5Stack-Avatar` (PIO Registry 名、リポは [stack-chan/m5stack-avatar](https://github.com/stack-chan/m5stack-avatar)) (MIT)
 
 ## ビルド
@@ -82,9 +89,8 @@ pio device monitor
 > ず、画面全体タップ + シリアルだけで完結する。
 
 > **注**: `M5.Speaker.playWav` は `M5Unified` 内部で WAV ヘッダを parse する。
-> 16bit / mono / 16kHz は piper / VOICEVOX 出力と同じ形式で、旧 stackchan-atama
-> 試作で実機再生実績がある最も保守的な組合せ。Step D で外部受信した WAV も
-> この形式で揃える前提。
+> 16bit / mono / 16kHz は piper / VOICEVOX 出力と同じ形式で、実機再生実績がある
+> 最も保守的な組合せ。Step D で外部受信した WAV もこの形式で揃える前提。
 
 ### XangiBridge (xangi シリアル経由 WAV 再生 + Avatar + サーボ)
 
@@ -120,6 +126,34 @@ uv run python scripts/test_xangi_bridge.py --port /dev/ttyACM0
 Python 側は `src/xangi_stackchan/stackchan.py` の `StackchanSerial` がそのまま
 使える (ボーレート 921600 一致、`send_wav` のチャンク 1024B / chunk_delay 5ms
 シーケンスと整合)。
+
+### AtomVoiceBridge (AtomS3R + Atomic Voice/Echo Base 用)
+
+M5Stack AtomS3R + Atomic Voice Base / Atomic Echo Base を xangi シリアル経由
+音声出力デバイスとして動かす受信ファーム。XangiBridge プロトコルと互換だが、
+ハードウェア構成上の制約で `MOVE` / `CAPTURE` は unavailable 応答に降格する
+graceful degradation 版。
+
+- ES8311 audio codec の初期化は `cfg.external_speaker.atomic_echo = true` で
+  M5Unified が自動 (Atomic Voice Base / Echo Base 共通の I2S 配線
+  G5=SDIN, G6=LRCK, G7=ASDOUT, G8=SCLK, G39=SCL, G38=SDA)
+- AtomS3R LCD 128×128 で Avatar を scale 0.5 + position 調整して表示
+- サーボ無し → `STATUS` の `servo: false`、`MOVE` → `servo not available`
+- カメラ無し → `STATUS` の `camera: false`、`CAPTURE` → `camera not available`
+- Serial baud は **115200** (AtomS3R USB-CDC 安定値、stackchan-atama リポ準拠)
+
+```bash
+pio run -e m5stack-atoms3r-atom-voice-bridge -t upload
+# Python 側からテスト:
+uv run python scripts/test_xangi_bridge.py --port /dev/stackchan --baud 115200
+```
+
+xangi-stackchan 常駐起動時は `--baud 115200` 指定が必要 (CoreS3 系 XangiBridge は
+921600)。設定 UI / config.json の `baud` でも切替可能。Atomic Voice Base /
+Atomic Echo Base はマイク + スピーカー一体型の同系 ES8311 製品なので、本ファーム
+ではマイク機能は使わず再生のみ。NS4150B class D amp の過変調防止のため、
+初期音量は 192 に設定 (`g_volume = ATOMIC_ECHO_VOLUME`、必要に応じて `VOLUME:` で
+上書き)。
 
 ### SetAngleDemo (yaw 中央移動 + ±30° スイープ)
 

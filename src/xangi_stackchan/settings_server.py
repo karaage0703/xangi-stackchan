@@ -110,6 +110,43 @@ def render_page(state: RuntimeState) -> str:
     </fieldset>
     <button type="submit">ダンスデモを実行</button>
   </form>
+  <fieldset style="margin-top: 32px;">
+    <legend>camera (Phase 1A: snapshot + monitor)</legend>
+    <p class="hint">CoreS3 内蔵 GC0308 カメラから JPEG 1 枚取得して表示する。撮影中はデバイスのアバターに「capturing」が出る。</p>
+    <div style="display:flex; gap:16px; align-items:flex-start;">
+      <img id="camera-preview" src="/api/camera/snapshot.jpg" alt="snapshot"
+           style="max-width:320px; border:1px solid #c9c0b0; border-radius:10px; background:#000;"
+           onerror="this.alt='no snapshot yet';">
+      <div>
+        <button type="button" id="camera-shutter" style="margin-bottom:8px;">スナップショット</button>
+        <pre id="camera-status" style="background:#eee4d2; padding:8px; border-radius:8px; max-width:380px; white-space:pre-wrap;">(no capture yet)</pre>
+      </div>
+    </div>
+  </fieldset>
+  <script>
+    (function() {{
+      const shutter = document.getElementById('camera-shutter');
+      const preview = document.getElementById('camera-preview');
+      const status = document.getElementById('camera-status');
+      if (!shutter) return;
+      shutter.addEventListener('click', async () => {{
+        shutter.disabled = true;
+        const t0 = Date.now();
+        try {{
+          const resp = await fetch('/api/camera/capture', {{ method: 'POST' }});
+          const meta = await resp.json();
+          status.textContent = JSON.stringify(meta, null, 2) + '\\n(client elapsed: ' + (Date.now() - t0) + 'ms)';
+          if (meta.status === 'ok') {{
+            preview.src = '/api/camera/snapshot.jpg?_=' + Date.now();
+          }}
+        }} catch (e) {{
+          status.textContent = 'fetch error: ' + e;
+        }} finally {{
+          shutter.disabled = false;
+        }}
+      }});
+    }})();
+  </script>
 </body>
 </html>"""
 
@@ -120,6 +157,28 @@ def _flatten_form(raw: bytes) -> dict[str, object]:
     data["wifi"] = "wifi" in parsed
     data["move_enabled"] = "move_enabled" in parsed
     return data
+
+
+def _execute_capture(state: RuntimeState) -> dict[str, object]:
+    """Phase 1A: backend.capture() を叩いて結果を RuntimeState にキャッシュ。
+
+    Returns: capture() の結果 dict (image_jpeg を除いた snapshot メタデータ)。
+             成功時は state.set_last_capture() で内部キャッシュも更新する。
+    """
+    backend, _ = state.get_runtime()
+    if backend is None:
+        return {"status": "error", "error": "runtime not ready"}
+    if not hasattr(backend, "capture"):
+        return {"status": "error", "error": "backend does not support capture"}
+    try:
+        result = backend.capture()
+    except Exception as exc:
+        return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+
+    if result.get("status") == "ok" and isinstance(result.get("image_jpeg"), (bytes, bytearray)):
+        # キャッシュ用に dict をコピー (image_jpeg は重いのでそのまま渡す = 同一参照)
+        state.set_last_capture(dict(result))
+    return result
 
 
 def _execute_demo(state: RuntimeState, payload: dict[str, object]) -> dict[str, object]:
@@ -178,6 +237,38 @@ def make_handler(state: RuntimeState):
             if self.path in {"/", "/settings"}:
                 self._send(200, render_page(state).encode(), "text/html; charset=utf-8")
                 return
+            # /api/camera/snapshot.jpg は ?force=1 でデバイスから新規取得、
+            # 省略時はキャッシュから返す (キャッシュ無しなら自動でデバイス取得)。
+            if self.path.startswith("/api/camera/snapshot.jpg"):
+                force = "force=1" in self.path
+                cached = state.get_last_capture() if not force else None
+                if cached is None:
+                    result = _execute_capture(state)
+                    if result.get("status") != "ok" or not isinstance(
+                        result.get("image_jpeg"), (bytes, bytearray)
+                    ):
+                        body = json.dumps(result, ensure_ascii=False).encode()
+                        self._send(
+                            503 if result.get("error") in {"runtime not ready", "camera not ready"} else 502,
+                            body,
+                            "application/json; charset=utf-8",
+                        )
+                        return
+                    cached = result
+                self._send(200, bytes(cached["image_jpeg"]), "image/jpeg")
+                return
+            if self.path == "/api/camera/status":
+                cached = state.get_last_capture()
+                if cached is None:
+                    payload = {"status": "ok", "last_capture": None}
+                else:
+                    import time as _t
+                    meta = {k: v for k, v in cached.items() if k != "image_jpeg"}
+                    if isinstance(cached.get("captured_at"), (int, float)):
+                        meta["age_ms"] = int((_t.time() - cached["captured_at"]) * 1000)
+                    payload = {"status": "ok", "last_capture": meta}
+                self._send(200, json.dumps(payload, ensure_ascii=False).encode(), "application/json; charset=utf-8")
+                return
             self._send(404, b"not found", "text/plain; charset=utf-8")
 
         def do_POST(self):
@@ -202,6 +293,19 @@ def make_handler(state: RuntimeState):
                 self.send_response(303)
                 self.send_header("Location", "/")
                 self.end_headers()
+                return
+            if self.path == "/api/camera/capture":
+                # Phase 1A: 同期 capture。成功時は image_jpeg を除いたメタを返す。
+                # (画像は別途 GET /api/camera/snapshot.jpg で取りに来る前提)
+                result = _execute_capture(state)
+                meta = {k: v for k, v in result.items() if k != "image_jpeg"}
+                if "size" in meta:
+                    meta["has_image"] = True
+                status = 200 if result.get("status") == "ok" else (
+                    503 if result.get("error") in {"runtime not ready", "camera not ready"} else 502
+                )
+                body = json.dumps(meta, ensure_ascii=False).encode()
+                self._send(status, body, "application/json; charset=utf-8")
                 return
             if self.path == "/api/demo":
                 # CLI / 自動化向け: 同期実行して結果 JSON を返す。

@@ -163,6 +163,133 @@ class StackchanSerial:
                 time.sleep(0.05)
         return {"status": "ok", "size": len(wav_data), "note": "no confirmation received"}
 
+    def capture(self, timeout: float = 5.0) -> dict:
+        """Phase 1A: CAPTURE コマンドで CoreS3 内蔵カメラ (GC0308) から JPEG 1 枚取得。
+
+        プロトコル (詳細は docs/xangi_bridge_protocol.md):
+          ホスト送信:  CAPTURE\n
+          ファーム応答 (成功):
+            IMG:<size>\n
+            <size bytes JPEG binary>
+            {"status":"ok","size":N,"format":"jpeg","width":W,"height":H,
+             "captured_at":<ms>}\n
+          ファーム応答 (失敗):
+            {"status":"error","error":"..."}\n
+
+        返り値: 成功時 {"status":"ok","image_jpeg":bytes,"size":N,"format":"jpeg",
+                       "width":W,"height":H,"captured_at_device_ms":<device millis>,
+                       "captured_at":<host epoch sec, float>}
+                失敗時 {"status":"error","error":"..."}
+
+        シリアル排他: self._lock で他 WAV/MOVE/FACE と直列化。
+        """
+        with self._lock:
+            return self._capture_locked(timeout)
+
+    def _capture_locked(self, timeout: float) -> dict:
+        host_capture_start = time.time()
+        self.drain()
+        self.ser.write(b"CAPTURE\n")
+        self.ser.flush()
+
+        # 1 行目を待つ: "IMG:<size>" or error JSON
+        # in_waiting で来た分だけ読んで自前で行分割 (readline の timeout block 回避)。
+        deadline = time.time() + timeout
+        buf = b""
+        header_size: int | None = None
+        while time.time() < deadline:
+            avail = self.ser.in_waiting
+            if avail > 0:
+                buf += self.ser.read(avail)
+                while b"\n" in buf:
+                    raw_line, buf = buf.split(b"\n", 1)
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    if line.startswith("IMG:"):
+                        try:
+                            header_size = int(line[4:])
+                        except ValueError:
+                            return {"status": "error", "error": f"invalid IMG header: {line}"}
+                        break
+                    if line.startswith("{"):
+                        try:
+                            return json.loads(line)
+                        except json.JSONDecodeError:
+                            return {"status": "error", "error": f"non-json line: {line}"}
+                    # ログ行 (`[bridge] ...`) などは捨てて継続
+                if header_size is not None:
+                    break
+            else:
+                time.sleep(0.02)
+        if header_size is None:
+            return {"status": "error", "error": "no IMG header (timeout)"}
+        if header_size <= 0:
+            return {"status": "error", "error": f"non-positive size: {header_size}"}
+
+        # JPEG 本体 <header_size> bytes 読む。buf に既に取り込み済の余剰があれば
+        # それを使い、不足分のみ追加で read する。
+        # `ser.read(N)` は serial の global timeout (=5s) で block するので、
+        # `in_waiting` で来た分だけ読んで自前で進める (CAPTURE は数百 KB 規模、
+        # ack を待つだけで 5s 消費するのを避ける)。
+        jpeg = buf[:header_size]
+        buf = buf[header_size:]
+        remaining = header_size - len(jpeg)
+        deadline = time.time() + max(timeout, 10.0)
+        while remaining > 0 and time.time() < deadline:
+            avail = self.ser.in_waiting
+            if avail > 0:
+                chunk = self.ser.read(min(remaining, avail, 4096))
+                if chunk:
+                    jpeg += chunk
+                    remaining -= len(chunk)
+            else:
+                time.sleep(0.005)
+        if remaining > 0:
+            return {"status": "error", "error": f"binary recv timeout ({remaining}/{header_size} remaining)"}
+
+        # ack JSON 待ち
+        deadline = time.time() + timeout
+        ack: dict | None = None
+        while ack is None and time.time() < deadline:
+            avail = self.ser.in_waiting
+            if avail > 0:
+                buf += self.ser.read(avail)
+                while b"\n" in buf:
+                    raw_line, buf = buf.split(b"\n", 1)
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line.startswith("{"):
+                        continue
+                    try:
+                        ack = json.loads(line)
+                        break
+                    except json.JSONDecodeError:
+                        continue
+            else:
+                time.sleep(0.02)
+        if ack is None:
+            # ack が来ない場合でも JPEG は取れているので、画像だけ返す (ack の欠落は
+            # 致命ではない)
+            return {
+                "status": "ok",
+                "image_jpeg": jpeg,
+                "size": len(jpeg),
+                "format": "jpeg",
+                "captured_at": host_capture_start,
+                "note": "ack missing",
+            }
+        if ack.get("status") == "error":
+            return ack
+        # 成功 ack に画像本体と host 時刻を載せて返す。ファームが返す `captured_at`
+        # は device millis (起動からの相対時刻) なので、`captured_at_device_ms` に
+        # rename して保持し、`captured_at` は host 側の epoch sec で上書きする。
+        device_ms = ack.pop("captured_at", None)
+        if isinstance(device_ms, (int, float)):
+            ack["captured_at_device_ms"] = int(device_ms)
+        ack["image_jpeg"] = jpeg
+        ack["captured_at"] = host_capture_start
+        return ack
+
 
 class StackchanWifi:
     """WiFi HTTP API backend for stackchan family devices (K151 / stackchan-atama)."""
@@ -201,6 +328,11 @@ class StackchanWifi:
         )
         response.raise_for_status()
         return response.json()
+
+    def capture(self, timeout: float = 5.0) -> dict:
+        # WiFi 経由のカメラ取得は Phase 2 (WiFi MJPEG ストリーム) で実装予定。
+        # Phase 1A は USB シリアル経由のみ。
+        return {"status": "error", "error": "WiFi capture not implemented (Phase 2)"}
 
 
 @dataclass

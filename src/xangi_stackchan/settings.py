@@ -150,6 +150,12 @@ class RuntimeState:
         # send_wav 側の RLock と組み合わせて同時アクセスを直列化する。
         self._backend: object | None = None
         self._piper_process: object | None = None
+        # Phase 1A: 直近の CAPTURE 結果メモリキャッシュ。`/api/camera/snapshot.jpg`
+        # と `/api/camera/status` で参照する。
+        # 形式: {"jpeg": bytes, "captured_at": float (host epoch),
+        #        "width": W, "height": H, "size": N, "error": Optional[str],
+        #        "captured_at_device_ms": Optional[int]}
+        self._last_capture: dict[str, Any] | None = None
 
     def snapshot(self) -> tuple[BridgeConfig, int]:
         with self._lock:
@@ -163,6 +169,14 @@ class RuntimeState:
     def get_runtime(self) -> tuple[object | None, object | None]:
         with self._lock:
             return self._backend, self._piper_process
+
+    def set_last_capture(self, capture: dict[str, Any] | None) -> None:
+        with self._lock:
+            self._last_capture = capture
+
+    def get_last_capture(self) -> dict[str, Any] | None:
+        with self._lock:
+            return self._last_capture
 
     def snapshot_dict(self) -> dict[str, Any]:
         with self._lock:

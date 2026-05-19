@@ -1,21 +1,26 @@
 ---
 name: xs:xangi-stackchan
-description: xangi の SSE イベントを購読してスタックチャン (M5Stack atama / K151 / K151-R) に喋らせ・表情変更・首振りさせる常駐ブリッジを起動・操作するスキル。TTS は piper-plus / VOICEVOX を選択可。設定 UI 経由でランタイム設定変更、ダンスデモ実行、ファーム単体テストにも対応。「xangi の返答をスタックチャンで読ませて」「xangi-stackchan を立ち上げて」「スタックチャン踊らせて」「xangi-stackchan」で使用。
+description: xangi の SSE イベントを購読してスタックチャン (M5Stack CoreS3 / K151 / K151-R) に喋らせ・表情変更・首振りさせる常駐ブリッジを起動・操作するスキル。TTS は piper-plus / VOICEVOX を選択可。設定 UI 経由でランタイム設定変更、ダンスデモ実行、ファーム単体テストにも対応。「xangi の返答をスタックチャンで読ませて」「xangi-stackchan を立ち上げて」「スタックチャン踊らせて」「xangi-stackchan」で使用。
 ---
 
 # xangi-stackchan 制御スキル
 
 xangi の `GET /api/events/stream` を購読して、`turn.started` / `message.delta` / `turn.complete` / `agent.error` に応じてスタックチャンに表情・首振り・音声再生をさせる常駐ブリッジ。
 
-USB シリアルまたは WiFi HTTP API でデバイス側 (atama 機 / K151 機) と通信する。
+USB シリアル経由で M5Stack CoreS3 ベースのデバイスと通信する。
 表示 UI は持たず、デバイスの表情変更と音声再生に集中する。
 
 ## 対応デバイス
 
-- **stackchan-atama** (M5Stack 単体版、サーボなし) — USB / WiFi、ファームは別リポ [`karaage0703/stackchan-atama`](https://github.com/karaage0703/stackchan-atama)
-- **M5Stack 公式 K151 / K151-R** — CoreS3 + サーボ + Remote、`firmware/k151/` の Arduino (PlatformIO) ファームを焼く
+USB シリアル経由で Arduino (PlatformIO) ファームを焼く。
 
-K151 系のみ MOVE (首振り) コマンドが効く。atama 機では MOVE はファーム側でエラー応答が返るだけ。
+| デバイス | ファーム | baud | フル機能 |
+|---------|---------|------|---------|
+| K151 / K151-R (CoreS3 + サーボ + Remote) | `examples/XangiBridge` | 921600 | WAV / FACE / MOVE / CAPTURE |
+| CoreS3 単体 (サーボ無し) | `examples/XangiBridge` | 921600 | WAV / FACE / CAPTURE (MOVE は unavailable) |
+| AtomS3R + Atomic Voice Base / Echo Base | `examples/AtomVoiceBridge` | 115200 | WAV / FACE (MOVE / CAPTURE は unavailable) |
+
+サーボ・カメラ有無は起動時に自動検出、`STATUS` の `servo` / `camera` フィールドで現状取得可。
 
 ## Step 0: 初回セットアップ (piper-plus のバイナリ・モデルが無い場合のみ)
 
@@ -64,19 +69,11 @@ setsid -f bash -c 'cd '"$PWD"' && exec uv run xangi-stackchan \
 
 - `--xangi-url`: 接続先 xangi (既定 `http://127.0.0.1:18888`)
 - `--port`: USB シリアル (udev で `/dev/stackchan` 固定推奨)
-- `--baud`: 115200 (atama) / 921600 (K151 XangiBridge)
-- `--volume`: 0〜255 (既定 255)
+- `--baud`: `921600` (CoreS3 系 XangiBridge) / `115200` (AtomS3R 系 AtomVoiceBridge)
+- `--volume`: 0〜255 (既定 255、AtomS3R + Voice Base は ES8311 過変調防止で 192 以下推奨)
 - `--tts`: `piper` / `voicevox` / `none`
 - `--settings-port`: 設定 UI の port (既定 7897)
 - `--settings-bind`: LAN/Tailscale 公開時は `0.0.0.0`
-
-WiFi モード (atama 機向け):
-
-```bash
-setsid -f bash -c '... uv run xangi-stackchan \
-  --xangi-url http://127.0.0.1:18888 \
-  --wifi --host 192.168.1.6 --volume 200 --tts piper' </dev/null >>/tmp/xangi-stackchan.log 2>&1
-```
 
 ログ確認:
 
@@ -89,10 +86,11 @@ tail -f /tmp/xangi-stackchan.log
 ブラウザで <http://127.0.0.1:7897/> を開くと以下を変更できる。
 
 - xangi URL / thread filter
-- USB / WiFi 接続先・音量
+- USB 接続先・音量
 - TTS 設定 (piper / voicevox / none)
 - 状態ごとの表情 (idle / thinking / talking / error)
-- 首振り (MOVE) 設定 (K151 機のみ)
+- 首振り (MOVE) 設定 (サーボあり機のみ)
+- カメラスナップショット (Phase 1A)
 
 保存すると `~/.xangi/xangi-stackchan/config.json` に永続化し、実行中デーモンにも反映する。xangi URL を変更した場合はストリームを張り直す。
 
@@ -106,6 +104,27 @@ curl -s http://127.0.0.1:7897/api/config | jq
 curl -s -X POST http://127.0.0.1:7897/api/config \
   -H 'Content-Type: application/json' \
   -d '{"volume":180}'
+```
+
+## Step 3.5: カメラスナップショット (Phase 1A)
+
+CoreS3 内蔵 GC0308 カメラから JPEG 1 枚取得し、設定 UI / API で表示する。LLM への
+自動添付は Phase 1B 以降。カメラ初期化に失敗した機種では `camera not ready` 応答。
+
+設定 UI: <http://127.0.0.1:7897/> 末尾の「camera」パネル → スナップショットボタン。
+
+API:
+
+```bash
+# 撮影 + JPEG ダウンロード (キャッシュ更新)
+curl -X POST http://127.0.0.1:7897/api/camera/capture
+curl -o /tmp/snapshot.jpg http://127.0.0.1:7897/api/camera/snapshot.jpg
+
+# 強制再キャプチャ
+curl -o /tmp/snapshot.jpg "http://127.0.0.1:7897/api/camera/snapshot.jpg?force=1"
+
+# メタデータ (age_ms 等)
+curl -s http://127.0.0.1:7897/api/camera/status | jq
 ```
 
 ## Step 4: ダンスデモ (K151 サーボ機のみ)
@@ -193,7 +212,7 @@ xangi-stackchan 側のログで `turn.started` → `turn.complete` の流れと 
 - **常駐ブリッジが xangi に繋がらない**: `--xangi-url` で指定した port が xangi のデフォルト (`18888`) と合っているか / xangi が起動しているか確認
 - **デバイスに音声が届かない**: `pgrep -fa xangi-stackchan` で生きているか、`tail -f /tmp/xangi-stackchan.log` で `send_wav` エラーが出ていないか確認
 - **シリアルポートが掴まれている**: 常駐ブリッジ自身が掴んでいるケース。`pkill -f xangi-stackchan` で落としてから再起動
-- **MOVE が効かない**: atama 機ではサーボ無しなので無効。K151 機の場合は `--no-move-enabled` で OFF にしていないか / 設定 UI で MOVE が有効か確認
+- **MOVE が効かない**: CoreS3 単体 (サーボ無し) では無効、STATUS の `servo: false` で判定可能。サーボあり機の場合は `--no-move-enabled` で OFF にしていないか / 設定 UI で MOVE が有効か確認
 - **発話が遅い**: piper-plus は常駐プロセスなので、初回だけモデルロード。それ以降は低遅延
 
 ## 使用例

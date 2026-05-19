@@ -42,14 +42,26 @@ sudo udevadm trigger
 
 ### 最小起動
 
-USB 接続したスタックチャン (K151 / atama 共通) を動かす最小例。
+USB 接続したデバイスを動かす最小例。ファームと baud rate は機種で異なる:
+
+- **CoreS3 系 (K151 / K151-R / CoreS3 単体)** + XangiBridge: `--baud 921600`
+- **AtomS3R + Atomic Voice/Echo Base** + AtomVoiceBridge: `--baud 115200`
 
 ```bash
+# CoreS3 系
+uv run xangi-stackchan \
+  --xangi-url http://127.0.0.1:18888 \
+  --port /dev/stackchan \
+  --baud 921600 \
+  --volume 200 \
+  --tts piper
+
+# AtomS3R + Voice/Echo Base
 uv run xangi-stackchan \
   --xangi-url http://127.0.0.1:18888 \
   --port /dev/stackchan \
   --baud 115200 \
-  --volume 200 \
+  --volume 192 \
   --tts piper
 ```
 
@@ -65,25 +77,16 @@ UI から以下を変更できる。
 
 - xangi URL
 - thread filter
-- USB / WiFi 接続先
+- USB 接続先
 - 音量
 - TTS 設定
 - 状態ごとの表情
+- 首振り (MOVE) 設定 (サーボあり機のみ)
+- カメラスナップショット (Phase 1A)
 
 保存すると `~/.xangi/xangi-stackchan/config.json` に永続化し、実行中デーモンにも反映する。xangi URL を変更した場合はストリームを張り直す。
 
 設定 UI を LAN / Tailscale 経由でも開きたい場合は `--settings-bind 0.0.0.0` を付ける (既定は `127.0.0.1`)。
-
-### WiFi HTTP API (atama 機向け、K151 は USB 推奨)
-
-```bash
-uv run xangi-stackchan \
-  --xangi-url http://127.0.0.1:18888 \
-  --wifi \
-  --host 192.168.1.6 \
-  --volume 200 \
-  --tts piper
-```
 
 ### 設定 UI を無効化
 
@@ -99,7 +102,7 @@ uv run xangi-stackchan --no-settings-ui ...
 setsid -f bash -c 'cd /path/to/xangi-stackchan && exec uv run xangi-stackchan \
   --xangi-url http://127.0.0.1:18888 \
   --port /dev/stackchan \
-  --baud 115200 \
+  --baud 921600 \
   --volume 200 \
   --tts piper \
   --stackchan-retry-seconds 3 \
@@ -131,8 +134,7 @@ tail -f /tmp/xangi-stackchan.log
 - `--settings-port`: 設定 UI の port (既定 `7897`)
 - `--settings-bind`: 設定 UI の listen アドレス (既定 `127.0.0.1`、LAN/Tailscale 公開時は `0.0.0.0`)
 - `--no-settings-ui`: 設定 UI を起動しない
-- `--wifi --host`: USB ではなく WiFi API を使う (atama 機向け)
-- `--port --baud`: USB serial のポートと baudrate
+- `--port --baud`: USB serial のポートと baudrate (XangiBridge ファーム既定値 `921600`)
 - `--volume`: デバイスの音量 (`0`〜`255`、既定 `255`)
 - `--tts`: `piper`, `voicevox`, `none`
 - `--piper-bin`: piper-plus 実行ファイル (既定 `tools/piper`)
@@ -214,6 +216,41 @@ uv run python scripts/test_xangi_bridge.py --port /dev/stackchan
 ```
 
 STATUS / VOLUME / FACE / MOVE / WAV (440Hz トーン) の往復を 1 ショットで確認する。
+
+### カメラ (Phase 1A: スナップショット + モニタリング)
+
+CoreS3 内蔵 GC0308 カメラから JPEG 1 枚取得し、設定 UI で表示する機能。
+xangi (LLM) への入力連携は Phase 1B (発話時 1 枚自動添付) で別途実装予定。
+
+#### A. 設定 UI から
+
+ブラウザで <http://127.0.0.1:7897/> を開いて末尾の「camera」パネル:
+
+- 「スナップショット」ボタンで 1 枚撮影 → プレビュー画像更新
+- メタデータ (`size` / `width` / `height` / `captured_at`) が JSON で表示
+
+#### B. API 経由 (CLI / 自動化向け)
+
+```bash
+# 撮影 + JPEG ダウンロード
+curl -X POST http://127.0.0.1:7897/api/camera/capture
+curl -o /tmp/snapshot.jpg http://127.0.0.1:7897/api/camera/snapshot.jpg
+
+# キャッシュから取得 (撮影せず最新フレームを取る)
+curl -o /tmp/snapshot.jpg "http://127.0.0.1:7897/api/camera/snapshot.jpg"
+
+# 強制再キャプチャ
+curl -o /tmp/snapshot.jpg "http://127.0.0.1:7897/api/camera/snapshot.jpg?force=1"
+
+# 最終キャプチャのメタ情報 + age_ms
+curl http://127.0.0.1:7897/api/camera/status
+```
+
+#### 制約 (Phase 1A)
+
+- **USB シリアル接続のみ対応**。WiFi MJPEG ストリームは Phase 2 で実装予定
+- **M5Stack CoreS3 系のみ** (K151 / K151-R / CoreS3 単体)。カメラ初期化に失敗した機種では `camera not ready` 応答
+- **オンデマンド撮影** (1 リクエスト 1 枚)。常時ストリーミングは Phase 2
 
 ## トラブルシュート
 

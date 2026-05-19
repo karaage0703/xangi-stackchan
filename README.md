@@ -11,14 +11,21 @@
 - `turn.complete` の最終テキストを piper-plus / VOICEVOX で音声化して再生。再生中は首がささやかに揺れる
 - 完了後は `neutral` 顔 + idle ポーズに戻る
 - `agent.error` では `sad` 顔 + 首を下げる
+- **カメラスナップショット (Phase 1A)**: 内蔵 GC0308 カメラで JPEG 撮影 → 設定 UI / API で表示。LLM 連携は Phase 1B 以降
 
-表示 UI は持たず、デバイスの表情変更と音声再生に集中する。サーボ動作は K151 / K151-R 用 (atama 機はサーボ無しなので MOVE はファーム側エラー応答が返るだけ)。
+表示 UI は持たず、デバイスの表情変更と音声再生に集中する。サーボの有無は起動時に自動判定され、サーボ無しの CoreS3 単体機では MOVE のみ unavailable 応答 (WAV/FACE/CAPTURE は通常動作) する graceful degradation 設計。
 
 ## 対応デバイス
 
-- **stackchan-atama** (M5Stack 単体版、サーボなし) — Python ホストブリッジ経由で USB / WiFi 制御
-  - M5Stack 側のファームは別リポ [`karaage0703/stackchan-atama`](https://github.com/karaage0703/stackchan-atama) を焼く
-- **M5Stack 公式 K151 / K151-R** (CoreS3 + サーボ + Remote) — `firmware/k151/` 配下に Arduino (PlatformIO) ファームを焼いて USB シリアル経由で制御
+USB シリアル経由で Arduino (PlatformIO) ファームを焼く。CoreS3 系は `firmware/k151/examples/XangiBridge/`、AtomS3R 系は `firmware/k151/examples/AtomVoiceBridge/` を使う。両ファームはシリアルプロトコル互換 (STATUS / VOLUME / WAV / FACE)、機種差は graceful degradation で吸収。
+
+| デバイス | ファーム | baud | MOVE | CAPTURE |
+|---------|---------|------|------|---------|
+| M5Stack 公式 K151 / K151-R (CoreS3 + サーボ + Remote) | XangiBridge | 921600 | ✅ | ✅ |
+| M5Stack CoreS3 単体 (サーボ無し) | XangiBridge | 921600 | 🚫 | ✅ |
+| M5Stack AtomS3R + Atomic Voice Base / Echo Base (ES8311) | AtomVoiceBridge | 115200 | 🚫 | 🚫 |
+
+XangiBridge ではサーボ有無は起動時に自動検出、`STATUS` の `servo` フィールドで現状を取得できる。
 
 ## 構成
 
@@ -28,9 +35,9 @@ xangi (:18888)
       └─ xangi-stackchan (host bridge, Python)
           ├─ thread_id filter
           ├─ piper-plus persistent process
-          └─ device (USB serial 共通プロトコル: STATUS / FACE: / WAV:<size> / VOLUME: / MOVE:)
-              ├─ K151 / K151-R    (firmware/k151/、サーボあり)
-              └─ stackchan-atama  (karaage0703/stackchan-atama のファームを焼いた M5Stack 単体機)
+          └─ device (USB serial 共通プロトコル: STATUS / FACE: / WAV:<size> / VOLUME: / MOVE: / CAPTURE)
+              ├─ M5Stack CoreS3 (K151 / K151-R / 単体機、firmware/k151/ XangiBridge、baud 921600)
+              └─ M5Stack AtomS3R + Atomic Voice/Echo Base (firmware/k151/ AtomVoiceBridge、baud 115200)
 ```
 
 ## クイックスタート
@@ -64,7 +71,6 @@ uv run xangi-stackchan \
 
 ## 参考
 
-- [karaage0703/stackchan-atama](https://github.com/karaage0703/stackchan-atama): stackchan-atama (M5Stack 単体版) 用の M5Stack 側ファーム — atama 機を使う場合はこのリポを焼く
 - [m5stack/StackChan](https://github.com/m5stack/StackChan): M5Stack 公式 K151 のリポ (xiaozhi-esp32 ベース、本リポでは仕様情報のみ参照)
 - [stack-chan/stack-chan](https://github.com/stack-chan/stack-chan): 元祖スタックチャン (Apache-2.0、`firmware/k151/` のサーボ制御ロジックの仕様参照元)
 
