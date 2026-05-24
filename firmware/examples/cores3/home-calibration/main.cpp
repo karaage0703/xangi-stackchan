@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 karaage0703
 // SPDX-License-Identifier: MIT
 //
-// firmware/k151 examples/HomeCalibration:
+// firmware/examples/cores3/home-calibration:
 //   K151 のサーボ ゼロ点 (= 真正面・水平の物理姿勢) を ESP32 NVS に保存する。
 //
 // 設計:
@@ -12,7 +12,7 @@
 //   に CalibrationOfs.ino が無いことが根拠)。よって ホスト側 (ESP32 NVS)
 //   で zero raw を保持する D 案を採用する。
 //
-//   通常運用ファーム (src/main.cpp Step B 以降) は起動時に NVS から読んで
+//   通常運用ファーム (src/main.cpp サーボ通信疎通モード以降) は起動時に NVS から読んで
 //   servo.setZero*() に流し、setAngle*() が zero ベースで動くようにする。
 //
 // 動作:
@@ -81,7 +81,7 @@ bool enableServoPower() {
 SCServo servo(Serial1, SERVO_RX_PIN, SERVO_TX_PIN);
 
 // NVS namespace は 15 文字以内 (ESP32 NVS 制約)。"xstackchan" = 10 文字。
-// キーは "yaw_zero" / "pitch_zero"。Step B / 通常運用ファームと共有する。
+// キーは "yaw_zero" / "pitch_zero"。safe-startup / 通常運用ファームと共有する。
 constexpr const char* NVS_NAMESPACE = "xstackchan";
 constexpr const char* NVS_KEY_YAW_ZERO   = "yaw_zero";
 constexpr const char* NVS_KEY_PITCH_ZERO = "pitch_zero";
@@ -96,7 +96,7 @@ void drawHeader() {
     M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
     M5.Display.setTextSize(2);
     M5.Display.setCursor(8, 4);
-    M5.Display.print("HomeCalibration");
+    M5.Display.print("home-calibration");
 }
 
 void drawFooter() {
@@ -222,7 +222,7 @@ void setup() {
     Serial.begin(115200);
     delay(100);
     Serial.println();
-    Serial.println("[homecal] xangi-stackchan-dev / k151 HomeCalibration");
+    Serial.println("[homecal] xangi-stackchan-dev / k151 home-calibration");
 
     drawHeader();
     drawFooter();

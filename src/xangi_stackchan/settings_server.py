@@ -1,3 +1,4 @@
+import errno
 import html
 import json
 import threading
@@ -6,6 +7,9 @@ from urllib.parse import parse_qs
 
 from .dance import PRESETS as DANCE_PRESETS, run_demo as run_dance_demo
 from .settings import RuntimeState
+
+
+DEFAULT_SETTINGS_PORT = 7897
 
 
 # 同時複数の demo リクエストを直列化する Lock (UI 連打でデモ多重起動を防ぐ)。
@@ -335,8 +339,36 @@ def make_handler(state: RuntimeState):
     return Handler
 
 
-def start_settings_server(state: RuntimeState, bind: str, port: int) -> ThreadingHTTPServer:
-    server = ThreadingHTTPServer((bind, port), make_handler(state))
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    return server
+def start_settings_server(
+    state: RuntimeState,
+    bind: str,
+    port: int,
+    autoshift_tries: int = 1,
+) -> tuple[ThreadingHTTPServer, int]:
+    """Start the settings UI HTTP server, auto-shifting the port on conflict.
+
+    ``autoshift_tries=1`` keeps the previous fail-fast behaviour and binds to
+    ``port`` exactly. With ``autoshift_tries>1`` the server tries ``port``,
+    ``port+1`` ... up to ``autoshift_tries`` candidates and binds the first
+    free one (modelled after xangi-pets-dev ``PORT_AUTOSHIFT_TRIES``).
+
+    Returns ``(server, bound_port)``. The caller is expected to log the
+    bound port so concurrent instances on the same host can be told apart.
+    """
+    tries = max(1, autoshift_tries)
+    last_error: OSError | None = None
+    for offset in range(tries):
+        candidate = port + offset
+        try:
+            server = ThreadingHTTPServer((bind, candidate), make_handler(state))
+        except OSError as exc:
+            if exc.errno in {errno.EADDRINUSE, errno.EACCES}:
+                last_error = exc
+                continue
+            raise
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, candidate
+    raise OSError(
+        f"settings UI port {port}..{port + tries - 1} all busy"
+    ) from last_error

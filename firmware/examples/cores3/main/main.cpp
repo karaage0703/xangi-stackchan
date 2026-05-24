@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2026 karaage0703
 // SPDX-License-Identifier: MIT
 //
-// firmware/k151 examples/XangiBridge:
+// firmware/examples/cores3/main:
 //   K151 / CoreS3 を xangi (or 任意ホスト) のシリアル経由音声出力デバイスとして
-//   動かす受信ファーム。Step D の本体。
+//   動かす受信ファーム。本体ファーム。
 //
 // プロトコル (詳細は docs/xangi_bridge_protocol.md):
 //   テキスト行 (\n 終端):
@@ -16,16 +16,16 @@
 //     FACE:<expr>      → setExpression → JSON ack {"status":"ok","face":"..."}
 //                        expr: neutral / happy / sad / doubt / sleepy / angry
 //     MOVE:<yaw,pitch> → setAngleYaw + setAnglePitch (zero ベース角度) → JSON ack
-//                        {"status":"ok","yaw":N,"pitch":N} (Step E で実装)
+//                        {"status":"ok","yaw":N,"pitch":N} (サーボ統合 PR で実装)
 //
 // 設計:
-//   - **Step D-2 で Avatar 統合**: 顔表示 + 表情変更 + 口パク連動
-//   - **Step E でサーボ統合**: PY32 VM_EN ON → SCServo UART1 1Mbps、起動時に
+//   - **Avatar 統合実装 で Avatar 統合**: 顔表示 + 表情変更 + 口パク連動
+//   - **サーボ統合 PR でサーボ統合**: PY32 VM_EN ON → SCServo UART1 1Mbps、起動時に
 //     NVS から zero raw load (HomeCalibration の出力)、torque OFF で安全側立ち
 //     上げ。MOVE 受信で torque ON + setAngle*。サーボ初期化失敗時は
 //     `g_servo_ready = false` で MOVE が unavailable になるが WAV/FACE は動く
 //     (graceful degradation)。HomeCalibration を先に焼く前提。
-//   - **Step G で WAV キュー化 (本 PR)**: stackchan-atama の WavSlot ring buffer
+//   - **WAV キュー化**: stackchan-atama の WavSlot ring buffer
 //     方式を採用。`handleWav` は受信完了で即 ack、`wavPlayTask` (RTOS task on
 //     core 1) が dequeue → `M5.Speaker.playWav` → 口パク → free。これでホスト側
 //     `send_wav` の ack 待ち block (再生時間ぶん = 数秒〜十数秒) が無くなり、
@@ -68,7 +68,7 @@ constexpr size_t   MAX_JPEG_BYTES    = 256 * 1024;  // 想定上限 (320x240 RGB
 constexpr int8_t SERVO_RX_PIN = 7;
 constexpr int8_t SERVO_TX_PIN = 6;
 
-// HomeCalibration ファームと共有する NVS namespace / キー (firmware/k151/src/main.cpp と一致)
+// HomeCalibration ファームと共有する NVS namespace / キー (firmware/examples/cores3/safe-startup/main.cpp と一致)
 constexpr const char* NVS_NAMESPACE      = "xstackchan";
 constexpr const char* NVS_KEY_YAW_ZERO   = "yaw_zero";
 constexpr const char* NVS_KEY_PITCH_ZERO = "pitch_zero";
@@ -94,7 +94,7 @@ static const char* stateStr(State s) {
     return "unknown";
 }
 
-// === WAV キュー (Step G、stackchan-atama 方式) ================================
+// === WAV キュー (stackchan-atama 方式) ================================
 // 4 slot ring buffer。`handleWav` が push、`wavPlayTask` が pop して再生する。
 // volatile + 整数 head/tail だけで RTOS 同期不要 (push は loop task / pop は
 // wavPlayTask の片方ずつ進むので、index の単一書き込み者保証で OK)。
@@ -129,7 +129,7 @@ static Avatar avatar;
 static SCServo servo(Serial1, SERVO_RX_PIN, SERVO_TX_PIN);
 
 // === PY32 IO Expander 経由でサーボバス電源 (VM_EN) を ON にする =================
-// firmware/k151/src/main.cpp の py32 namespace と同一仕様 (docs §11.4.1)。
+// firmware/examples/cores3/safe-startup/main.cpp の py32 namespace と同一仕様 (docs §11.4.1)。
 namespace py32 {
 constexpr uint8_t  I2C_ADDR         = 0x6F;
 constexpr uint32_t I2C_FREQ         = 100000;
@@ -271,7 +271,7 @@ static void sendAckUnsupported(const char* cmd) {
 // === コマンド処理 ============================================================
 
 static void handleStatus() {
-    Serial.printf("{\"state\":\"%s\",\"volume\":%u,\"version\":\"xangi-bridge-0.5\","
+    Serial.printf("{\"state\":\"%s\",\"volume\":%u,\"version\":\"cores3-main-0.7\","
                   "\"servo\":%s,\"torque\":%s,\"camera\":%s,\"queued\":%d,\"playing\":%s}\n",
                   stateStr(g_state), g_volume,
                   g_servo_ready  ? "true" : "false",
@@ -443,7 +443,7 @@ static void handleFace(const char* arg) {
 }
 
 // WAV:<size>\n
-// Step G の核: 受信完了 → WAV キューに push → 即 ack 返す。再生は別 RTOS task
+// WAV キュー実装の核: 受信完了 → WAV キューに push → 即 ack 返す。再生は別 RTOS task
 // `wavPlayTask` が core 1 で処理するので、loop task はブロックしない。
 //
 // シーケンス:
@@ -538,7 +538,7 @@ static void handleWav(size_t size) {
     sendAckOk(extra);
 }
 
-// === WAV 再生タスク (Step G、core 1) =========================================
+// === WAV 再生タスク (core 1) =========================================
 // loop task と分離して動く。キューが空でなければ dequeue → playWav → 口パク →
 // free を順次処理。`g_wav_playing` フラグで現在再生中かを公開、STATUS で参照可。
 static void wavPlayTask(void* /*param*/) {
@@ -587,6 +587,71 @@ static void wavPlayTask(void* /*param*/) {
         free(data);
         g_wav_playing = false;
         setState(wavQueueEmpty() ? State::Ready : State::Playing);
+    }
+}
+
+// === タッチによる発話停止 (Phase 1: stop のみ) ================================
+// LCD 長押し (TOUCH_HOLD_MS) で M5.Speaker.stop + WAV キュー全クリア。stop した
+// 旨を Serial に `{"event":"audio_stopped","reason":"touch",...}` で通知。host 側
+// (xangi-stackchan) は SerialReader で受け取って、現 turn の後続 chunk を skip +
+// FACE idle + MOVE ホーム復帰する。pause/resume は M5Unified に API が無いため
+// 別 PR (現状未実装)。
+constexpr uint32_t TOUCH_HOLD_MS = 1000;  // 1 秒長押しで stop (誤タッチ防止)
+static uint32_t g_touch_press_start_ms = 0;
+static bool     g_touch_stop_armed     = false;  // この press で stop を出したか
+
+static void emitAudioStopped(const char* reason) {
+    // ホスト向け非同期イベント行。`pollSerialCommand` のコマンド応答とは別の
+    // 行で、host 側は SerialReader thread で逐次読み取って _user_stopped を立てる。
+    Serial.printf("{\"event\":\"audio_stopped\",\"reason\":\"%s\",\"at\":%lu}\n",
+                  reason, static_cast<unsigned long>(millis()));
+}
+
+static void clearWavQueueAndStop() {
+    // 1. 現再生中の WAV を即停止
+    M5.Speaker.stop();
+    // 2. キューに残ってる全 slot を free + クリア
+    for (int i = 0; i < WAV_QUEUE_SIZE; i++) {
+        if (g_wav_queue[i].data != nullptr) {
+            free(g_wav_queue[i].data);
+            g_wav_queue[i].data = nullptr;
+            g_wav_queue[i].len  = 0;
+        }
+    }
+    g_wav_queue_head = 0;
+    g_wav_queue_tail = 0;
+    g_wav_playing    = false;
+    // 3. Avatar 口パクリセット
+    avatar.setMouthOpenRatio(0.0f);
+    avatar.setSpeechText("stopped");
+    // 4. state を Ready に戻す (表情は host からの FACE が来るまで触らない)
+    setState(State::Ready);
+    Serial.println("[bridge] audio stopped by user touch");
+}
+
+static void pollTouchStop() {
+    auto t = M5.Touch.getDetail();
+    if (t.isPressed()) {
+        if (g_touch_press_start_ms == 0) {
+            // 押し始め
+            g_touch_press_start_ms = millis();
+            g_touch_stop_armed     = false;
+            Serial.printf("[touch] pressed x=%d y=%d\n", t.x, t.y);
+        } else if (!g_touch_stop_armed && millis() - g_touch_press_start_ms >= TOUCH_HOLD_MS) {
+            // 1 秒経過 → 1 回だけ stop を発火 (連続発火を armed フラグで防ぐ)
+            g_touch_stop_armed = true;
+            Serial.println("[touch] long-press detected, stopping audio");
+            clearWavQueueAndStop();
+            emitAudioStopped("touch");
+        }
+    } else {
+        // タッチ離れた → 状態リセット
+        if (g_touch_press_start_ms != 0) {
+            Serial.printf("[touch] released after %lu ms\n",
+                          static_cast<unsigned long>(millis() - g_touch_press_start_ms));
+        }
+        g_touch_press_start_ms = 0;
+        g_touch_stop_armed     = false;
     }
 }
 
@@ -663,7 +728,7 @@ void setup() {
     Serial.begin(SERIAL_BAUD);
     delay(100);
     Serial.println();
-    Serial.println("[bridge] xangi-stackchan-dev / k151 XangiBridge 0.4 (avatar+servo+wavqueue)");
+    Serial.println("[bridge] xangi-stackchan / cores3-main 0.7 (avatar+servo+wavqueue+camera+touchstop)");
 
     // Avatar 初期化。`init()` で内部スプライトを確保し、表情/口パク用の draw
     // task を起動する。M5.begin() の後で呼ぶ必要あり。
@@ -714,5 +779,6 @@ void setup() {
 void loop() {
     M5.update();
     pollSerialCommand();
+    pollTouchStop();
     delay(2);
 }

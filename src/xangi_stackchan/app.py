@@ -10,9 +10,15 @@ from queue import Queue
 
 from .app_types import BridgeConfig
 from .events import iter_xangi_events, normalize_xangi_stream_url
-from .settings import DEFAULT_CONFIG_PATH, RuntimeState, load_config_dict, merge_config
-from .settings_server import start_settings_server
-from .stackchan import DEFAULT_BAUD, DEFAULT_WIFI_HOST, StackchanConfig, create_backend
+from .settings import (
+    DEFAULT_CONFIG_PATH,
+    DEFAULT_INSTANCE_ID,
+    RuntimeState,
+    load_instance_dict,
+    merge_config,
+)
+from .settings_server import DEFAULT_SETTINGS_PORT, start_settings_server
+from .stackchan import DEFAULT_BAUD, DEFAULT_WIFI_HOST, StackchanConfig, apply_profile_defaults, create_backend
 from .tts import (
     DEFAULT_PIPER_BIN,
     DEFAULT_PIPER_MODEL,
@@ -207,6 +213,7 @@ def speak_text(backend, text: str, config: BridgeConfig, piper_process: PiperPro
 
 def open_backend_with_retry(config: BridgeConfig):
     while True:
+        apply_profile_defaults(config.stackchan)
         backend = create_backend(config.stackchan)
         try:
             backend.open()
@@ -305,6 +312,12 @@ def run_bridge(state: RuntimeState):
 
                         if event_type == "turn.started":
                             active_turn = event.get("turn_id")
+                            # ユーザがファーム LCD 長押しで前 turn を止めた状態
+                            # (user_stopped=True) を新 turn 開始でリセット。これで
+                            # 次の send_wav から通常動作復帰する。
+                            if getattr(backend, "user_stopped", False):
+                                backend.user_stopped = False
+                                log({"user_stopped": "cleared", "reason": "turn.started"})
                             set_face_if_needed(backend, config.face_thinking, current_face)
                             if config.move_enabled:
                                 set_move_if_needed(
@@ -392,6 +405,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default=DEFAULT_WIFI_HOST)
     parser.add_argument("--port", default="")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD)
+    parser.add_argument("--device-profile", default="",
+                        help="プリセット選択 (cores3_k151 / cores3_standalone / atoms3r / rt_beta)。"
+                             "指定すると baud / max_wav_bytes の既定値が埋まる")
+    parser.add_argument("--max-wav-bytes", type=int, default=0,
+                        help="WAV サイズ上限 (byte)。0 = 無制限 (ファーム側に任せる)。"
+                             "rt_beta profile は 96KB、atoms3r は 256KB が既定")
+    parser.add_argument("--skip-move-during-wav", action="store_true",
+                        help="WAV 再生中の MOVE 送信をスキップ (rt_beta 既定 ON)。"
+                             "M5Stack Basic + アールティ PCB のように USB 給電と"
+                             "サーボ電源を共有する構成で電流ラッシュ → USB 切断を回避")
     parser.add_argument("--volume", type=int, default=255)
     parser.add_argument("--serial-chunk", type=int, default=1024)
     parser.add_argument("--serial-delay", type=float, default=0.005)
@@ -421,8 +444,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--move-talking-sway-interval", type=float, default=1.5)
 
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
+    parser.add_argument(
+        "--instance-id",
+        default=DEFAULT_INSTANCE_ID,
+        help="config namespace inside config.json (default: 'default'). Each "
+        "concurrently running stackchan should have its own instance-id.",
+    )
     parser.add_argument("--settings-bind", default="127.0.0.1")
-    parser.add_argument("--settings-port", type=int, default=7897)
+    parser.add_argument("--settings-port", type=int, default=DEFAULT_SETTINGS_PORT)
+    parser.add_argument(
+        "--port-autoshift-tries",
+        type=int,
+        default=10,
+        help="Number of consecutive ports to try when --settings-port is busy "
+        "(default 10, i.e. 7897..7906).",
+    )
+    parser.add_argument(
+        "--no-port-autoshift",
+        action="store_true",
+        help="Disable settings-UI port auto-shift; fail fast on bind error.",
+    )
     parser.add_argument("--no-settings-ui", action="store_true")
     return parser
 
@@ -436,6 +477,9 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
             host=args.host,
             port=args.port,
             baud=args.baud,
+            device_profile=args.device_profile,
+            max_wav_bytes=args.max_wav_bytes,
+            skip_move_during_wav=args.skip_move_during_wav,
         ),
         volume=max(0, min(255, args.volume)),
         tts=args.tts,
@@ -471,11 +515,37 @@ def main(argv: list[str] | None = None):
     parser = build_parser()
     args = parser.parse_args(argv)
     config_path = Path(args.config).expanduser()
-    config = merge_config(config_from_args(args), load_config_dict(config_path))
+    instance_id = args.instance_id.strip() or DEFAULT_INSTANCE_ID
+    config = merge_config(
+        config_from_args(args), load_instance_dict(config_path, instance_id)
+    )
     if config.tts == "piper" and not config.piper_model:
         parser.error("--piper-model is required when using --tts piper")
-    state = RuntimeState(config, config_path)
+    state = RuntimeState(config, config_path, instance_id=instance_id)
+
+    serial_target = (
+        config.stackchan.host if config.stackchan.wifi else (config.stackchan.port or "")
+    )
+    bound_config_port: int | None = None
     if not args.no_settings_ui:
-        start_settings_server(state, args.settings_bind, args.settings_port)
-        log({"settings_ui": f"http://{args.settings_bind}:{args.settings_port}/"})
+        autoshift = 1 if args.no_port_autoshift else max(1, args.port_autoshift_tries)
+        _, bound_config_port = start_settings_server(
+            state,
+            args.settings_bind,
+            args.settings_port,
+            autoshift_tries=autoshift,
+        )
+        log({"settings_ui": f"http://{args.settings_bind}:{bound_config_port}/"})
+
+    log(
+        {
+            "boot": True,
+            "instance_id": instance_id,
+            "serial_port": serial_target,
+            "wifi": config.stackchan.wifi,
+            "bound_config_port": bound_config_port,
+            "thread_id": config.thread_id,
+            "xangi_url": config.xangi_url,
+        }
+    )
     run_bridge(state)

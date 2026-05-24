@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 karaage0703
 // SPDX-License-Identifier: MIT
 //
-// firmware/k151 examples/SetAngleDemo:
+// firmware/examples/cores3/set-angle-demo:
 //   K151 で **初の torque ON 系ファーム**。HomeCalibration が NVS に保存した
 //   zero raw を読み込み、`servo.setAngleYaw()` で yaw を中央 → ±30° → 中央に
 //   スイープさせる。setAngle*() の zero ベース角度計算が実機で意図通り動くか
@@ -51,13 +51,13 @@ using namespace scservo;
 constexpr int8_t SERVO_RX_PIN = 7;  // G7
 constexpr int8_t SERVO_TX_PIN = 6;  // G6
 
-// HomeCalibration / Step B と共有する NVS namespace / キー
+// home-calibration / safe-startup と共有する NVS namespace / キー
 constexpr const char* NVS_NAMESPACE      = "xstackchan";
 constexpr const char* NVS_KEY_YAW_ZERO   = "yaw_zero";
 constexpr const char* NVS_KEY_PITCH_ZERO = "pitch_zero";
 
 // PY32 IO Expander 経由で K151 のサーボバス電源 (VM_EN, pin 0) を ON。
-// HomeCalibration / Step B と同じ手順 (docs/scservo_protocol.md §1)。
+// home-calibration / safe-startup と同じ手順 (docs/scservo_protocol.md §1)。
 namespace py32 {
 constexpr uint8_t  I2C_ADDR        = 0x6F;
 constexpr uint32_t I2C_FREQ        = 100000;
