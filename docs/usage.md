@@ -42,17 +42,21 @@ sudo udevadm trigger
 
 ### 最小起動
 
-USB 接続したデバイスを動かす最小例。ファームと baud rate は機種で異なる:
+USB 接続したデバイスを動かす最小例。`--device-profile` でプリセット (baud / WAV サイズ上限 / capability) をまとめて指定できる:
 
-- **CoreS3 系 (K151 / K151-R / CoreS3 単体)** + XangiBridge: `--baud 921600`
-- **AtomS3R + Atomic Voice/Echo Base** + AtomVoiceBridge: `--baud 115200`
+| デバイス | `--device-profile` | baud | WAV 上限 |
+|---|---|---|---|
+| M5Stack 公式 K151 / K151-R (CoreS3 + サーボ + カメラ) | `cores3_k151` | 921600 | 無制限 (PSRAM 4MB) |
+| M5Stack CoreS3 単体 (サーボ無し、カメラあり) | `cores3_standalone` | 921600 | 無制限 |
+| M5Stack AtomS3R + Atomic Voice / Echo Base | `atoms3r` | 115200 | 256KB |
+| アールティ Ver.β (M5Stack Basic + Feetech SCS0009 ×2) | `rt_beta` | 115200 | 96KB (内部 DRAM 制約) |
 
 ```bash
-# CoreS3 系
+# CoreS3 系 (K151 / K151-R / CoreS3 単体)
 uv run xangi-stackchan \
   --xangi-url http://127.0.0.1:18888 \
   --port /dev/stackchan \
-  --baud 921600 \
+  --device-profile cores3_k151 \
   --volume 200 \
   --tts piper
 
@@ -60,10 +64,20 @@ uv run xangi-stackchan \
 uv run xangi-stackchan \
   --xangi-url http://127.0.0.1:18888 \
   --port /dev/stackchan \
-  --baud 115200 \
+  --device-profile atoms3r \
   --volume 192 \
   --tts piper
+
+# アールティ Ver.β (M5Stack Basic + SCS0009)
+uv run xangi-stackchan \
+  --xangi-url http://127.0.0.1:18888 \
+  --port /dev/stackchan \
+  --device-profile rt_beta \
+  --volume 200 \
+  --tts piper
 ```
+
+`--baud` / `--max-wav-bytes` で個別上書きも可能。`--device-profile` を指定しない場合は `--baud` (既定 921600) と `--max-wav-bytes` (既定 0 = 無制限) を直接指定する。
 
 `--xangi-url` で接続先の xangi を選ぶ。複数 xangi を建てている場合は、対象インスタンスの URL を指定する。
 
@@ -82,7 +96,7 @@ UI から以下を変更できる。
 - TTS 設定
 - 状態ごとの表情
 - 首振り (MOVE) 設定 (サーボあり機のみ)
-- カメラスナップショット (Phase 1A)
+- カメラスナップショット
 
 保存すると `~/.xangi/xangi-stackchan/config.json` に永続化し、実行中デーモンにも反映する。xangi URL を変更した場合はストリームを張り直す。
 
@@ -130,8 +144,11 @@ tail -f /tmp/xangi-stackchan.log
 ## 主なオプション
 
 - `--xangi-url`: xangi base URL または `/api/events/stream` の完全 URL (既定 `http://127.0.0.1:18888`)
-- `--thread-id`: 対象 thread のみ処理
-- `--settings-port`: 設定 UI の port (既定 `7897`)
+- `--thread-id`: 対象 thread のみ処理 (複数台運用時の喋り分けに使う、後述「複数台で動かす」参照)
+- `--instance-id`: config.json の namespace 名 (既定 `default`、複数台で別 instance を持たせる)
+- `--settings-port`: 設定 UI の port (既定 `7897`、衝突したら +1 ずつ auto-shift)
+- `--port-autoshift-tries`: 設定 UI port の試行回数 (既定 `10`、`7897..7906`)
+- `--no-port-autoshift`: 設定 UI port を auto-shift せず最初の bind 失敗で終了
 - `--settings-bind`: 設定 UI の listen アドレス (既定 `127.0.0.1`、LAN/Tailscale 公開時は `0.0.0.0`)
 - `--no-settings-ui`: 設定 UI を起動しない
 - `--port --baud`: USB serial のポートと baudrate (XangiBridge ファーム既定値 `921600`)
@@ -148,6 +165,109 @@ tail -f /tmp/xangi-stackchan.log
 - `--move-talking-sway-yaw` / `--move-talking-sway-pitch`: 喋り中のランダム揺らぎ振り幅 (既定 `±4` / `±2`)
 - `--move-talking-sway-interval`: 喋り中のランダム揺らぎ更新間隔 (秒、既定 `1.5`)
 - `--stackchan-retry-seconds`: デバイス切断時の再接続間隔 (秒)
+
+## 複数台で動かす
+
+xangi-stackchan は同じマシン上で複数プロセスを並列起動できる。1 プロセス = 1 スタックチャンが基本で、台数分だけ起動する。xangi 側は固定 1 URL、各 xangi-stackchan プロセスが個別に SSE を購読する。
+
+### 1. udev で物理デバイスを固定名にする (Linux)
+
+デフォルトの `udev/99-xangi-stackchan.rules` は 2 台以上挿すと `/dev/stackchan` を奪い合うので、シリアル番号ベースで個別 SYMLINK を付ける。
+
+```udev
+# /etc/udev/rules.d/99-xangi-stackchan.rules
+
+# 1 台目 (左)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001", \
+  ATTRS{serial}=="AABBCCDDEEFF", SYMLINK+="stackchan-left", MODE="0666"
+
+# 2 台目 (右)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001", \
+  ATTRS{serial}=="112233445566", SYMLINK+="stackchan-right", MODE="0666"
+```
+
+シリアル番号は `udevadm info -a -n /dev/ttyACMx | grep ATTRS{serial}` で取れる。
+
+`ATTRS{serial}` が空 (CP2104 系の一部チップ) な場合は `ENV{ID_PATH}` の物理 USB ポート位置を fallback に使う:
+
+```udev
+SUBSYSTEM=="tty", ENV{ID_PATH}=="pci-0000:00:14.0-usb-0:1:1.0", \
+  SYMLINK+="stackchan-left", MODE="0666"
+```
+
+どちらも取れないチップ・組み合わせなら、3rd fallback として `--port /dev/ttyACM0` 等を起動時に明示するしかない (ただしホットプラグで順序が変わるので運用しにくい)。
+
+反映:
+
+```bash
+sudo udevadm control --reload && sudo udevadm trigger
+```
+
+### 2. instance-id ごとに別プロセスで起動
+
+`~/.xangi/xangi-stackchan/config.json` は v2 schema で `instances.<id>` namespace を持つ。`--instance-id` を分けると、設定 UI からの保存・読み込みも instance 単位で分離される。
+
+```bash
+# 左スタックチャン (--thread-id は xangi 側の thread 識別子)
+setsid -f bash -c 'cd /path/to/xangi-stackchan && exec uv run xangi-stackchan \
+  --instance-id left \
+  --port /dev/stackchan-left \
+  --thread-id left \
+  --settings-port 7897 \
+  --tts piper' </dev/null >>/tmp/xangi-stackchan-left.log 2>&1
+
+# 右スタックチャン (settings UI port は auto-shift で 7898 になる)
+setsid -f bash -c 'cd /path/to/xangi-stackchan && exec uv run xangi-stackchan \
+  --instance-id right \
+  --port /dev/stackchan-right \
+  --thread-id right \
+  --settings-port 7897 \
+  --tts piper' </dev/null >>/tmp/xangi-stackchan-right.log 2>&1
+```
+
+`--settings-port 7897` は両方とも同じ起点で良い。後発プロセスは bind 失敗で `+1` 試行を最大 `--port-autoshift-tries` 回繰り返し、空いた port を採用する。実際に bind した port は起動ログの `bound_config_port` フィールドと `settings_ui` 行に出る:
+
+```json
+{"settings_ui": "http://127.0.0.1:7898/"}
+{"boot": true, "instance_id": "right", "serial_port": "/dev/stackchan-right",
+ "wifi": false, "bound_config_port": 7898, "thread_id": "right", ...}
+```
+
+設定 UI は instance ごとに別 URL になるので、ブラウザのタブ 2 つで個別に編集できる。
+
+### 3. 喋り分けの考え方 (SSE event routing)
+
+デフォルトは「全員一斉に喋る」 (broadcast)。`--thread-id` を指定しない複数プロセスは、全員が同じ xangi の `turn.complete` を受けて同じ発話をする。
+
+個別に喋り分けたいときは、xangi 側で thread を分けて、各 xangi-stackchan に `--thread-id` を渡す。xangi 側がどう thread を分けるかは xangi の運用次第 (Discord channel ID / Slack channel / Web thread 等)。
+
+将来的に xangi 本体に役割ベース routing が入る予定はあるが、現状は thread-id 分離が唯一の手段。
+
+### 4. config.json の構造 (v2)
+
+```json
+{
+  "version": 2,
+  "instances": {
+    "default": {
+      "xangi_url": "http://127.0.0.1:18888",
+      "port": "/dev/stackchan",
+      "thread_id": "",
+      "volume": 200,
+      "tts": "piper"
+    },
+    "left": {
+      "xangi_url": "http://127.0.0.1:18888",
+      "port": "/dev/stackchan-left",
+      "thread_id": "left",
+      "volume": 192,
+      "tts": "piper"
+    }
+  }
+}
+```
+
+v1 (フラット 1 ファイル) で運用していた既存ユーザは、初回保存時に自動的に `instances.default` の下に packing される。CLI で `--instance-id` を指定しなければ常に `default` を読むので、シングル運用は変更なしで動く。
 
 ## 動作確認
 
@@ -217,10 +337,10 @@ uv run python scripts/test_xangi_bridge.py --port /dev/stackchan
 
 STATUS / VOLUME / FACE / MOVE / WAV (440Hz トーン) の往復を 1 ショットで確認する。
 
-### カメラ (Phase 1A: スナップショット + モニタリング)
+### カメラ (スナップショット + モニタリング)
 
 CoreS3 内蔵 GC0308 カメラから JPEG 1 枚取得し、設定 UI で表示する機能。
-xangi (LLM) への入力連携は Phase 1B (発話時 1 枚自動添付) で別途実装予定。
+xangi (LLM) への入力連携は別途実装予定 (発話時 1 枚自動添付)。
 
 #### A. 設定 UI から
 
@@ -246,11 +366,11 @@ curl -o /tmp/snapshot.jpg "http://127.0.0.1:7897/api/camera/snapshot.jpg?force=1
 curl http://127.0.0.1:7897/api/camera/status
 ```
 
-#### 制約 (Phase 1A)
+#### 制約
 
-- **USB シリアル接続のみ対応**。WiFi MJPEG ストリームは Phase 2 で実装予定
+- **USB シリアル接続のみ対応**。WiFi MJPEG ストリームは将来別途実装予定
 - **M5Stack CoreS3 系のみ** (K151 / K151-R / CoreS3 単体)。カメラ初期化に失敗した機種では `camera not ready` 応答
-- **オンデマンド撮影** (1 リクエスト 1 枚)。常時ストリーミングは Phase 2
+- **オンデマンド撮影** (1 リクエスト 1 枚)。常時ストリーミングは将来検討
 
 ## トラブルシュート
 

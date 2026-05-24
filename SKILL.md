@@ -14,13 +14,14 @@ USB シリアル経由で M5Stack CoreS3 ベースのデバイスと通信する
 
 USB シリアル経由で Arduino (PlatformIO) ファームを焼く。
 
-| デバイス | ファーム | baud | フル機能 |
+| デバイス | ファーム (PlatformIO env) | baud | フル機能 |
 |---------|---------|------|---------|
-| K151 / K151-R (CoreS3 + サーボ + Remote) | `examples/XangiBridge` | 921600 | WAV / FACE / MOVE / CAPTURE |
-| CoreS3 単体 (サーボ無し) | `examples/XangiBridge` | 921600 | WAV / FACE / CAPTURE (MOVE は unavailable) |
-| AtomS3R + Atomic Voice Base / Echo Base | `examples/AtomVoiceBridge` | 115200 | WAV / FACE (MOVE / CAPTURE は unavailable) |
+| K151 / K151-R (CoreS3 + サーボ + Remote) | `cores3-main` (`examples/cores3/main`) | 921600 | WAV / FACE / MOVE / CAPTURE |
+| CoreS3 単体 (サーボ無し) | `cores3-main` (`examples/cores3/main`) | 921600 | WAV / FACE / CAPTURE (MOVE は unavailable) |
+| AtomS3R + Atomic Voice Base / Echo Base | `atoms3r-main` (`examples/atoms3r/main`) | 115200 | WAV / FACE (MOVE / CAPTURE は unavailable) |
+| M5Stack Basic + アールティ Ver.β | `basic-main` (`examples/basic/main`) | 115200 | WAV / FACE / MOVE (CAPTURE は unavailable) |
 
-サーボ・カメラ有無は起動時に自動検出、`STATUS` の `servo` / `camera` フィールドで現状取得可。
+CoreS3 系はサーボ・カメラ有無を起動時に自動検出、`STATUS` の `servo` / `camera` フィールドで現状取得可。
 
 ## Step 0: 初回セットアップ (piper-plus のバイナリ・モデルが無い場合のみ)
 
@@ -90,7 +91,7 @@ tail -f /tmp/xangi-stackchan.log
 - TTS 設定 (piper / voicevox / none)
 - 状態ごとの表情 (idle / thinking / talking / error)
 - 首振り (MOVE) 設定 (サーボあり機のみ)
-- カメラスナップショット (Phase 1A)
+- カメラスナップショット
 
 保存すると `~/.xangi/xangi-stackchan/config.json` に永続化し、実行中デーモンにも反映する。xangi URL を変更した場合はストリームを張り直す。
 
@@ -106,10 +107,10 @@ curl -s -X POST http://127.0.0.1:7897/api/config \
   -d '{"volume":180}'
 ```
 
-## Step 3.5: カメラスナップショット (Phase 1A)
+## Step 3.5: カメラスナップショット
 
 CoreS3 内蔵 GC0308 カメラから JPEG 1 枚取得し、設定 UI / API で表示する。LLM への
-自動添付は Phase 1B 以降。カメラ初期化に失敗した機種では `camera not ready` 応答。
+自動添付は将来別 PR で対応予定。カメラ初期化に失敗した機種では `camera not ready` 応答。
 
 設定 UI: <http://127.0.0.1:7897/> 末尾の「camera」パネル → スナップショットボタン。
 

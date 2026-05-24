@@ -9,17 +9,74 @@ from .stackchan import StackchanConfig
 
 
 DEFAULT_CONFIG_PATH = Path.home() / ".xangi" / "xangi-stackchan" / "config.json"
+DEFAULT_INSTANCE_ID = "default"
+CONFIG_SCHEMA_VERSION = 2
 
 
-def load_config_dict(path: Path) -> dict[str, Any]:
+# --- file-level helpers --------------------------------------------------
+
+
+def load_config_file(path: Path) -> dict[str, Any]:
+    """Read the on-disk config file in v2 schema.
+
+    Returns ``{"version": 2, "instances": {...}}``. If the file does not
+    exist, returns an empty v2 document. If the file is the legacy v1 flat
+    schema, it is migrated to v2 in-memory (the migration is persisted only
+    when something is saved back).
+    """
     if not path.exists():
-        return {}
-    return json.loads(path.read_text())
+        return {"version": CONFIG_SCHEMA_VERSION, "instances": {}}
+    raw = json.loads(path.read_text())
+    return migrate_to_v2(raw)
 
 
-def save_config_dict(path: Path, data: dict[str, Any]):
+def save_config_file(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+
+
+def migrate_to_v2(raw: dict[str, Any]) -> dict[str, Any]:
+    """Promote a v1 flat config to the v2 ``instances`` namespace.
+
+    A v1 file is recognised by the absence of a ``version`` key (or
+    ``version<2``). Its flat fields are wrapped into ``instances.default``.
+    """
+    if not isinstance(raw, dict):
+        return {"version": CONFIG_SCHEMA_VERSION, "instances": {}}
+    version = raw.get("version")
+    if isinstance(version, int) and version >= CONFIG_SCHEMA_VERSION:
+        instances = raw.get("instances")
+        if not isinstance(instances, dict):
+            instances = {}
+        return {"version": CONFIG_SCHEMA_VERSION, "instances": dict(instances)}
+
+    # v1 fallback: take every top-level key as a flat config for "default".
+    flat = {k: v for k, v in raw.items() if k != "version"}
+    instances: dict[str, Any] = {}
+    if flat:
+        instances[DEFAULT_INSTANCE_ID] = flat
+    return {"version": CONFIG_SCHEMA_VERSION, "instances": instances}
+
+
+def load_instance_dict(path: Path, instance_id: str) -> dict[str, Any]:
+    """Return the per-instance dict, or {} if the instance is unknown."""
+    doc = load_config_file(path)
+    instances = doc.get("instances", {})
+    data = instances.get(instance_id)
+    return dict(data) if isinstance(data, dict) else {}
+
+
+def save_instance_dict(path: Path, instance_id: str, data: dict[str, Any]) -> None:
+    """Persist ``data`` into ``instances[instance_id]`` of the v2 file."""
+    doc = load_config_file(path)
+    instances = doc.setdefault("instances", {})
+    instances[instance_id] = dict(data)
+    doc["instances"] = instances
+    doc["version"] = CONFIG_SCHEMA_VERSION
+    save_config_file(path, doc)
+
+
+# --- BridgeConfig <-> dict ----------------------------------------------
 
 
 def config_to_dict(config: BridgeConfig) -> dict[str, Any]:
@@ -30,6 +87,9 @@ def config_to_dict(config: BridgeConfig) -> dict[str, Any]:
         "host": config.stackchan.host,
         "port": config.stackchan.port,
         "baud": config.stackchan.baud,
+        "device_profile": config.stackchan.device_profile,
+        "max_wav_bytes": config.stackchan.max_wav_bytes,
+        "skip_move_during_wav": config.stackchan.skip_move_during_wav,
         "volume": config.volume,
         "tts": config.tts,
         "piper_bin": config.piper_bin,
@@ -94,6 +154,9 @@ def merge_config(base: BridgeConfig, data: dict[str, Any]) -> BridgeConfig:
         host=str(data.get("host", base.stackchan.host)),
         port=str(data.get("port", base.stackchan.port)),
         baud=_int_or(data.get("baud"), base.stackchan.baud),
+        device_profile=str(data.get("device_profile", base.stackchan.device_profile)),
+        max_wav_bytes=_int_or(data.get("max_wav_bytes"), base.stackchan.max_wav_bytes),
+        skip_move_during_wav=_bool(data.get("skip_move_during_wav", base.stackchan.skip_move_during_wav)),
     )
     return replace(
         base,
@@ -139,11 +202,17 @@ def merge_config(base: BridgeConfig, data: dict[str, Any]) -> BridgeConfig:
 
 
 class RuntimeState:
-    def __init__(self, config: BridgeConfig, config_path: Path):
+    def __init__(
+        self,
+        config: BridgeConfig,
+        config_path: Path,
+        instance_id: str = DEFAULT_INSTANCE_ID,
+    ):
         self._lock = Lock()
         self._config = config
         self._version = 0
         self.config_path = config_path
+        self.instance_id = instance_id
         # backend / piper_process は run_bridge が config 適用後に set_runtime で
         # 登録する。settings_server の `/api/demo` がそれを取って共有する。
         # run_bridge 専有ではなく Lock 経由で共有するので、send_command /
@@ -183,6 +252,7 @@ class RuntimeState:
             data = config_to_dict(self._config)
             data["version"] = self._version
             data["config_path"] = str(self.config_path)
+            data["instance_id"] = self.instance_id
             return data
 
     def update(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -190,7 +260,26 @@ class RuntimeState:
             self._config = merge_config(self._config, data)
             self._version += 1
             saved = config_to_dict(self._config)
-            save_config_dict(self.config_path, saved)
+            save_instance_dict(self.config_path, self.instance_id, saved)
             saved["version"] = self._version
             saved["config_path"] = str(self.config_path)
+            saved["instance_id"] = self.instance_id
             return saved
+
+
+# --- legacy compat aliases -----------------------------------------------
+#
+# These kept the previous flat-file behaviour. We keep thin shims so that
+# callers (and tests) which still reach for ``load_config_dict`` keep
+# working against the v2 file format. They always operate on the default
+# instance — multi-instance code should use the explicit helpers above.
+
+
+def load_config_dict(path: Path) -> dict[str, Any]:
+    """Deprecated: return the ``default`` instance dict from a v2 file."""
+    return load_instance_dict(path, DEFAULT_INSTANCE_ID)
+
+
+def save_config_dict(path: Path, data: dict[str, Any]) -> None:
+    """Deprecated: persist ``data`` into the ``default`` instance."""
+    save_instance_dict(path, DEFAULT_INSTANCE_ID, data)

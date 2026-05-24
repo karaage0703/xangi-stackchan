@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 karaage0703
 // SPDX-License-Identifier: MIT
 //
-// firmware/k151 Step B: サーボ電源系統と SCServo 通信を疎通確認するだけの安全起動。
+// firmware/examples/cores3/safe-startup: サーボ電源系統と SCServo 通信を疎通確認するだけの安全起動。
 //   1. PY32 IO Expander 経由でサーボバス電源 (VM) を ON
 //   2. UART1 (1Mbps, TX=G6, RX=G7) を開く
 //   3. 念のため torque OFF を投げて、サーボを手で動かせる状態にする
@@ -109,7 +109,7 @@ void setup() {
     Serial.begin(115200);
     delay(100);
     Serial.println();
-    Serial.println("[main] xangi-stackchan-dev / k151 Step B");
+    Serial.println("[main] xangi-stackchan / cores3 safe-startup");
 
     avatar.init();
     avatar.setExpression(Expression::Neutral);

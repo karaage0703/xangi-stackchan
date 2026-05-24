@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""XangiBridge ファーム (firmware/k151 examples/XangiBridge) 単体テスト。
+"""XangiBridge ファーム (firmware/examples/cores3/main) 単体テスト。
 
 STATUS / VOLUME / WAV の往復を確認する。WAV は 440Hz の sine tone を 1 秒分
 組み立てて送信、デバイス側で実音が鳴ることを耳で確認する。
@@ -36,7 +36,7 @@ def build_sine_wav(
 ) -> bytes:
     """16bit/mono/sample_rate Hz の RIFF/WAVE PCM を組み立てて bytes で返す。
 
-    XangiBridge の `examples/SpeakerDemo/main.cpp::buildToneWav()` と
+    XangiBridge の `examples/cores3/speaker-demo/main.cpp::buildToneWav()` と
     同じ形式 (44 byte header + sint16 LE PCM)。
     """
     sample_count = int(sample_rate * duration_s)

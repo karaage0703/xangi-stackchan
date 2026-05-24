@@ -2,6 +2,7 @@ import glob
 import json
 import os
 import platform
+import struct
 import threading
 import time
 from dataclasses import dataclass
@@ -13,6 +14,70 @@ import serial.tools.list_ports
 
 DEFAULT_BAUD = 921600
 DEFAULT_WIFI_HOST = os.environ.get("STACKCHAN_IP", "192.168.1.100")
+
+
+# デバイスごとの既定値プリセット。CLI --device-profile / 設定 UI で選択する。
+# - baud:           USB シリアル baud rate
+# - max_wav_bytes:  ファーム側の WAV 受信上限。超える size の WAV は送信前に
+#                   早期 error で弾く。0 は無制限 (CoreS3 PSRAM 4MB クラス)
+# - capabilities:   既定の機能可否 (実機 STATUS の servo/camera/torque で上書き)
+DEVICE_PROFILES: dict[str, dict] = {
+    "cores3_k151": {
+        "baud": 921600,
+        "max_wav_bytes": 0,
+        "capabilities": {"servo": True, "camera": True, "mic": False},
+        "description": "M5Stack 公式 K151 / K151-R (CoreS3 + サーボ + カメラ)",
+    },
+    "cores3_standalone": {
+        "baud": 921600,
+        "max_wav_bytes": 0,
+        "capabilities": {"servo": False, "camera": True, "mic": False},
+        "description": "M5Stack CoreS3 単体 (サーボ無し、カメラあり)",
+    },
+    "atoms3r": {
+        "baud": 115200,
+        "max_wav_bytes": 256 * 1024,
+        "capabilities": {"servo": False, "camera": False, "mic": False},
+        "description": "M5Stack AtomS3R + Atomic Voice / Echo Base",
+    },
+    "rt_beta": {
+        "baud": 115200,
+        "max_wav_bytes": 96 * 1024,
+        "capabilities": {"servo": True, "camera": False, "mic": False},
+        "skip_move_during_wav": True,
+        "description": "アールティ Ver.β (M5Stack Basic + Feetech SCS0009 ×2)",
+    },
+}
+
+
+def resolve_profile(name: str) -> dict | None:
+    """device_profile 名 → プリセット dict。未知の名前は None。"""
+    if not name:
+        return None
+    return DEVICE_PROFILES.get(name)
+
+
+def estimate_wav_duration_seconds(wav_data: bytes) -> float:
+    """RIFF/WAVE ヘッダから再生時間を秒で見積もる。
+
+    16-bit PCM の典型的なフォーマットを想定。ヘッダが壊れている場合は 0 を返す
+    (呼び出し側は 0 = 不明として扱う)。WAV 再生中の MOVE スキップ用 timer に使う。
+    """
+    if len(wav_data) < 44 or wav_data[:4] != b"RIFF" or wav_data[8:12] != b"WAVE":
+        return 0.0
+    try:
+        channels = struct.unpack("<H", wav_data[22:24])[0]
+        sample_rate = struct.unpack("<I", wav_data[24:28])[0]
+        bits = struct.unpack("<H", wav_data[34:36])[0]
+    except struct.error:
+        return 0.0
+    if sample_rate <= 0 or channels <= 0 or bits <= 0:
+        return 0.0
+    bytes_per_second = sample_rate * channels * (bits // 8)
+    if bytes_per_second <= 0:
+        return 0.0
+    data_bytes = max(0, len(wav_data) - 44)
+    return data_bytes / bytes_per_second
 
 
 def detect_serial_port() -> str:
@@ -49,6 +114,21 @@ class StackchanSerial:
         # playWav 失敗・no READY response・ノイズ再生を引き起こす。RLock で
         # send_command / send_wav 全体を直列化する。
         self._lock = threading.RLock()
+        # device_profile から渡される WAV サイズ上限 (0 = 無制限)。超過時は
+        # send_wav 内で送信前に早期 error を返す。
+        self.max_wav_bytes: int = 0
+        # device_profile から渡される「WAV 再生中の MOVE スキップ」フラグ。
+        # rt_beta (M5Stack Basic + アールティ PCB) では USB 5V/500mA とサーボ
+        # 電源を Stack-chan PCB が共有するため、WAV 受信中のサーボ MOVE 連動で
+        # 電流ラッシュ → USB ブラウンアウト → シリアル切断が起きる。True なら
+        # send_command で MOVE が来た時 _wav_active=True の間スキップする。
+        self.skip_move_during_wav: bool = False
+        self._wav_active: bool = False
+        self._wav_end_timer: threading.Timer | None = None
+        # ファームから `{"event":"audio_stopped",...}` を受信したら True に立ち、
+        # send_wav 冒頭でその WAV を skip する。app.py 側で turn.started 受信時に
+        # False に戻して次 turn から通常動作復帰。
+        self.user_stopped: bool = False
 
     def open(self):
         self.ser = serial.Serial(self.port, self.baud, timeout=5)
@@ -60,10 +140,34 @@ class StackchanSerial:
             self.ser.close()
 
     def drain(self):
+        # 単に捨てるのではなく、行単位で読んで非同期 event 行 (audio_stopped 等) を
+        # フラグに反映してから捨てる。これで send_wav 前の drain でユーザ stop を
+        # 取りこぼさない。
         while self.ser and self.ser.in_waiting:
-            self.ser.read(self.ser.in_waiting)
+            try:
+                raw = self.ser.readline()
+            except Exception:
+                break
+            if not raw:
+                break
+            line = raw.decode("utf-8", errors="replace").strip()
+            if line:
+                self._detect_async_event(line)
+
+    def _detect_async_event(self, line: str) -> bool:
+        """ファームからの非同期 event 行 (`{"event":"audio_stopped",...}`) を検知して
+        backend 内部フラグを立てる。検知した場合 True を返す (応答行としては使わない)。
+        """
+        if '"event"' in line and "audio_stopped" in line:
+            self.user_stopped = True
+            return True
+        return False
 
     def send_command(self, cmd: str) -> dict:
+        # WAV 再生中の MOVE は skip_move_during_wav=True 時にスキップ。電流ラッシュ
+        # 由来の USB シリアル切断を避けるための rt_beta 向け mutual exclusion。
+        if self.skip_move_during_wav and self._wav_active and cmd.startswith("MOVE:"):
+            return {"status": "skipped", "cmd": cmd, "reason": "wav playing"}
         with self._lock:
             self.ser.write(f"{cmd}\n".encode())
             self.ser.flush()
@@ -71,8 +175,11 @@ class StackchanSerial:
             response = ""
             while self.ser.in_waiting:
                 line = self.ser.readline().decode("utf-8", errors="replace").strip()
-                if line:
-                    response = line
+                if not line:
+                    continue
+                if self._detect_async_event(line):
+                    continue  # 非同期 event はフラグだけ立てて応答とは別扱い
+                response = line
             try:
                 return json.loads(response)
             except json.JSONDecodeError:
@@ -82,18 +189,74 @@ class StackchanSerial:
         if not wav_data:
             return {"status": "error", "error": "empty WAV"}
 
-        # Step G: ファーム (xangi-bridge-0.4+) は WAV キューが満杯なら受信前に
+        # ユーザがファーム LCD を長押しで stop した状態 (audio_stopped event 受信済)。
+        # 次の turn.started が来るまでホスト側でこのフラグを True に保持して、
+        # 後続 chunk の WAV 送信を全てスキップする (黙る挙動)。
+        if self.user_stopped:
+            return {"status": "skipped", "reason": "user_stopped", "size": len(wav_data)}
+
+        # device_profile (rt_beta / atoms3r 等) で渡された WAV サイズ上限の早期
+        # チェック。例: basic-main (M5Stack Basic) は内部 DRAM 96KB 制約。超過時は
+        # ファーム側でも error が返るが、シリアル送信のロード自体を避けるため
+        # ホスト側で先にブロック。0 = 無制限 (CoreS3 PSRAM 4MB クラス)。
+        if self.max_wav_bytes > 0 and len(wav_data) > self.max_wav_bytes:
+            return {
+                "status": "error",
+                "error": "exceeds device profile max_wav_bytes",
+                "size": len(wav_data),
+                "max_wav_bytes": self.max_wav_bytes,
+            }
+
+        # WAV 送信開始の直前に _wav_active=True をセット。skip_move_during_wav=True
+        # (rt_beta) の場合、これで TalkingSway 等の並列 MOVE 送信を WAV 送信中
+        # ずっと skip させる。送信開始**前**にフラグを立てるのが重要 (ack 受信後だと
+        # 最初の sway と WAV chunk 1 が race して USB 電源ラッシュで切れる事例あり、
+        # 2026-05-24 実機検証で発覚)。再生は WAV ack 後にファーム側で非同期実行
+        # されるが、host 側から見える「サーボに静かにしていてほしい期間」は WAV
+        # 送信中 + 再生推定時間まで。前者は send_wav 呼び出し中の状態、後者は
+        # 推定時間 timer で end する。
+        if self.skip_move_during_wav:
+            self._begin_wav_active(estimate_wav_duration_seconds(wav_data) or 1.0)
+
+        # WAV キュー実装: ファーム (xangi-bridge-0.4+) は WAV キューが満杯なら受信前に
         # `{"status":"error","error":"queue full"}` を返す。再生中のスロットが
         # 空くまで短く sleep + retry する (キュー 4 slot なので最悪でも 1 chunk
         # 分の再生時間 = 数秒待てば必ず空く)。リトライ中もシリアル排他は維持。
-        for attempt in range(8):
-            with self._lock:
-                result = self._send_wav_locked(wav_data, chunk_size, chunk_delay)
-            if result.get("status") == "error" and result.get("error") == "queue full":
-                time.sleep(0.5)
-                continue
+        try:
+            for attempt in range(8):
+                with self._lock:
+                    result = self._send_wav_locked(wav_data, chunk_size, chunk_delay)
+                if result.get("status") == "error" and result.get("error") == "queue full":
+                    time.sleep(0.5)
+                    continue
+                return result
             return result
-        return result
+        finally:
+            # WAV 送信エラー (USB 切断・recv timeout 等) ですぐ skip 解除すると、
+            # 再生中のサーボラッシュを引き続き避けたいケースで早すぎる。timer は
+            # _begin_wav_active で既に起動済 (推定再生時間で auto end) なので、
+            # ここでは何もしない。次の send_wav 呼び出し時に古い timer は
+            # _begin_wav_active 内で cancel されて新タイマーに置き換わる。
+            pass
+
+    def _begin_wav_active(self, duration_seconds: float) -> None:
+        """`_wav_active` を True にし、`duration_seconds` 秒後に False へ戻す
+        タイマーを仕掛ける。連続 WAV 送信時は古い timer を cancel して新しい
+        終了時刻で上書きする (累積で MOVE スキップ期間が伸びる、これは複数
+        WAV キューイング時の意図通り)。
+        """
+        with self._lock:
+            self._wav_active = True
+            if self._wav_end_timer is not None:
+                self._wav_end_timer.cancel()
+            self._wav_end_timer = threading.Timer(max(0.1, duration_seconds), self._end_wav_active)
+            self._wav_end_timer.daemon = True
+            self._wav_end_timer.start()
+
+    def _end_wav_active(self) -> None:
+        with self._lock:
+            self._wav_active = False
+            self._wav_end_timer = None
 
     def _send_wav_locked(self, wav_data: bytes, chunk_size: int, chunk_delay: float) -> dict:
         self.drain()
@@ -341,10 +504,35 @@ class StackchanConfig:
     host: str = DEFAULT_WIFI_HOST
     port: str = ""
     baud: int = DEFAULT_BAUD
+    device_profile: str = ""
+    max_wav_bytes: int = 0  # 0 = 無制限 (ファーム側に任せる)
+    skip_move_during_wav: bool = False  # rt_beta 等の電源マージン制約用
+
+
+def apply_profile_defaults(config: StackchanConfig) -> StackchanConfig:
+    """device_profile が指定されていれば、未設定フィールドにプリセット値を埋める。
+
+    明示指定 (CLI / config.json で 0 以外) は常に優先、profile 値で上書きしない。
+    profile 未指定 or 未知の名前なら何もしない。
+    """
+    profile = resolve_profile(config.device_profile)
+    if profile is None:
+        return config
+    if config.baud == DEFAULT_BAUD and profile.get("baud"):
+        # CLI で baud を明示してない場合のみ profile の baud を採用
+        config.baud = profile["baud"]
+    if config.max_wav_bytes == 0:
+        config.max_wav_bytes = profile.get("max_wav_bytes", 0)
+    if not config.skip_move_during_wav:
+        config.skip_move_during_wav = profile.get("skip_move_during_wav", False)
+    return config
 
 
 def create_backend(config: StackchanConfig):
     if config.wifi:
         return StackchanWifi(config.host)
-    return StackchanSerial(config.port or detect_serial_port(), config.baud)
+    backend = StackchanSerial(config.port or detect_serial_port(), config.baud)
+    backend.max_wav_bytes = config.max_wav_bytes
+    backend.skip_move_during_wav = config.skip_move_during_wav
+    return backend
 

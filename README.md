@@ -11,21 +11,22 @@
 - `turn.complete` の最終テキストを piper-plus / VOICEVOX で音声化して再生。再生中は首がささやかに揺れる
 - 完了後は `neutral` 顔 + idle ポーズに戻る
 - `agent.error` では `sad` 顔 + 首を下げる
-- **カメラスナップショット (Phase 1A)**: 内蔵 GC0308 カメラで JPEG 撮影 → 設定 UI / API で表示。LLM 連携は Phase 1B 以降
+- **カメラスナップショット**: 内蔵 GC0308 カメラで JPEG 撮影 → 設定 UI / API で表示。LLM 連携は将来別 PR で対応
 
 表示 UI は持たず、デバイスの表情変更と音声再生に集中する。サーボの有無は起動時に自動判定され、サーボ無しの CoreS3 単体機では MOVE のみ unavailable 応答 (WAV/FACE/CAPTURE は通常動作) する graceful degradation 設計。
 
 ## 対応デバイス
 
-USB シリアル経由で Arduino (PlatformIO) ファームを焼く。CoreS3 系は `firmware/k151/examples/XangiBridge/`、AtomS3R 系は `firmware/k151/examples/AtomVoiceBridge/` を使う。両ファームはシリアルプロトコル互換 (STATUS / VOLUME / WAV / FACE)、機種差は graceful degradation で吸収。
+USB シリアル経由で Arduino (PlatformIO) ファームを焼く。機種ごとの本体ファームは `firmware/examples/<machine>/main/` に置かれていて、共通シリアルプロトコル (STATUS / VOLUME / WAV / FACE / MOVE / CAPTURE) を実装する。未搭載のハードは graceful degradation で `unavailable` 応答。
 
-| デバイス | ファーム | baud | MOVE | CAPTURE |
+| デバイス | ファーム (PlatformIO env) | baud | MOVE | CAPTURE |
 |---------|---------|------|------|---------|
-| M5Stack 公式 K151 / K151-R (CoreS3 + サーボ + Remote) | XangiBridge | 921600 | ✅ | ✅ |
-| M5Stack CoreS3 単体 (サーボ無し) | XangiBridge | 921600 | 🚫 | ✅ |
-| M5Stack AtomS3R + Atomic Voice Base / Echo Base (ES8311) | AtomVoiceBridge | 115200 | 🚫 | 🚫 |
+| M5Stack 公式 K151 / K151-R (CoreS3 + サーボ + Remote) | `cores3-main` | 921600 | ✅ | ✅ |
+| M5Stack CoreS3 単体 (サーボ無し) | `cores3-main` | 921600 | 🚫 | ✅ |
+| M5Stack AtomS3R + Atomic Voice Base / Echo Base (ES8311) | `atoms3r-main` | 115200 | 🚫 | 🚫 |
+| M5Stack Basic + アールティ Ver.β (SCS0009 ×2) | `basic-main` | 115200 | ✅ | 🚫 |
 
-XangiBridge ではサーボ有無は起動時に自動検出、`STATUS` の `servo` フィールドで現状を取得できる。
+CoreS3 系の本体ファーム (`cores3-main`) はサーボ・カメラ有無を起動時に自動検出、`STATUS` の `servo` / `camera` フィールドで現状を取得できる。
 
 ## 構成
 
@@ -36,8 +37,9 @@ xangi (:18888)
           ├─ thread_id filter
           ├─ piper-plus persistent process
           └─ device (USB serial 共通プロトコル: STATUS / FACE: / WAV:<size> / VOLUME: / MOVE: / CAPTURE)
-              ├─ M5Stack CoreS3 (K151 / K151-R / 単体機、firmware/k151/ XangiBridge、baud 921600)
-              └─ M5Stack AtomS3R + Atomic Voice/Echo Base (firmware/k151/ AtomVoiceBridge、baud 115200)
+              ├─ M5Stack CoreS3 (K151 / K151-R / 単体機、firmware/examples/cores3/main、baud 921600)
+              ├─ M5Stack AtomS3R + Atomic Voice/Echo Base (firmware/examples/atoms3r/main、baud 115200)
+              └─ M5Stack Basic + アールティ Ver.β (firmware/examples/basic/main、baud 115200)
 ```
 
 ## クイックスタート
@@ -56,6 +58,25 @@ uv run xangi-stackchan \
 
 起動すると設定 UI が `http://127.0.0.1:7897/` で立ち上がる。xangi URL / 接続先 / 音量 / TTS / 表情をブラウザから変更でき、保存すると `~/.xangi/xangi-stackchan/config.json` に永続化される。
 
+## 複数台で動かす
+
+xangi-stackchan は同じマシンで複数プロセスを並列起動できる (1 プロセス = 1 スタックチャン)。
+
+```bash
+# 左 (settings UI: 7897)
+uv run xangi-stackchan --instance-id left  --port /dev/stackchan-left  --thread-id left  --settings-port 7897 --tts piper &
+
+# 右 (port 7897 が埋まっているので auto-shift で 7898 になる)
+uv run xangi-stackchan --instance-id right --port /dev/stackchan-right --thread-id right --settings-port 7897 --tts piper &
+```
+
+- 設定 UI の port は `7897` 起点で `+1` ずつ最大 `--port-autoshift-tries` 回 (既定 `10`) auto-shift する
+- `~/.xangi/xangi-stackchan/config.json` は v2 schema で `instances.<id>` namespace を持つ。`--instance-id` で分離 (既存の v1 フラット config は初回保存時に `instances.default` へ自動移行)
+- 2 台以上挿す場合は udev でシリアル番号別の SYMLINK を切って物理デバイスを固定する (例 `/dev/stackchan-left` / `/dev/stackchan-right`)
+- デフォルトでは全プロセスが同じ xangi イベントを受けて一斉に喋る (broadcast)。喋り分けたいときは xangi 側で thread を分けて、各プロセスに `--thread-id` を渡す
+
+詳細 (udev rules サンプル、systemd 設定例、SSE routing の挙動) は [`docs/usage.md`](./docs/usage.md) の「複数台で動かす」セクションを参照。
+
 詳細なセットアップ・オプション・常駐起動・トラブルシュートは [`docs/usage.md`](./docs/usage.md) を参照。
 
 ## AI エージェント連携
@@ -67,12 +88,12 @@ uv run xangi-stackchan \
 - [`docs/usage.md`](./docs/usage.md): セットアップ・オプション・常駐起動・デモ・トラブルシュート
 - [`docs/xangi_bridge_protocol.md`](./docs/xangi_bridge_protocol.md): USB シリアル共通プロトコル仕様
 - [`docs/scservo_protocol.md`](./docs/scservo_protocol.md): Feetech SCS シリアルサーボのプロトコル仕様
-- [`firmware/k151/README.md`](./firmware/k151/README.md): K151 / K151-R 用 Arduino ファームの開発ガイド
+- [`firmware/README.md`](./firmware/README.md): Arduino ファーム群の開発ガイド (機種別 example の一覧と PlatformIO env)
 
 ## 参考
 
 - [m5stack/StackChan](https://github.com/m5stack/StackChan): M5Stack 公式 K151 のリポ (xiaozhi-esp32 ベース、本リポでは仕様情報のみ参照)
-- [stack-chan/stack-chan](https://github.com/stack-chan/stack-chan): 元祖スタックチャン (Apache-2.0、`firmware/k151/` のサーボ制御ロジックの仕様参照元)
+- [stack-chan/stack-chan](https://github.com/stack-chan/stack-chan): 元祖スタックチャン (Apache-2.0、`firmware/lib/scservo/` のサーボ制御ロジックの仕様参照元)
 
 ## ライセンス
 

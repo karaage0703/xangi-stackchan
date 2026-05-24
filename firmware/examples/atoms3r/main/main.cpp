@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 karaage0703
 // SPDX-License-Identifier: MIT
 //
-// firmware/k151 examples/AtomVoiceBridge:
+// firmware/examples/atoms3r/main:
 //   M5Stack AtomS3R + Atomic Voice Base / Atomic Echo Base を xangi のシリアル
 //   経由音声出力デバイスとして動かす受信ファーム。XangiBridge (CoreS3 / K151)
 //   と同じシリアルプロトコルを採用、サーボ・カメラを持たないので MOVE / CAPTURE
@@ -65,7 +65,7 @@ static const char* stateStr(State s) {
     return "unknown";
 }
 
-// === WAV キュー (XangiBridge Step G と同一構造) ============================
+// === WAV キュー (XangiBridge の WAV キュー実装と同一構造) ============================
 struct WavSlot {
     uint8_t* data;
     size_t   len;
@@ -128,7 +128,7 @@ static void sendAckError(const char* err) {
 // === コマンド処理 ============================================================
 
 static void handleStatus() {
-    Serial.printf("{\"state\":\"%s\",\"volume\":%u,\"version\":\"atom-voice-bridge-0.1\","
+    Serial.printf("{\"state\":\"%s\",\"volume\":%u,\"version\":\"atoms3r-main-0.2\","
                   "\"servo\":false,\"torque\":false,\"camera\":false,"
                   "\"queued\":%d,\"playing\":%s}\n",
                   stateStr(g_state), g_volume,
@@ -352,7 +352,7 @@ void setup() {
     Serial.begin(SERIAL_BAUD);
     delay(300);
     Serial.println();
-    Serial.println("[bridge] xangi-stackchan-dev / AtomVoiceBridge 0.1 (AtomS3R + Voice/Echo Base)");
+    Serial.println("[bridge] xangi-stackchan / atoms3r-main 0.2 (AtomS3R + Voice/Echo Base)");
 
     // Speaker config (atama リポ準拠、ES8311 で過変調を避ける)
     auto spk_cfg = M5.Speaker.config();

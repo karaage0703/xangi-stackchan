@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: 2026 karaage0703
 // SPDX-License-Identifier: MIT
 //
-// firmware/k151 examples/SpeakerDemo:
+// firmware/examples/cores3/speaker-demo:
 //   K151 / CoreS3 内蔵スピーカーから WAV を再生する最小ファーム。
 //   サーボには触らない (PY32 VM_EN も叩かない)。
 //
 // 目的:
-//   Step D で xangi SSE bridge から `WAV:<size>\n` + バイナリで受信した
+//   xangi SSE bridge で から `WAV:<size>\n` + バイナリで受信した
 //   音声をそのまま `M5.Speaker.playWav(buf, size)` に流す経路を、外部供給
 //   なしで先に独立検証する。**実機焼き → 音が鳴ること**だけを確認する。
 //
@@ -15,7 +15,7 @@
 //       global バッファに生成し、44 byte の RIFF/WAVE ヘッダを前置きして
 //       PROGMEM 不要の 1 byte 配列にまとめる。
 //     - トリガごとに `M5.Speaker.playWav(buf, size)` を呼んで再生する。
-//   Step D ではこの buf をシリアル受信バッファに置き換えれば良い。
+//   WAV 受信実装ではこの buf をシリアル受信バッファに置き換えれば良い。
 //
 // 動作:
 //   起動時: Speaker init、LCD に「TAP / serial 'p': play」
@@ -41,8 +41,8 @@
 //     mono の最も保守的な組合せのみ生成する。
 //   - **旧 stackchan-atama 試作で piper の 16bit mono 16kHz PCM を
 //     CoreS3 内蔵スピーカーで playWav できることは実機確認済み**。本ファーム
-//     は Step D の前段としてその経路を K151 firmware 内で再現する。
-//   - 周波数 16kHz は piper / VOICEVOX 出力と揃えてある (Step D で変更不要)。
+//     は 本体ファームの前段としてその経路を K151 firmware 内で再現する。
+//   - 周波数 16kHz は piper / VOICEVOX 出力と揃えてある (本体ファームで変更不要)。
 
 #include <M5Unified.h>
 #include <math.h>
