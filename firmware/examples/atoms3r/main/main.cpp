@@ -13,6 +13,8 @@
 //   VOLUME:<0-255>   → setVolume (master + channel) → JSON ack
 //   WAV:<size>       → "READY\n" 返してバイナリ受信、再生キューに push → 即 ack
 //   FACE:<expr>      → setExpression → JSON ack
+//   ROTATE:<0-3>     → 顔の向きを時計回りクオータターン (0=自然/1=CW90/2=180/3=CW270)
+//                      で切替 → JSON ack。既定は起動時 1 (時計回り90度)
 //   MOVE:<yaw,pitch> → {"status":"error","error":"servo not available"}
 //   CAPTURE          → {"status":"error","error":"camera not available"}
 //
@@ -49,7 +51,15 @@ constexpr uint32_t MOUTH_UPDATE_MS   = 80;
 constexpr int      WAV_QUEUE_SIZE    = 4;
 constexpr uint8_t  ATOMIC_ECHO_VOLUME = 192;  // ES8311 で過変調を避ける保守値
 
+// 顔の向き。M5.begin が決める自然な向き (g_base_rotation) を基準に、時計回りの
+// クオータターン数 (g_rotation_step, 0-3) を足して M5.Display.setRotation に渡す。
+//   step 0 = 自然な向き / 1 = 時計回り90度 / 2 = 180度 / 3 = 時計回り270度 (反時計90度)
+// AtomS3R LCD は 128x128 の正方形なので 90 度単位の回転で歪みは出ない。
+constexpr uint8_t  DEFAULT_ROTATION_STEP = 1;  // 既定は時計回り90度
+
 static uint8_t g_volume = ATOMIC_ECHO_VOLUME;
+static uint8_t g_base_rotation  = 0;
+static uint8_t g_rotation_step  = DEFAULT_ROTATION_STEP;
 
 enum class State { Booting, Ready, Receiving, Playing, Error };
 static State g_state = State::Booting;
@@ -97,6 +107,19 @@ static void avatarSay(const char* msg) {
     avatar.setSpeechText(msg);
 }
 
+// Avatar 描画タスクを止めずに M5.Display.setRotation を叩くと、回転途中のフレームと
+// 描画が競合して表示が乱れる。suspend → setRotation → 画面クリア → resume の順で
+// 安全に向きを切り替える。corners は起動時と同じく黒で埋める。
+static bool g_avatar_started = false;
+static void applyRotation() {
+    uint8_t r = static_cast<uint8_t>((g_base_rotation + g_rotation_step) & 0x03);
+    if (g_avatar_started) avatar.suspend();
+    M5.Display.setRotation(r);
+    M5.Display.fillScreen(TFT_BLACK);
+    if (g_avatar_started) avatar.resume();
+    Serial.printf("[bridge] rotation step=%u (display=%u)\n", g_rotation_step, r);
+}
+
 static void setState(State s) {
     g_state = s;
     avatarSay(stateStr(s));
@@ -128,10 +151,12 @@ static void sendAckError(const char* err) {
 // === コマンド処理 ============================================================
 
 static void handleStatus() {
-    Serial.printf("{\"state\":\"%s\",\"volume\":%u,\"version\":\"atoms3r-main-0.2\","
+    Serial.printf("{\"state\":\"%s\",\"volume\":%u,\"version\":\"atoms3r-main-0.3\","
                   "\"servo\":false,\"torque\":false,\"camera\":false,"
+                  "\"rotation\":%u,"
                   "\"queued\":%d,\"playing\":%s}\n",
                   stateStr(g_state), g_volume,
+                  g_rotation_step,
                   wavQueueCount(),
                   g_wav_playing ? "true" : "false");
 }
@@ -159,6 +184,21 @@ static void handleFace(const char* arg) {
     avatar.setExpression(ex);
     char extra[48];
     snprintf(extra, sizeof(extra), "\"face\":\"%s\"", arg);
+    sendAckOk(extra);
+}
+
+// ROTATE:<0-3>\n  顔の向きを時計回りクオータターン数で指定 (0=自然/1=CW90/2=180/3=CW270)
+static void handleRotate(const char* arg) {
+    char* end = nullptr;
+    long n = strtol(arg, &end, 10);
+    if (end == arg || n < 0 || n > 3) {
+        sendAckError("rotation must be 0-3");
+        return;
+    }
+    g_rotation_step = static_cast<uint8_t>(n);
+    applyRotation();
+    char extra[32];
+    snprintf(extra, sizeof(extra), "\"rotation\":%u", g_rotation_step);
     sendAckOk(extra);
 }
 
@@ -316,6 +356,9 @@ static void pollSerialCommand() {
             else if (strncmp(g_line, "FACE:", 5) == 0) {
                 handleFace(g_line + 5);
             }
+            else if (strncmp(g_line, "ROTATE:", 7) == 0) {
+                handleRotate(g_line + 7);
+            }
             else if (strncmp(g_line, "MOVE:", 5) == 0) {
                 sendAckError("servo not available");
             }
@@ -364,10 +407,16 @@ void setup() {
     M5.Speaker.setVolume(g_volume);
     M5.Speaker.setChannelVolume(0, g_volume);
 
+    // 顔の向き: M5.begin が決めた自然な向きを基準に、起動時に既定の回転を適用してから
+    // Avatar を init する (init 前に向きを確定させておくと回転途中フレームが出ない)。
+    g_base_rotation = static_cast<uint8_t>(M5.Display.getRotation() & 0x03);
+    applyRotation();
+
     // Avatar: AtomS3R LCD は 128x128 で小さいので scale 0.5 + position 調整
     avatar.setScale(0.5);
     avatar.setPosition(-56, -96);
     avatar.init();
+    g_avatar_started = true;
     avatar.setExpression(Expression::Neutral);
     avatar.setSpeechText("booting");
     g_state = State::Booting;

@@ -26,7 +26,17 @@ piper-plus を使う場合は、このリポジトリ内でセットアップす
 
 `PIPER_BIN` / `PIPER_MODEL` 環境変数や CLI オプションで上書きできるが、通常は指定不要。
 
-### udev ルール (Linux、オプション)
+### シリアルポートの指定
+
+`/dev/ttyACMx` の番号は再起動・USB 抜き差し・USB の再列挙で変わる。config.json に `/dev/ttyACM0` のような番号付きパスを保存していると、番号がズレた瞬間にデバイスを掴めず喋らなくなる。さらに config.json に保存された `port` は CLI の `--port` より優先されるため、起動時に `--port` で別パスを渡しても効かないことがある (実際に使われたパスは起動ログの `serial_port` フィールドで確認できる)。番号に依存しない固定パスで指定するのが安全。
+
+推奨順:
+
+1. by-id の安定リンク (Linux、最も手軽): `ls /dev/serial/by-id/` に出る `/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_<シリアル>-if00` を `--port` に渡す (config.json の `port` にも同じ値を書く)。udev rules を書かなくてもチップのシリアル番号で固定されるので番号ドリフトに強い。単体運用ならこれが一番簡単。
+2. udev SYMLINK: 下記 udev ルールで `/dev/stackchan` を割り当てる。複数台で名前を付け分けたいときに有効。
+3. `/dev/ttyACMx` 直指定: 番号が変動するので非推奨。検証用の一時起動向け。
+
+#### udev ルール (Linux、オプション)
 
 `/dev/stackchan` を固定 SYMLINK で割り当てたい場合 (`/dev/ttyACMx` の番号変動を避ける):
 
@@ -158,6 +168,9 @@ tail -f /tmp/xangi-stackchan.log
 - `--piper-model`: piper-plus モデル (既定 `models/tsukuyomi-chan-6lang-fp16.onnx`)
 - `--piper-speaker`: マルチスピーカーモデル用の話者 ID (通常不要)
 - `--face-idle`, `--face-thinking`, `--face-talking`, `--face-error`: 状態ごとの表情
+- `--face-mode`: `avatar` (既定) / `sprite`。`sprite` はスプライトシートから状態ごとの画像を切り出して LCD に表示し、row/state + filled-frame tick でまばたき/表情アニメーションする
+- `--sprite-sheet`: `--face-mode sprite` 時に使う `spritesheet.webp`。既定 `assets/pets/default/spritesheet.webp`。このファイルはローカル資産として `.gitignore` 対象
+- `--sprite-jpeg-quality`: `--face-mode sprite` 時にデバイスへ送る JPEG 品質 (1〜95、既定 85)
 - `--move-enabled` / `--no-move-enabled`: 首振り (MOVE) 機能 ON/OFF (既定 ON、K151 SCServo 専用)
 - `--move-idle-yaw` / `--move-idle-pitch`: idle 時の首ポーズ (既定 `0` / `+5`、少し上向き)
 - `--move-thinking-yaw` / `--move-thinking-pitch`: 考え中の首ポーズ (既定 `-8` / `+5`、少し首かしげ)
@@ -165,6 +178,91 @@ tail -f /tmp/xangi-stackchan.log
 - `--move-talking-sway-yaw` / `--move-talking-sway-pitch`: 喋り中のランダム揺らぎ振り幅 (既定 `±4` / `±2`)
 - `--move-talking-sway-interval`: 喋り中のランダム揺らぎ更新間隔 (秒、既定 `1.5`)
 - `--stackchan-retry-seconds`: デバイス切断時の再接続間隔 (秒)
+- `--voice-conversation`: アタマセンサ tap で録音 → STT (faster-whisper) → xangi `POST /api/chat` 投入の音声対話モード (M5Stackchan K151 専用、後述「音声対話モード」参照)
+- `--voice-app-session-id`: 音声対話で xangi に投げる appSessionId。空ならアプリ起動時に専用 web session を自動作成
+- `--voice-silence-dbfs`: VAD 無音判定の dBFS 閾値 (既定 -40、静かな部屋なら -50、騒がしい環境なら -30)
+- `--voice-silence-seconds`: 無音判定後の自動停止までの秒数 (既定 1.5)
+- `--voice-max-seconds`: 最大録音時間 (既定 15、これを超えたら強制停止)
+- `--voice-initial-grace-seconds`: なでてから最初の発話までの猶予秒数 (既定 5)。この間の無音では録音を止めない (考える時間)。最初の有音で通常の無音判定 (`--voice-silence-seconds`) に切り替わり、猶予内に一度も発話が無ければ誤タップとして停止。env `STACKCHAN_VC_INITIAL_GRACE_SECONDS` / 設定 UI でも調整可。
+
+## 音声対話モード
+
+M5Stackchan K151 のアタマセンサ (Si12T 容量タッチ、cores3-main 0.8+) を tap →
+内蔵 PDM マイクで録音 → 無音 1.5 秒で自動停止 → faster-whisper STT (Silero VAD
+フィルタ ON) → xangi `POST /api/chat` 投入。xangi 応答 (turn.complete) は piper
+TTS で発話される (既存経路)。
+
+### 起動例
+
+```bash
+uv run xangi-stackchan \
+  --voice-conversation \
+  --xangi-url http://127.0.0.1:18888 \
+  --device-profile cores3_k151 \
+  --port /dev/ttyACM1 \
+  --volume 30
+```
+
+`--voice-app-session-id` と `--thread-id` を両方指定しなければ、起動時に xangi
+で stackchan 専用の新規 web session を作成して両方に自動セット。これで:
+
+- POST /api/chat は stackchan 専用 session に投入 (他 web セッションを汚さない)
+- SSE event は `thread_id` フィルタで stackchan 専用 thread のみ反応 (Discord/
+  Slack 等の他チャンネルからの message は届かない → Mic 録音中のシリアル衝突を回避)
+
+### 環境変数チューニング
+
+主要パラメータは CLI / 設定 UI (`--voice-silence-dbfs` 等) 経由で変更するのが
+推奨。env はそれら CLI 引数のデフォルト値として使う場合のみ。
+
+| env | 既定 | 内容 |
+|---|---|---|
+| `STACKCHAN_WHISPER_MODEL` | `small` | `tiny`/`base`/`small`/`medium`/`large-v3` |
+| `STACKCHAN_WHISPER_DEVICE` | `cpu` | `cpu` / `cuda` (DGX Spark ARM64 の ctranslate2 は CUDA 未対応、CPU のみ) |
+| `STACKCHAN_WHISPER_COMPUTE` | `int8` | `int8` / `float16` / `float32` |
+| `STACKCHAN_WHISPER_LANGUAGE` | `ja` | ISO 言語コード |
+| `STACKCHAN_WHISPER_BEAM` | `1` | beam_size。大きいと精度↑速度↓ |
+| `STACKCHAN_WHISPER_VAD` | `1` | Silero VAD フィルタ ON (`0` で OFF) |
+| `STACKCHAN_VC_SILENCE_DBFS` | `-40.0` | VoiceConversation 直接生成時の無音 dBFS フォールバック |
+| `STACKCHAN_VC_SILENCE_SECONDS` | `1.5` | 同上 (秒数) |
+| `STACKCHAN_VC_MAX_SECONDS` | `15.0` | 同上 (最大録音秒) |
+| `STACKCHAN_VC_MIN_PCM_BYTES` | `8192` | 短すぎる録音 (誤タップ) を捨てる閾値 |
+| `STACKCHAN_VC_HISTORY_MAX` | `10` | 設定 UI に表示する発話履歴の保持件数 |
+
+### 操作
+
+- アタマセンサ tap (Press) → 録音開始、Avatar が listening 顔 (doubt)
+- 喋る (録音中は Speaker 切断、音声 feedback なし)
+- 1.5 秒無音 (RMS が `-40 dBFS` 未満が継続) で自動 MIC_STOP → STT → POST
+- 録音中の再 tap (Press) で toggle 即停止
+- 15 秒で強制停止 (`--max-record-seconds` 相当の env で調整可)
+
+### 設定 UI から確認・調整
+
+`http://127.0.0.1:7897/` の voice fieldset で以下を実行時に変更可能:
+
+- 音声対話モード ON/OFF (checkbox)
+- appSessionId (空のままなら起動時に自動作成された専用 web session を継続使用)
+- silence threshold (dBFS) / silence seconds / max record seconds の動的調整
+- 直近 10 件の発話履歴 (5 秒ごと自動更新、各 entry は `[時刻] rec=録音秒 stt=処理秒 →status_code "STT結果"`)
+
+履歴は POST 失敗時や STT 空文字でも残るので、「マイクは録れたが xangi に届いて
+ない」「ノイズが拾われて hallucination が出てる」等のトラブルシュートが画面だけで完結する。
+
+### 制約
+
+- M5Stackchan K151 (Si12T 搭載) + シリアル backend (`--wifi` 不可) のみ
+- 録音中は WAV 再生不可 (I2S 共有のため)、ファーム側で Speaker を end → Mic
+  へ切り替え
+- faster-whisper モデル初回 DL (small ≈ 462MB) は最初の transcribe で実行、
+  初回 tap は遅延あり。事前に `uv run python -c "from xangi_stackchan.stt import load_model; load_model()"`
+  で warm-up しておくと初回 STT が速い
+- DGX Spark ARM64 では ctranslate2 の CUDA wheel が未対応で CPU のみ。
+  small/int8 で 2 秒 WAV STT が 1.7 秒、VAD ON で無音 WAV は 0.04 秒。
+  リアル会話に十分な速度
+- 同じ USB serial port を複数プロセスから開こうとすると `fcntl.flock` で即 abort。
+  pkill 等で wrapper だけ殺すと子プロセスが取り残されるバグの再発を防止
+  (`STACKCHAN_NO_SERIAL_LOCK=1` で無効化可)
 
 ## 複数台で動かす
 
@@ -377,6 +475,7 @@ curl http://127.0.0.1:7897/api/camera/status
 - **Permission denied (Linux)**: `sudo usermod -aG dialout $USER` して再ログイン
 - **ポートが見つからない**: USB ケーブルがデータ転送対応か確認 (充電専用ケーブルは NG)
 - **間違ったポートが選ばれる (複数 ESP32 接続時)**: `--port /dev/cu.usbmodem3101` または udev rules で `/dev/stackchan` を固定
+- **再起動・USB 抜き差し後に喋らなくなった (Linux)**: `/dev/ttyACMx` の番号が変わり、config.json の保存値とズレた可能性。config.json の `port` は CLI の `--port` より優先されるので、`~/.xangi/xangi-stackchan/config.json` の `instances.<id>.port` を `/dev/serial/by-id/...` の安定リンクに書き換える (「シリアルポートの指定」参照)。実際に使われたパスは起動ログの `serial_port` で確認できる
 - **音が鳴らない**: `--volume 255` で最大音量
 - **発話開始が遅い**: piper-plus は JSONL 入力の常駐プロセスとして保持する設計のため、初回だけモデルロードが入る。2 回目以降のレスポンスは低遅延になる
 - **piper-plus の発話速度を変えたい**: `PIPER_LENGTH_SCALE=1.2` のように小さくすると速くなる (既定はモデルカード推奨の `1.5`)。発音品質とのトレードオフ

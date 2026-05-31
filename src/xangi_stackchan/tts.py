@@ -34,6 +34,40 @@ DEFAULT_PIPER_LENGTH_SCALE = os.environ.get("PIPER_LENGTH_SCALE", "1.5")
 DEFAULT_PIPER_NOISE_SCALE = os.environ.get("PIPER_NOISE_SCALE", "0.667")
 
 
+def downsample_wav(wav_bytes: bytes, factor: int = 2) -> bytes:
+    """16bit PCM WAV のサンプルレートを 1/factor に落として bytes を返す。
+
+    piper(PiperPlus) は 22050Hz 固定出力で、これを USB シリアルに丸ごと流すと長文応答
+    で送信に時間がかかり会話レイテンシのボトルネックになる。発話用途では 11025Hz 程度
+    でも十分聞き取れるので、送信前にダウンサンプルして転送量を減らす。audioop.ratecv は
+    内蔵ローパス付きでエイリアスを抑える。factor<=1 や解析失敗時は原 bytes をそのまま
+    返す (安全側)。
+    """
+    if factor <= 1 or not wav_bytes:
+        return wav_bytes
+    try:
+        import audioop
+        import io
+        import wave
+
+        with wave.open(io.BytesIO(wav_bytes), "rb") as w:
+            n_ch = w.getnchannels()
+            width = w.getsampwidth()
+            rate = w.getframerate()
+            frames = w.readframes(w.getnframes())
+        new_rate = max(8000, rate // factor)
+        converted, _ = audioop.ratecv(frames, width, n_ch, rate, new_rate, None)
+        out = io.BytesIO()
+        with wave.open(out, "wb") as w:
+            w.setnchannels(n_ch)
+            w.setsampwidth(width)
+            w.setframerate(new_rate)
+            w.writeframes(converted)
+        return out.getvalue()
+    except Exception:
+        return wav_bytes
+
+
 def split_text(text: str, max_len: int = 80) -> list[str]:
     parts = re.findall(r"[^。！？!?\.]+[。！？!?\.]?", text.strip())
     chunks: list[str] = []

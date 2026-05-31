@@ -104,6 +104,9 @@ def config_to_dict(config: BridgeConfig) -> dict[str, Any]:
         "face_thinking": config.face_thinking,
         "face_talking": config.face_talking,
         "face_error": config.face_error,
+        "face_mode": config.face_mode,
+        "sprite_sheet": config.sprite_sheet,
+        "sprite_jpeg_quality": config.sprite_jpeg_quality,
         "stream_timeout": config.stream_timeout,
         "retry_seconds": config.retry_seconds,
         "max_retry_seconds": config.max_retry_seconds,
@@ -117,6 +120,12 @@ def config_to_dict(config: BridgeConfig) -> dict[str, Any]:
         "move_talking_sway_yaw": config.move_talking_sway_yaw,
         "move_talking_sway_pitch": config.move_talking_sway_pitch,
         "move_talking_sway_interval": config.move_talking_sway_interval,
+        "voice_conversation": config.voice_conversation,
+        "voice_app_session_id": config.voice_app_session_id,
+        "voice_silence_dbfs": config.voice_silence_dbfs,
+        "voice_silence_seconds": config.voice_silence_seconds,
+        "voice_max_seconds": config.voice_max_seconds,
+        "voice_initial_grace_seconds": config.voice_initial_grace_seconds,
     }
 
 
@@ -179,6 +188,11 @@ def merge_config(base: BridgeConfig, data: dict[str, Any]) -> BridgeConfig:
         face_thinking=str(data.get("face_thinking", base.face_thinking)),
         face_talking=str(data.get("face_talking", base.face_talking)),
         face_error=str(data.get("face_error", base.face_error)),
+        face_mode=str(data.get("face_mode", base.face_mode)),
+        sprite_sheet=str(data.get("sprite_sheet", base.sprite_sheet)),
+        sprite_jpeg_quality=_clamp(
+            _int_or(data.get("sprite_jpeg_quality"), base.sprite_jpeg_quality), 1, 95
+        ),
         stream_timeout=_int_or(data.get("stream_timeout"), base.stream_timeout),
         retry_seconds=_float_or(data.get("retry_seconds"), base.retry_seconds),
         max_retry_seconds=_float_or(data.get("max_retry_seconds"), base.max_retry_seconds),
@@ -197,6 +211,22 @@ def merge_config(base: BridgeConfig, data: dict[str, Any]) -> BridgeConfig:
         ),
         move_talking_sway_interval=_float_or(
             data.get("move_talking_sway_interval"), base.move_talking_sway_interval
+        ),
+        voice_conversation=_bool(data.get("voice_conversation", base.voice_conversation)),
+        voice_app_session_id=str(
+            data.get("voice_app_session_id", base.voice_app_session_id)
+        ),
+        voice_silence_dbfs=_float_or(
+            data.get("voice_silence_dbfs"), base.voice_silence_dbfs
+        ),
+        voice_silence_seconds=_float_or(
+            data.get("voice_silence_seconds"), base.voice_silence_seconds
+        ),
+        voice_max_seconds=_float_or(
+            data.get("voice_max_seconds"), base.voice_max_seconds
+        ),
+        voice_initial_grace_seconds=_float_or(
+            data.get("voice_initial_grace_seconds"), base.voice_initial_grace_seconds
         ),
     )
 
@@ -225,6 +255,10 @@ class RuntimeState:
         #        "width": W, "height": H, "size": N, "error": Optional[str],
         #        "captured_at_device_ms": Optional[int]}
         self._last_capture: dict[str, Any] | None = None
+        # Phase 2: 音声対話モードの coordinator (VoiceConversation インスタンス)。
+        # run_bridge が config.voice_conversation=True + StackchanSerial backend のとき
+        # set_voice_conversation で登録。`/api/voice/history` から history が読める。
+        self._voice_conv: object | None = None
 
     def snapshot(self) -> tuple[BridgeConfig, int]:
         with self._lock:
@@ -246,6 +280,14 @@ class RuntimeState:
     def get_last_capture(self) -> dict[str, Any] | None:
         with self._lock:
             return self._last_capture
+
+    def set_voice_conversation(self, voice_conv: object | None) -> None:
+        with self._lock:
+            self._voice_conv = voice_conv
+
+    def get_voice_conversation(self) -> object | None:
+        with self._lock:
+            return self._voice_conv
 
     def snapshot_dict(self) -> dict[str, Any]:
         with self._lock:

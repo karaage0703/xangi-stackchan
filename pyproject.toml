@@ -5,8 +5,21 @@ description = "Physical xangi pet bridge for stackchan family devices (K151 / st
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+  "faster-whisper>=1.2.1",
+  "pillow>=11.0",
   "pyserial>=3.5",
   "requests>=2.31",
+]
+
+[project.optional-dependencies]
+# GPU STT: ctranslate2 が CUDA 非対応な環境 (DGX Spark GB10 等) で
+# openai-whisper (PyTorch) にフォールバックして GPU を使うための extra。
+# `uv sync --extra gpu` で導入。torch は GB10(CUDA13/Blackwell) 用に cu130 wheel が
+# 要るため 2.12.0 以上 (cu128 だと cuda False)。numpy は WAV→float32 変換にも使う。
+gpu = [
+  "openai-whisper>=20231117",
+  "torch>=2.12.0",
+  "numpy>=1.24",
 ]
 
 [project.scripts]
@@ -17,7 +30,9 @@ dev = [
   "pytest>=8.0",
 ]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
-

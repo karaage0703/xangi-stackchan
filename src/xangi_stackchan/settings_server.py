@@ -36,6 +36,7 @@ def render_page(state: RuntimeState) -> str:
     cfg = state.snapshot_dict()
     checked = " checked" if cfg.get("wifi") else ""
     move_checked = " checked" if cfg.get("move_enabled") else ""
+    voice_checked = " checked" if cfg.get("voice_conversation") else ""
     return f"""<!doctype html>
 <html lang="ja">
 <head>
@@ -85,10 +86,13 @@ def render_page(state: RuntimeState) -> str:
     </fieldset>
     <fieldset>
       <legend>faces</legend>
+      {_select("face_mode", "mode", cfg["face_mode"], ["avatar", "sprite"])}
       {_field("face_idle", "idle", cfg["face_idle"])}
       {_field("face_thinking", "thinking", cfg["face_thinking"])}
       {_field("face_talking", "talking", cfg["face_talking"])}
       {_field("face_error", "error", cfg["face_error"])}
+      {_field("sprite_sheet", "sprite sheet", cfg["sprite_sheet"])}
+      {_field("sprite_jpeg_quality", "sprite JPEG quality", cfg["sprite_jpeg_quality"], "number")}
     </fieldset>
     <fieldset>
       <legend>movement (MOVE:yaw,pitch / SAFE: yaw±100°, pitch±30°)</legend>
@@ -102,6 +106,19 @@ def render_page(state: RuntimeState) -> str:
       {_field("move_talking_sway_yaw", "talking sway yaw (±°)", cfg["move_talking_sway_yaw"], "number")}
       {_field("move_talking_sway_pitch", "talking sway pitch (±°)", cfg["move_talking_sway_pitch"], "number")}
       {_field("move_talking_sway_interval", "talking sway interval (s)", cfg["move_talking_sway_interval"], "number")}
+    </fieldset>
+    <fieldset>
+      <legend>voice conversation (M5Stackchan K151 のアタマセンサ + 内蔵 PDM マイク経由)</legend>
+      <p class="hint">tap で録音開始 → 無音 1.5 秒で自動停止 → faster-whisper STT → xangi <code>POST /api/chat</code> 投入。応答 TTS は既存経路で発話される。詳細 <code>docs/usage.md</code> の「音声対話モード」。</p>
+      <label class="checkbox"><input name="voice_conversation" type="checkbox"{voice_checked}> 音声対話モードを有効化</label>
+      {_field("voice_app_session_id", "appSessionId (空ならアプリ起動時に専用 web session 自動作成)", cfg["voice_app_session_id"])}
+      {_field("voice_silence_dbfs", "silence threshold (dBFS、静か:-50 / 騒:-30)", cfg["voice_silence_dbfs"], "number")}
+      {_field("voice_silence_seconds", "silence seconds (自動停止までの無音秒数)", cfg["voice_silence_seconds"], "number")}
+      {_field("voice_max_seconds", "max record seconds (強制停止)", cfg["voice_max_seconds"], "number")}
+      <div style="margin-top:12px;">
+        <strong>直近の発話履歴 (上から新しい順、5 秒ごと自動更新):</strong>
+        <pre id="vc-history" style="background:#eee4d2; padding:8px; border-radius:8px; max-height:240px; overflow-y:auto; white-space:pre-wrap; margin-top:6px;">(まだ録音なし)</pre>
+      </div>
     </fieldset>
     <button type="submit">保存して反映</button>
   </form>
@@ -129,6 +146,38 @@ def render_page(state: RuntimeState) -> str:
   </fieldset>
   <script>
     (function() {{
+      // 発話履歴 polling (voice_conversation 有効時のみ意味あり)。
+      const vcHistory = document.getElementById('vc-history');
+      if (vcHistory) {{
+        const fmt = (ts) => {{
+          if (!ts) return '?';
+          const d = new Date(ts * 1000);
+          const pad = (n) => String(n).padStart(2, '0');
+          return `${{pad(d.getHours())}}:${{pad(d.getMinutes())}}:${{pad(d.getSeconds())}}`;
+        }};
+        const render = (data) => {{
+          if (!data.history || data.history.length === 0) {{
+            vcHistory.textContent = '(まだ録音なし)';
+            return;
+          }}
+          const lines = data.history.slice().reverse().map((e) => {{
+            const dur = e.duration_seconds != null ? `${{e.duration_seconds.toFixed(2)}}s` : '-';
+            const ela = e.elapsed_seconds != null ? `${{e.elapsed_seconds.toFixed(2)}}s` : '-';
+            const sent = e.sent_status != null ? `→${{e.sent_status}}` : '';
+            return `[${{fmt(e.ts)}}] rec=${{dur}} stt=${{ela}} ${{sent}}\n  "${{e.text || '(empty)'}}"`;
+          }});
+          vcHistory.textContent = lines.join('\\n');
+        }};
+        const fetchHistory = async () => {{
+          try {{
+            const r = await fetch('/api/voice/history');
+            if (r.ok) render(await r.json());
+          }} catch (e) {{}}
+        }};
+        fetchHistory();
+        setInterval(fetchHistory, 5000);
+      }}
+
       const shutter = document.getElementById('camera-shutter');
       const preview = document.getElementById('camera-preview');
       const status = document.getElementById('camera-status');
@@ -160,6 +209,7 @@ def _flatten_form(raw: bytes) -> dict[str, object]:
     data = {key: values[-1] for key, values in parsed.items()}
     data["wifi"] = "wifi" in parsed
     data["move_enabled"] = "move_enabled" in parsed
+    data["voice_conversation"] = "voice_conversation" in parsed
     return data
 
 
@@ -261,6 +311,21 @@ def make_handler(state: RuntimeState):
                     cached = result
                 self._send(200, bytes(cached["image_jpeg"]), "image/jpeg")
                 return
+            if self.path == "/api/voice/history":
+                # voice_conversation.history (直近 N 件の STT + POST 結果) を返す。
+                # 設定 UI の polling 表示 + デバッグ用。voice_conversation 無効起動時
+                # や VoiceConversation 未生成 (WiFi backend 等) は status=ok + 空配列。
+                vc = state.get_voice_conversation()
+                history = []
+                if vc is not None:
+                    history = list(getattr(vc, "history", []))
+                payload = {"status": "ok", "history": history, "count": len(history)}
+                self._send(
+                    200,
+                    json.dumps(payload, ensure_ascii=False).encode(),
+                    "application/json; charset=utf-8",
+                )
+                return
             if self.path == "/api/camera/status":
                 cached = state.get_last_capture()
                 if cached is None:
@@ -350,7 +415,7 @@ def start_settings_server(
     ``autoshift_tries=1`` keeps the previous fail-fast behaviour and binds to
     ``port`` exactly. With ``autoshift_tries>1`` the server tries ``port``,
     ``port+1`` ... up to ``autoshift_tries`` candidates and binds the first
-    free one (modelled after xangi-pets-dev ``PORT_AUTOSHIFT_TRIES``).
+    free one.
 
     Returns ``(server, bound_port)``. The caller is expected to log the
     bound port so concurrent instances on the same host can be told apart.

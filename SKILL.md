@@ -59,22 +59,44 @@ cd [SKILL_DIR]
 setsid -f bash -c 'cd '"$PWD"' && exec uv run xangi-stackchan \
   --xangi-url http://127.0.0.1:18888 \
   --port /dev/stackchan \
-  --baud 115200 \
+  --device-profile cores3_k151 \
   --volume 200 \
   --tts piper \
   --stackchan-retry-seconds 3 \
   --settings-port 7897' </dev/null >>/tmp/xangi-stackchan.log 2>&1
 ```
 
+音声対話 (アタマセンサをなでて話しかける) も有効にする場合は `--voice-conversation` を足す (K151 専用)。STT モデルは `STACKCHAN_WHISPER_MODEL=medium` を前置すると短い発話を取りこぼしにくい (`small` は VAD でこぼしやすい)。voice 用設定が通常運用と混ざらないよう `--instance-id` を分けると良い:
+
+```bash
+cd [SKILL_DIR]
+setsid -f bash -c 'cd '"$PWD"' && STACKCHAN_WHISPER_MODEL=medium exec uv run xangi-stackchan \
+  --xangi-url http://127.0.0.1:18888 \
+  --port /dev/stackchan \
+  --device-profile cores3_k151 \
+  --volume 80 \
+  --tts piper \
+  --settings-port 7897 \
+  --voice-conversation \
+  --instance-id voice' </dev/null >>/tmp/xangi-stackchan.log 2>&1
+```
+
+注意: 1 デバイス = 1 プロセス。同じシリアルポートに複数ブリッジを並走させると先発がポートを掴んだまま後発が応答できず「なでても無反応」になる。起動前に `pgrep -fa xangi-stackchan` で重複が無いか確認する。
+
 オプション要点:
 
 - `--xangi-url`: 接続先 xangi (既定 `http://127.0.0.1:18888`)
-- `--port`: USB シリアル (udev で `/dev/stackchan` 固定推奨)
-- `--baud`: `921600` (CoreS3 系 XangiBridge) / `115200` (AtomS3R 系 AtomVoiceBridge)
+- `--port`: USB シリアル。`/dev/ttyACMx` は USB 再列挙で番号が変わるので、番号非依存の固定パスを使う。Linux なら `/dev/serial/by-id/...` の安定リンク (`ls /dev/serial/by-id/` で確認) か、udev で `/dev/stackchan` を固定するのが安全。config.json の `port` は CLI `--port` より優先されるので、番号付きパスが保存されていると番号ズレ時に無反応になる (起動ログの `serial_port` で実際に使われたパスを確認)
+- `--device-profile`: `cores3_k151` / `cores3_standalone` / `atoms3r` / `rt_beta` (baud / WAV 上限 / capability をまとめて設定)。指定時は `--baud` 不要
+- `--baud`: profile 未指定時のみ。`921600` (CoreS3 系) / `115200` (AtomS3R / rt_beta 系)
 - `--volume`: 0〜255 (既定 255、AtomS3R + Voice Base は ES8311 過変調防止で 192 以下推奨)
 - `--tts`: `piper` / `voicevox` / `none`
+- `--face-mode`: `avatar` / `sprite`。`sprite` は `spritesheet.webp` を LCD 画像顔として送り、filled-frame tick でまばたき/表情アニメーションする
+- `--sprite-sheet`: `--face-mode sprite` 用の `spritesheet.webp` (既定 `assets/pets/default/spritesheet.webp`)。スプライト本体は `.gitignore` 対象でコミットしない
 - `--settings-port`: 設定 UI の port (既定 7897)
-- `--settings-bind`: LAN/Tailscale 公開時は `0.0.0.0`
+- `--settings-bind`: 既定 `127.0.0.1`。同一マシン以外 (LAN / Tailscale 等の別端末) から設定 UI を開きたい場合のみ `0.0.0.0`
+- `--voice-conversation`: アタマセンサなで → 録音 → STT → xangi 投入の音声対話モード (K151 専用)
+- `--instance-id`: config namespace。用途別 (通常運用 / voice 等) に分けると設定が混ざらない
 
 ログ確認:
 
@@ -84,7 +106,7 @@ tail -f /tmp/xangi-stackchan.log
 
 ## Step 3: 設定 UI 経由でランタイム設定変更
 
-ブラウザで <http://127.0.0.1:7897/> を開くと以下を変更できる。
+ブラウザで <http://127.0.0.1:7897/> (同一マシン) を開くと以下を変更できる。別端末から開く場合は `--settings-bind 0.0.0.0` で起動した上で、そのマシンの LAN / Tailscale アドレスの `:7897` にアクセスする。
 
 - xangi URL / thread filter
 - USB 接続先・音量

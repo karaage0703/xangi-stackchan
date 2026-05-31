@@ -15,6 +15,8 @@
 //                        (実際の再生は wavPlayTask が別 task で処理)
 //     FACE:<expr>      → setExpression → JSON ack {"status":"ok","face":"..."}
 //                        expr: neutral / happy / sad / doubt / sleepy / angry
+//     IMAGE:<size>     → "READY\n" 返して JPEG を受信し、LCD に画像顔として表示
+//                        → JSON ack {"status":"ok","image":N}
 //     MOVE:<yaw,pitch> → setAngleYaw + setAnglePitch (zero ベース角度) → JSON ack
 //                        {"status":"ok","yaw":N,"pitch":N} (サーボ統合 PR で実装)
 //
@@ -49,6 +51,7 @@
 #include <string.h>
 
 #include "SCServo.h"
+#include "Si12T.h"
 
 using m5avatar::Avatar;
 using m5avatar::Expression;
@@ -63,6 +66,35 @@ constexpr uint32_t MOUTH_UPDATE_MS   = 80;       // 口パク更新間隔
 constexpr int      WAV_QUEUE_SIZE    = 4;        // WAV キュー slot 数 (ring buffer)
 constexpr uint8_t  JPEG_QUALITY      = 80;       // CAPTURE で frame2jpg に渡す品質 (0-100)
 constexpr size_t   MAX_JPEG_BYTES    = 256 * 1024;  // 想定上限 (320x240 RGB565→JPEG はせいぜい 30KB)
+constexpr size_t   MAX_IMAGE_BYTES   = 512 * 1024;  // host から送る LCD 用 JPEG 画像の上限
+constexpr size_t   MAX_RECT_BYTES    = 320 * 240 * 2;  // host から送る RGB565 dirty rect 上限
+// IMAGE/RECT のバイナリ受信中、1 chunk 到着までの最大空き時間。ホスト側の READY
+// 待ち (3s) より十分短くする。長いとホストが READY を諦めて次の IMAGE:<size>\n を
+// 送った時、ファームがまだ前フレームの受信ループに居座り、その IMAGE:... テキストを
+// JPEG バイナリとして食ってフレーム境界が恒久的にずれる (READY 不達の連鎖)。短く
+// すればホストが諦める前に受信ループを抜けてコマンド待ちに復帰でき、自動再同期する。
+constexpr uint32_t IMAGE_CHUNK_TIMEOUT_MS = 1500;
+constexpr uint32_t BATTERY_UPDATE_MS = 5000;
+
+// === マイク録音 (MIC_START / MIC_STOP / MIC_PCM) ==============================
+// CoreS3 内蔵 PDM マイクで 16-bit signed mono PCM @ 16kHz を取得し、64ms 単位
+// (1024 sample = 2048 byte) のチャンクで `MIC_PCM:<size>\n<binary>` 形式で host に
+// 流す。host 側で蓄積 → silero-vad で無音検出 → faster-whisper STT 想定 (本 PR は
+// stream 配信までの最小実装、無音検出と STT は host 側別 PR)。
+//
+// CoreS3 はスピーカーとマイクが I2S0 を共有するため、Mic.begin() の前に
+// Speaker.end() で I2S を解放、MIC_STOP で逆順に Speaker.begin() で復帰する。
+// 録音中は WAV 再生不可 (キューに積んでも playWav が音を出せない)。host 側で
+// `mic_recording=true` の間 WAV 送信を抑止する想定。
+constexpr uint32_t MIC_SAMPLE_RATE    = 16000;
+constexpr size_t   MIC_CHUNK_SAMPLES  = 1024;        // 64ms @ 16kHz
+constexpr size_t   MIC_CHUNK_BYTES    = MIC_CHUNK_SAMPLES * sizeof(int16_t);
+constexpr uint32_t MIC_STOP_WAIT_MS   = 200;         // 録音タスク終了待ち
+// 録音開始からの最大経過時間 (ms)。host が SIGKILL 等で死んで MIC_STOP を送れな
+// かった場合の保険。これを超えたら自動で MIC モードを抜けて Speaker 復帰する。
+// 通常の host 制御では _on_pcm_chunk で 15 秒 (voice_max_seconds) で自動 stop が
+// 走るので、ここはより長め (60 秒) に取って正常系を邪魔しない。
+constexpr uint32_t MIC_WATCHDOG_MS    = 60000;
 
 // CoreS3 の UART1 ピン (docs/scservo_protocol.md §1)
 constexpr int8_t SERVO_RX_PIN = 7;
@@ -79,6 +111,27 @@ static uint8_t g_volume = 128;
 static bool    g_servo_ready  = false;
 static bool    g_servo_torque = false;
 static bool    g_camera_ready = false;
+
+// アタマタッチセンサ (M5Stack 公式 StackChan K151 内蔵 Si12T、3 ch capacitive)。
+// K151 / K151-R では本体内に組み込まれている。CoreS3 単体機 (StackChan body 無し)
+// では I2C bus に device が存在しないので begin() が false を返し、polling task は
+// 起動しない (graceful degradation: head_touch 機能だけ unavailable)。
+static Si12T   g_head_touch;
+static bool    g_head_touch_ready = false;
+// なでなで feedback (Press で Happy + "nade nade!") の有効/無効。voice_conversation
+// モードでは「press 直後に MIC_START → Doubt + listening」がすぐ表示されるのを
+// 優先して、なでなで feedback を抑制する。host から `HEADTOUCH_AVATAR:on|off` で
+// 切替。デフォルト on (従来挙動を維持)。
+static bool    g_head_touch_avatar = true;
+
+// マイク録音状態。host 側 `MIC_START` で true、`MIC_STOP` で false。録音中は
+// micRecordTask が PDM マイクから 16-bit PCM をチャンクで切り出して Serial に
+// stream 配信する。STATUS の "mic_recording" でホスト側 polling 可能。
+static volatile bool g_mic_recording = false;
+static volatile uint32_t g_mic_start_ms = 0;  // 録音開始時刻 (watchdog 用)
+static volatile bool g_mic_watchdog_fired = false;  // watchdog 発火フラグ
+static TaskHandle_t  g_mic_task      = nullptr;
+static int16_t       g_mic_buffer[MIC_CHUNK_SAMPLES];
 
 enum class State { Booting, Ready, Receiving, Playing, Error };
 static State g_state = State::Booting;
@@ -127,6 +180,20 @@ static bool wavQueuePush(uint8_t* data, size_t len) {
 
 static Avatar avatar;
 static SCServo servo(Serial1, SERVO_RX_PIN, SERVO_TX_PIN);
+
+// スプライトを host 側で JPEG 化して送る画像顔モード。
+// IMAGE を受けたら Avatar draw task を suspend し、以後 LCD にはこの JPEG と
+// バッテリー overlay を描く。FACE を受けたら Avatar モードに戻る。
+static uint8_t* g_image_face_jpeg = nullptr;
+static size_t   g_image_face_len = 0;
+static bool     g_image_face_active = false;
+static bool     g_image_face_dirty = false;
+static M5Canvas g_image_face_canvas(&M5.Display);
+static bool     g_image_face_canvas_ready = false;
+static uint32_t g_last_battery_update_ms = 0;
+static int32_t  g_battery_level = -1;
+static int16_t  g_battery_voltage_mv = -1;
+static m5::Power_Class::is_charging_t g_battery_charging = m5::Power_Class::charge_unknown;
 
 // === PY32 IO Expander 経由でサーボバス電源 (VM_EN) を ON にする =================
 // firmware/examples/cores3/safe-startup/main.cpp の py32 namespace と同一仕様 (docs §11.4.1)。
@@ -236,8 +303,85 @@ static void avatarSay(const char* msg) {
 
 static void setState(State s) {
     g_state = s;
-    avatarSay(stateStr(s));
+    if (!g_image_face_active) {
+        avatarSay(stateStr(s));
+    }
     Serial.printf("[bridge] state=%s\n", stateStr(s));
+}
+
+static void updateBatteryInfo(bool force = false) {
+    uint32_t now = millis();
+    if (!force && now - g_last_battery_update_ms < BATTERY_UPDATE_MS) return;
+    g_last_battery_update_ms = now;
+    g_battery_level = M5.Power.getBatteryLevel();
+    g_battery_voltage_mv = M5.Power.getBatteryVoltage();
+    g_battery_charging = M5.Power.isCharging();
+
+    if (!g_image_face_active && avatar.isDrawing()) {
+        bool charging = (g_battery_charging == m5::Power_Class::is_charging);
+        avatar.setBatteryStatus(charging, g_battery_level);
+    }
+}
+
+template <typename Gfx>
+static void drawBatteryOverlayOn(Gfx& gfx) {
+    updateBatteryInfo();
+    int32_t level = g_battery_level;
+    if (level < 0) level = 0;
+    if (level > 100) level = 100;
+    bool charging = (g_battery_charging == m5::Power_Class::is_charging);
+
+    constexpr int x = 260;
+    constexpr int y = 8;
+    constexpr int w = 44;
+    constexpr int h = 16;
+    uint16_t fg = (level <= 20 && !charging) ? TFT_RED : TFT_WHITE;
+
+    gfx.fillRoundRect(x - 6, y - 4, 58, 28, 4, TFT_BLACK);
+    gfx.drawRect(x, y + 3, 4, 8, fg);
+    gfx.drawRect(x + 4, y, w, h, fg);
+    int fill = (w - 4) * level / 100;
+    gfx.fillRect(x + 6 + (w - 4 - fill), y + 2, fill, h - 4, fg);
+    if (charging) {
+        gfx.setTextColor(TFT_YELLOW, TFT_BLACK);
+        gfx.drawString("+", x - 3, y - 1);
+    }
+    gfx.setTextColor(fg, TFT_BLACK);
+    gfx.setTextSize(1);
+    gfx.drawRightString(String(level) + "%", x + w, y + h + 2);
+}
+
+static void drawBatteryOverlay() {
+    drawBatteryOverlayOn(M5.Display);
+}
+
+static void ensureImageFaceCanvas() {
+    if (g_image_face_canvas_ready) return;
+    g_image_face_canvas.setColorDepth(16);
+    g_image_face_canvas.createSprite(320, 240);
+    g_image_face_canvas_ready = true;
+}
+
+static void drawImageFace(bool force = false) {
+    if (!g_image_face_active || !g_image_face_jpeg || g_image_face_len == 0) return;
+    if (!force && !g_image_face_dirty) return;
+    ensureImageFaceCanvas();
+    g_image_face_canvas.fillScreen(TFT_BLACK);
+    bool ok = g_image_face_canvas.drawJpg(g_image_face_jpeg, g_image_face_len, 0, 0, 320, 240, 0, 0);
+    drawBatteryOverlayOn(g_image_face_canvas);
+    g_image_face_canvas.pushSprite(0, 0);
+    g_image_face_dirty = false;
+    Serial.printf("[bridge] image face draw: %s size=%u\n",
+                  ok ? "ok" : "failed", static_cast<unsigned>(g_image_face_len));
+}
+
+static void activateAvatarFace() {
+    if (g_image_face_active) {
+        g_image_face_active = false;
+        avatar.resume();
+        avatar.setBatteryIcon(true);
+        updateBatteryInfo(true);
+    }
 }
 
 // FACE 文字列 → Expression 変換。未知は false 返す。
@@ -252,33 +396,52 @@ static bool exprFromString(const char* s, Expression& out) {
 }
 
 // === シリアル送信 ============================================================
+// ESP32 Arduino の Serial.printf / println は内部 TX buffer に書くだけで自動 flush
+// しない。応答が「次の応答までまとめて batch 送信」されると host 側 send_command の
+// expect_line が timeout して順序がズレる (2026-05-27 23:27 で発覚)。各 ack 関数の
+// 末尾で Serial.flush() を呼んで即時送信する。
 static void sendAckOk(const char* extra = nullptr) {
     if (extra) {
         Serial.printf("{\"status\":\"ok\",%s}\n", extra);
     } else {
         Serial.println("{\"status\":\"ok\"}");
     }
+    Serial.flush();
 }
 
 static void sendAckError(const char* err) {
     Serial.printf("{\"status\":\"error\",\"error\":\"%s\"}\n", err);
+    Serial.flush();
 }
 
 static void sendAckUnsupported(const char* cmd) {
     Serial.printf("{\"status\":\"unsupported\",\"cmd\":\"%s\"}\n", cmd);
+    Serial.flush();
 }
 
 // === コマンド処理 ============================================================
 
 static void handleStatus() {
-    Serial.printf("{\"state\":\"%s\",\"volume\":%u,\"version\":\"cores3-main-0.7\","
-                  "\"servo\":%s,\"torque\":%s,\"camera\":%s,\"queued\":%d,\"playing\":%s}\n",
+    updateBatteryInfo(true);
+    Serial.printf("{\"state\":\"%s\",\"volume\":%u,\"version\":\"cores3-main-0.15\","
+                  "\"servo\":%s,\"torque\":%s,\"camera\":%s,\"head_touch\":%s,"
+                  "\"mic_recording\":%s,\"queued\":%d,\"playing\":%s,"
+                  "\"image_face\":%s,\"battery_level\":%ld,"
+                  "\"battery_voltage_mv\":%d,\"charging\":\"%s\"}\n",
                   stateStr(g_state), g_volume,
                   g_servo_ready  ? "true" : "false",
                   g_servo_torque ? "true" : "false",
                   g_camera_ready ? "true" : "false",
+                  g_head_touch_ready ? "true" : "false",
+                  g_mic_recording ? "true" : "false",
                   wavQueueCount(),
-                  g_wav_playing ? "true" : "false");
+                  g_wav_playing ? "true" : "false",
+                  g_image_face_active ? "true" : "false",
+                  static_cast<long>(g_battery_level),
+                  g_battery_voltage_mv,
+                  g_battery_charging == m5::Power_Class::is_charging ? "charging" :
+                    (g_battery_charging == m5::Power_Class::is_discharging ? "discharging" : "unknown"));
+    Serial.flush();
 }
 
 // CAPTURE\n
@@ -296,6 +459,12 @@ static void handleStatus() {
 // 320x240 RGB565 = 153600 bytes、JPEG 80 で 5-30KB に圧縮。frame2jpg は ESP-IDF
 // esp32-camera 内蔵のヘルパー。921600bps シリアルなら 30KB JPEG は ~330ms で送信。
 static void handleCapture() {
+    if (g_mic_recording) {
+        // Mic と Speaker / Camera は I2S/I2C を共有してないが、Mic 録音中は
+        // ホスト側で動かすべき経路ではないので二重防御。
+        sendAckError("mic recording active");
+        return;
+    }
     if (!g_camera_ready) {
         sendAckError("camera not ready");
         return;
@@ -436,9 +605,163 @@ static void handleFace(const char* arg) {
         sendAckError(err);
         return;
     }
+    activateAvatarFace();
     avatar.setExpression(ex);
     char extra[48];
     snprintf(extra, sizeof(extra), "\"face\":\"%s\"", arg);
+    sendAckOk(extra);
+}
+
+// IMAGE:<size>\n
+// host 側で 320x240 JPEG に変換済みの画像顔を受信して LCD に描画する。
+static void handleImage(size_t size) {
+    if (g_mic_recording) {
+        sendAckError("mic recording active");
+        return;
+    }
+    if (size == 0) {
+        sendAckError("size=0");
+        return;
+    }
+    if (size > MAX_IMAGE_BYTES) {
+        sendAckError("size exceeds MAX_IMAGE_BYTES");
+        return;
+    }
+
+    uint8_t* buf = static_cast<uint8_t*>(ps_malloc(size));
+    if (!buf) {
+        sendAckError("ps_malloc failed");
+        return;
+    }
+
+    Serial.printf("[bridge] image recv start, expect=%u\n", static_cast<unsigned>(size));
+    Serial.println("READY");
+    Serial.flush();
+
+    size_t received = 0;
+    uint32_t last_byte_ms = millis();
+    while (received < size) {
+        int avail = Serial.available();
+        if (avail > 0) {
+            size_t want = static_cast<size_t>(avail);
+            if (want > size - received) want = size - received;
+            int got = Serial.readBytes(buf + received, want);
+            if (got > 0) {
+                received += static_cast<size_t>(got);
+                last_byte_ms = millis();
+            }
+        } else {
+            if (millis() - last_byte_ms > IMAGE_CHUNK_TIMEOUT_MS) {
+                free(buf);
+                sendAckError("recv timeout");
+                return;
+            }
+            M5.update();
+            delay(1);
+        }
+    }
+
+    if (g_image_face_jpeg) {
+        free(g_image_face_jpeg);
+    }
+    g_image_face_jpeg = buf;
+    g_image_face_len = received;
+    g_image_face_active = true;
+    g_image_face_dirty = true;
+    avatar.suspend();
+    updateBatteryInfo(true);
+
+    char extra[96];
+    snprintf(extra, sizeof(extra), "\"image\":%u,\"battery_level\":%ld",
+             static_cast<unsigned>(received), static_cast<long>(g_battery_level));
+    sendAckOk(extra);
+    drawImageFace(true);
+}
+
+// RECT:<x>,<y>,<w>,<h>,<size>\n
+// host 側で前フレームとの差分 bbox を RGB565 little-endian に変換済みの矩形。
+// JPEG 全画面再描画ではなく pushImage で変化した矩形だけ更新する。
+static void handleRect(const char* arg) {
+    if (g_mic_recording) {
+        sendAckError("mic recording active");
+        return;
+    }
+
+    int x = 0, y = 0, w = 0, h = 0;
+    long n = 0;
+    if (sscanf(arg, "%d,%d,%d,%d,%ld", &x, &y, &w, &h, &n) != 5) {
+        sendAckError("RECT syntax: x,y,w,h,size");
+        return;
+    }
+    if (x < 0 || y < 0 || w <= 0 || h <= 0 || x + w > 320 || y + h > 240) {
+        sendAckError("rect out of bounds");
+        return;
+    }
+    if (n <= 0 || static_cast<size_t>(n) > MAX_RECT_BYTES) {
+        sendAckError("rect size out of range");
+        return;
+    }
+    size_t size = static_cast<size_t>(n);
+    if (size != static_cast<size_t>(w) * static_cast<size_t>(h) * 2) {
+        sendAckError("rect size mismatch");
+        return;
+    }
+
+    uint8_t* buf = static_cast<uint8_t*>(ps_malloc(size));
+    if (!buf) {
+        sendAckError("ps_malloc failed");
+        return;
+    }
+
+    Serial.printf("[bridge] rect recv start x=%d y=%d w=%d h=%d size=%u\n",
+                  x, y, w, h, static_cast<unsigned>(size));
+    Serial.println("READY");
+    Serial.flush();
+
+    size_t received = 0;
+    uint32_t last_byte_ms = millis();
+    while (received < size) {
+        int avail = Serial.available();
+        if (avail > 0) {
+            size_t want = static_cast<size_t>(avail);
+            if (want > size - received) want = size - received;
+            int got = Serial.readBytes(buf + received, want);
+            if (got > 0) {
+                received += static_cast<size_t>(got);
+                last_byte_ms = millis();
+            }
+        } else {
+            if (millis() - last_byte_ms > IMAGE_CHUNK_TIMEOUT_MS) {
+                free(buf);
+                sendAckError("recv timeout");
+                return;
+            }
+            M5.update();
+            delay(1);
+        }
+    }
+
+    if (!g_image_face_active) {
+        if (g_image_face_jpeg) {
+            free(g_image_face_jpeg);
+            g_image_face_jpeg = nullptr;
+            g_image_face_len = 0;
+        }
+        g_image_face_active = true;
+        avatar.suspend();
+        M5.Display.fillScreen(TFT_BLACK);
+        updateBatteryInfo(true);
+    }
+
+    M5.Display.pushImage(x, y, w, h, reinterpret_cast<uint16_t*>(buf));
+    free(buf);
+    drawBatteryOverlay();
+    g_image_face_dirty = false;
+
+    char extra[128];
+    snprintf(extra, sizeof(extra),
+             "\"rect\":[%d,%d,%d,%d],\"bytes\":%u,\"battery_level\":%ld",
+             x, y, w, h, static_cast<unsigned>(size), static_cast<long>(g_battery_level));
     sendAckOk(extra);
 }
 
@@ -455,6 +778,13 @@ static void handleFace(const char* arg) {
 // failure path で必ず free + ack 整合性を保つこと (push 失敗時に free 漏れすると
 // PSRAM が無くなる)。push 成功後の所有権は wavPlayTask へ移る。
 static void handleWav(size_t size) {
+    if (g_mic_recording) {
+        // Mic と Speaker は I2S 共有。録音中の playWav は不可。host 側で skip
+        // すべきだが、二重防御として拒否応答 (chunk binary が流れ込む前にエラー
+        // を返すことでシリアル汚染も防ぐ)。
+        sendAckError("mic recording active");
+        return;
+    }
     if (size == 0) {
         sendAckError("size=0");
         return;
@@ -577,12 +907,16 @@ static void wavPlayTask(void* /*param*/) {
             if (millis() - last_mouth_ms > MOUTH_UPDATE_MS) {
                 // 0.2..0.9 のランダム開口で「喋ってる感」を出す。
                 float ratio = 0.2f + (static_cast<float>(esp_random() % 700) / 1000.0f);
-                avatar.setMouthOpenRatio(ratio);
+                if (!g_image_face_active) {
+                    avatar.setMouthOpenRatio(ratio);
+                }
                 last_mouth_ms = millis();
             }
             vTaskDelay(pdMS_TO_TICKS(PLAY_POLL_INTERVAL_MS));
         }
-        avatar.setMouthOpenRatio(0.0f);
+        if (!g_image_face_active) {
+            avatar.setMouthOpenRatio(0.0f);
+        }
 
         free(data);
         g_wav_playing = false;
@@ -607,6 +941,161 @@ static void emitAudioStopped(const char* reason) {
                   reason, static_cast<unsigned long>(millis()));
 }
 
+// アタマタッチセンサ (Si12T) のジェスチャ通知。M5Stack 公式 StackChan K151 の
+// 頭部 3 ch capacitive touch (前/中/後ろ) を Press / Release / SwipeForward /
+// SwipeBackward の 4 ジェスチャに集約。host 側は音声入力トリガ等として利用する。
+static void emitHeadTouch(const char* gesture) {
+    Serial.printf("{\"event\":\"head_touch\",\"gesture\":\"%s\",\"at\":%lu}\n",
+                  gesture, static_cast<unsigned long>(millis()));
+}
+
+static const char* headTouchGestureName(Si12T::Gesture g) {
+    switch (g) {
+        case Si12T::Gesture::Press:         return "press";
+        case Si12T::Gesture::Release:       return "release";
+        case Si12T::Gesture::SwipeForward:  return "swipe_forward";
+        case Si12T::Gesture::SwipeBackward: return "swipe_backward";
+        default:                            return "none";
+    }
+}
+
+// アタマなでなで時の Avatar feedback。press で Happy 顔 + "nade nade!" 表示、
+// release で Neutral 戻し。録音中 (g_mic_recording = listening 顔) と再生中
+// (g_wav_playing = talking 顔) は触らず、それぞれの UX feedback を保つ。
+static void applyHeadTouchAvatar(Si12T::Gesture g) {
+    if (!g_head_touch_avatar) return;  // host から抑制指示あり (voice_conversation 中)
+    if (g_mic_recording || g_wav_playing) return;
+    switch (g) {
+        case Si12T::Gesture::Press:
+            avatar.setExpression(Expression::Happy);
+            avatar.setSpeechText("nade nade!");
+            break;
+        case Si12T::Gesture::Release:
+            avatar.setExpression(Expression::Neutral);
+            avatar.setSpeechText("");
+            break;
+        case Si12T::Gesture::SwipeForward:
+        case Si12T::Gesture::SwipeBackward:
+            // スワイプ中も Happy のまま (Release で戻す)
+            break;
+        default:
+            break;
+    }
+}
+
+static void headTouchPollTask(void* /*param*/) {
+    for (;;) {
+        if (g_head_touch_ready) {
+            Si12T::Gesture g = g_head_touch.poll();
+            if (g != Si12T::Gesture::None) {
+                emitHeadTouch(headTouchGestureName(g));
+                applyHeadTouchAvatar(g);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+// === マイク PCM stream =======================================================
+// 録音タスク本体。`M5.Mic.record` は非同期 DMA キャプチャを request して即返る。
+// `M5.Mic.isRecording()` が 0 になるのを polling して完了確認 → buffer を Serial に
+// `MIC_PCM:<size>\n<binary>` で送信。1024 sample = 64ms @ 16kHz、毎チャンク 2048
+// byte なので 921600 baud (= 92KB/s) 上で 32KB/s 占有、十分余裕。
+static void micRecordTask(void* /*param*/) {
+    while (g_mic_recording) {
+        // host 死亡 watchdog: MIC_START から MIC_WATCHDOG_MS 経過したら強制 stop。
+        // host が SIGKILL されたり USB disconnect された場合、ファームが MIC モード
+        // のまま PCM stream を吐き続けて次回の host 起動時シリアル汚染が発生する
+        // のを防ぐ (2026-05-27 21:01 事故の再発防止)。
+        if (g_mic_start_ms != 0 && millis() - g_mic_start_ms > MIC_WATCHDOG_MS) {
+            Serial.printf("{\"event\":\"mic_watchdog_timeout\",\"at\":%lu,"
+                          "\"elapsed_ms\":%lu}\n",
+                          static_cast<unsigned long>(millis()),
+                          static_cast<unsigned long>(millis() - g_mic_start_ms));
+            g_mic_recording = false;
+            g_mic_watchdog_fired = true;  // loop() で Speaker 復帰させる
+            break;
+        }
+        if (!M5.Mic.record(g_mic_buffer, MIC_CHUNK_SAMPLES, MIC_SAMPLE_RATE)) {
+            // record() 失敗 (queue full 等)。少し休んで retry。
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        // 録音完了待ち (DMA キャプチャ終了 = isRecording() が 0 になる)。
+        while (g_mic_recording && M5.Mic.isRecording()) {
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
+        if (!g_mic_recording) break;
+
+        // ヘッダ + バイナリで送信。改行は付けない (host 側 reader が binary body の
+        // 直後にコマンド応答や次の MIC_PCM ヘッダを受け取れるよう、binary は素直に
+        // <size> byte ぴったりで終わる)。
+        Serial.printf("MIC_PCM:%u\n", static_cast<unsigned>(MIC_CHUNK_BYTES));
+        Serial.write(reinterpret_cast<uint8_t*>(g_mic_buffer), MIC_CHUNK_BYTES);
+    }
+    g_mic_task = nullptr;
+    vTaskDelete(nullptr);
+}
+
+static void handleMicStart() {
+    if (g_mic_recording) {
+        sendAckError("already recording");
+        return;
+    }
+    // Speaker と Mic は I2S を共有するので、Speaker.end() → Mic.begin() の順で
+    // 切り替える。Speaker が止まると WAV 再生不可になるが、録音中はその想定。
+    M5.Speaker.end();
+    if (!M5.Mic.begin()) {
+        Serial.println("[bridge] Mic.begin() failed");
+        // 失敗時は Speaker を戻して error 応答
+        M5.Speaker.begin();
+        M5.Speaker.setVolume(g_volume);
+        sendAckError("mic begin failed");
+        return;
+    }
+    g_mic_recording = true;
+    g_mic_start_ms = millis();  // watchdog の起点
+    xTaskCreatePinnedToCore(micRecordTask, "micRec", 4096, nullptr, 3, &g_mic_task,
+                            APP_CPU_NUM);
+    if (!g_image_face_active) {
+        avatar.setExpression(Expression::Doubt);  // listening 顔 (doubt 流用)
+        avatar.setSpeechText("listening...");
+    }
+    Serial.printf("{\"status\":\"ok\",\"mode\":\"recording\",\"sample_rate\":%u,"
+                  "\"bits\":16,\"channels\":1,\"chunk_bytes\":%u}\n",
+                  static_cast<unsigned>(MIC_SAMPLE_RATE),
+                  static_cast<unsigned>(MIC_CHUNK_BYTES));
+    Serial.flush();
+}
+
+static void handleMicStop() {
+    if (!g_mic_recording) {
+        sendAckError("not recording");
+        return;
+    }
+    g_mic_recording = false;
+    // タスクが MIC_PCM 送信の途中なら最後の chunk が出るまで待つ。最悪 1 chunk
+    // ぶん (64ms 録音 + DMA 完了 polling) なので 200ms で十分。
+    uint32_t waited = 0;
+    while (g_mic_task != nullptr && waited < MIC_STOP_WAIT_MS) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        waited += 10;
+    }
+    M5.Mic.end();
+    if (!M5.Speaker.begin()) {
+        Serial.println("[bridge] Speaker.begin() failed after mic stop");
+        sendAckError("speaker resume failed");
+        return;
+    }
+    M5.Speaker.setVolume(g_volume);
+    if (!g_image_face_active) {
+        avatar.setExpression(Expression::Neutral);
+        avatar.setSpeechText("");
+    }
+    Serial.println("{\"status\":\"ok\",\"mode\":\"speaker\"}");
+    Serial.flush();
+}
+
 static void clearWavQueueAndStop() {
     // 1. 現再生中の WAV を即停止
     M5.Speaker.stop();
@@ -622,8 +1111,10 @@ static void clearWavQueueAndStop() {
     g_wav_queue_tail = 0;
     g_wav_playing    = false;
     // 3. Avatar 口パクリセット
-    avatar.setMouthOpenRatio(0.0f);
-    avatar.setSpeechText("stopped");
+    if (!g_image_face_active) {
+        avatar.setMouthOpenRatio(0.0f);
+        avatar.setSpeechText("stopped");
+    }
     // 4. state を Ready に戻す (表情は host からの FACE が来るまで触らない)
     setState(State::Ready);
     Serial.println("[bridge] audio stopped by user touch");
@@ -688,6 +1179,17 @@ static void pollSerialCommand() {
                     handleWav(static_cast<size_t>(n));
                 }
             }
+            else if (strncmp(g_line, "IMAGE:", 6) == 0) {
+                long n = atol(g_line + 6);
+                if (n < 0) {
+                    sendAckError("negative size");
+                } else {
+                    handleImage(static_cast<size_t>(n));
+                }
+            }
+            else if (strncmp(g_line, "RECT:", 5) == 0) {
+                handleRect(g_line + 5);
+            }
             else if (strncmp(g_line, "FACE:", 5) == 0) {
                 handleFace(g_line + 5);
             }
@@ -696,6 +1198,19 @@ static void pollSerialCommand() {
             }
             else if (strcmp(g_line, "CAPTURE") == 0) {
                 handleCapture();
+            }
+            else if (strcmp(g_line, "MIC_START") == 0) {
+                handleMicStart();
+            }
+            else if (strcmp(g_line, "MIC_STOP") == 0) {
+                handleMicStop();
+            }
+            else if (strncmp(g_line, "HEADTOUCH_AVATAR:", 17) == 0) {
+                const char* arg = g_line + 17;
+                g_head_touch_avatar = (strcmp(arg, "on") == 0);
+                Serial.printf("{\"status\":\"ok\",\"head_touch_avatar\":%s}\n",
+                              g_head_touch_avatar ? "true" : "false");
+                Serial.flush();
             }
             else {
                 Serial.printf("{\"status\":\"error\",\"error\":\"unknown command\",\"line\":\"%s\"}\n",
@@ -728,11 +1243,13 @@ void setup() {
     Serial.begin(SERIAL_BAUD);
     delay(100);
     Serial.println();
-    Serial.println("[bridge] xangi-stackchan / cores3-main 0.7 (avatar+servo+wavqueue+camera+touchstop)");
+    Serial.println("[bridge] xangi-stackchan / cores3-main 0.15 (avatar+spriteface+battery+servo+wavqueue+camera+touchstop+headtouch+headavatar+mic+micguard+micwatchdog+avtoggle+ackflush)");
 
     // Avatar 初期化。`init()` で内部スプライトを確保し、表情/口パク用の draw
     // task を起動する。M5.begin() の後で呼ぶ必要あり。
     avatar.init();
+    avatar.setBatteryIcon(true);
+    updateBatteryInfo(true);
     avatar.setExpression(Expression::Neutral);
     avatar.setSpeechText("booting");
     g_state = State::Booting;
@@ -766,6 +1283,20 @@ void setup() {
         delay(500);
     }
 
+    // アタマタッチセンサ (Si12T) を内部 I2C bus 上で探索 → 見つかれば初期化 +
+    // 50ms polling task 起動。K151 / K151-R のみ搭載、CoreS3 単体 / Basic では
+    // bus 上に device が無いので begin() が false を返して graceful degradation。
+    g_head_touch_ready = g_head_touch.begin();
+    Serial.printf("[bridge] head_touch: %s\n",
+                  g_head_touch_ready ? "ready (Si12T@0x68)" : "not present");
+    if (g_head_touch_ready) {
+        // priority 2 / core APP_CPU は loop と同じ。50ms 周期 polling なので CPU
+        // 負荷はほぼ無視できる。stack 4KB は Si12T::poll() の局所変数 + Serial.printf
+        // フォーマット用 buffer 分の余裕を見込んだサイズ。
+        xTaskCreatePinnedToCore(headTouchPollTask, "headTouch", 4096, nullptr, 2,
+                                nullptr, APP_CPU_NUM);
+    }
+
     // WAV 再生タスクを core 1 (APP_CPU_NUM) に pin。loop task は core 1 で動く
     // ので同 core にすることで M5.Speaker のスレッド親和性を維持する (M5Unified
     // の Speaker は呼び出し core で I2S DMA を回す)。stack 8KB は playWav の
@@ -776,9 +1307,38 @@ void setup() {
     setState(State::Ready);
 }
 
+// watchdog 発火時の Speaker 復帰処理。micRecordTask 内から Mic.end / Speaker.begin
+// を呼ぶと M5Unified の I2S 状態が別 task からの操作で壊れる可能性があるので、
+// main loop で実行する。Mic 録音タスクは既に g_mic_recording=false で抜けてる。
+static void recoverFromMicWatchdog() {
+    if (!g_mic_watchdog_fired) return;
+    g_mic_watchdog_fired = false;
+    // micRecordTask が break して終了するまで少し待つ。
+    uint32_t waited = 0;
+    while (g_mic_task != nullptr && waited < MIC_STOP_WAIT_MS) {
+        delay(10);
+        waited += 10;
+    }
+    M5.Mic.end();
+    if (M5.Speaker.begin()) {
+        M5.Speaker.setVolume(g_volume);
+    } else {
+        Serial.println("[bridge] Speaker.begin() failed after mic watchdog");
+    }
+    avatar.setExpression(Expression::Neutral);
+    avatar.setSpeechText("");
+    Serial.println("[bridge] mic watchdog: speaker resumed");
+}
+
 void loop() {
     M5.update();
     pollSerialCommand();
     pollTouchStop();
+    recoverFromMicWatchdog();
+    updateBatteryInfo();
+    if (g_image_face_active && millis() - g_last_battery_update_ms < 5) {
+        g_image_face_dirty = true;
+    }
+    drawImageFace();
     delay(2);
 }

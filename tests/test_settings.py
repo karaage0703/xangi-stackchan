@@ -34,6 +34,9 @@ def _base_config() -> BridgeConfig:
         face_thinking="doubt",
         face_talking="happy",
         face_error="sad",
+        face_mode="avatar",
+        sprite_sheet="assets/pets/default/spritesheet.webp",
+        sprite_jpeg_quality=85,
         stream_timeout=65,
         retry_seconds=1.0,
         max_retry_seconds=30.0,
@@ -117,6 +120,20 @@ def test_merge_config_accepts_move_overrides():
     assert config.move_idle_pitch == 10.0
     assert config.move_talking_sway_yaw == 2.5
     assert config.move_talking_sway_interval == 0.8
+
+
+def test_merge_config_accepts_sprite_face_options():
+    config = merge_config(
+        _base_config(),
+        {
+            "face_mode": "sprite",
+            "sprite_sheet": "assets/pets/default/spritesheet.webp",
+            "sprite_jpeg_quality": "120",
+        },
+    )
+    assert config.face_mode == "sprite"
+    assert config.sprite_sheet == "assets/pets/default/spritesheet.webp"
+    assert config.sprite_jpeg_quality == 95
 
 
 # --- v1 -> v2 migration --------------------------------------------------

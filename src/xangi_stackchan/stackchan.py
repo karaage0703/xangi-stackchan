@@ -5,11 +5,14 @@ import platform
 import struct
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import requests
 import serial
 import serial.tools.list_ports
+
+from .serial_actor import SerialActor
 
 
 DEFAULT_BAUD = 921600
@@ -80,6 +83,83 @@ def estimate_wav_duration_seconds(wav_data: bytes) -> float:
     return data_bytes / bytes_per_second
 
 
+def pcm_to_wav(
+    pcm_data: bytes,
+    sample_rate: int = 16000,
+    bits: int = 16,
+    channels: int = 1,
+) -> bytes:
+    """raw PCM (int16 LE mono が既定) を WAV bytes に wrap する。faster-whisper /
+    whisper.cpp / wave モジュール / WAV ファイル保存に投入できる形式。
+
+    `len(pcm_data)` が偶数 (bits=16 のとき) でない場合は末尾 1 byte を drop して
+    WAV の sample alignment を保つ。空入力でも valid な 0 frame WAV を返す。
+    """
+    import io
+    import wave
+
+    bytes_per_sample = bits // 8
+    if bytes_per_sample <= 0:
+        raise ValueError(f"unsupported bits: {bits}")
+    aligned_len = (len(pcm_data) // (bytes_per_sample * channels)) * (
+        bytes_per_sample * channels
+    )
+    aligned = pcm_data[:aligned_len]
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(channels)
+        w.setsampwidth(bytes_per_sample)
+        w.setframerate(sample_rate)
+        w.writeframes(aligned)
+    return buf.getvalue()
+
+
+def _ack_predicate_for(cmd: str) -> Callable[[str], bool]:
+    """各コマンドの ack に含まれる特徴的なキー文字列を見て filter する predicate を返す。
+
+    USB CDC のバッファリングで応答が前 transaction の expect_line timeout 後に
+    届くと、次 transaction の queue に流れ込む。コマンド固有のシグネチャで
+    filter すれば、本来の ack を確実に拾える + 他コマンドの ack は queue に
+    積み戻されて (expect_line 内の挙動) 後続 transaction が拾える。
+    """
+    cmd_upper = cmd.split(":")[0] if ":" in cmd else cmd
+    # 各コマンドの ack に必ず含まれるシグネチャ。'"error"' を含む行も常に通す
+    # (error 応答は無視せず即返す)。
+    signature_map = {
+        "STATUS": '"state"',
+        "VOLUME": '"volume"',
+        "FACE": '"face"',
+        "IMAGE": '"image"',
+        "MOVE": '"yaw"',
+        "HEADTOUCH_AVATAR": '"head_touch_avatar"',
+        "MIC_START": '"mode":"recording"',
+        "MIC_STOP": '"mode":"speaker"',
+    }
+    signature = signature_map.get(cmd_upper)
+
+    if signature is None:
+        # 不明コマンド: generic JSON line (event を除く)
+        def pred_generic(l: str) -> bool:
+            return l.startswith("{") and '"event"' not in l
+        return pred_generic
+
+    sig = signature
+
+    def pred_specific(l: str) -> bool:
+        if not l.startswith("{") or '"event"' in l:
+            return False
+        if sig in l:
+            return True
+        # error ack は signature 持たないので別経路で通す (例: "queue full",
+        # "not recording", "mic recording active" 等)
+        if '"error"' in l:
+            return True
+        return False
+
+    return pred_specific
+
+
 def detect_serial_port() -> str:
     env_port = os.environ.get("STACKCHAN_PORT")
     if env_port:
@@ -109,10 +189,11 @@ class StackchanSerial:
         self.port = port
         self.baud = baud
         self.ser = None
-        # シリアルバスは USB 1 本の共有資源。WAV 転送中に MOVE/FACE/VOLUME などの
-        # テキストコマンドが割り込むと WAV データに ASCII バイト列が混入し、
-        # playWav 失敗・no READY response・ノイズ再生を引き起こす。RLock で
-        # send_command / send_wav 全体を直列化する。
+        # Phase 2.x で SerialActor pattern に refactor。`actor` が唯一の serial reader、
+        # writer は `actor.write()` を経由してシリアライズ。`_lock` は「transaction
+        # (send_command/send_wav/capture) 全体を排他化する」役で、actor 内部の write_lock
+        # とは別レイヤー。これで複数 thread が同時に readline する race が原理的に消える。
+        self.actor: SerialActor | None = None
         self._lock = threading.RLock()
         # device_profile から渡される WAV サイズ上限 (0 = 無制限)。超過時は
         # send_wav 内で送信前に早期 error を返す。
@@ -129,39 +210,273 @@ class StackchanSerial:
         # send_wav 冒頭でその WAV を skip する。app.py 側で turn.started 受信時に
         # False に戻して次 turn から通常動作復帰。
         self.user_stopped: bool = False
+        # ファームから `{"event":"head_touch","gesture":"...","at":<ms>}` を受信した
+        # 時のコールバック (M5Stackchan K151 のアタマタッチセンサ Si12T)。
+        # gesture は press / release / swipe_forward / swipe_backward。app.py で
+        # 録音開始トリガとして bind する想定。callback は drain() / send_command
+        # 両方の経路から呼ばれるので、登録側は thread-safety を考慮する (現状の
+        # SerialReader は drain は main thread、send_command は呼び出し側 thread)。
+        self.on_head_touch: Callable[[dict], None] | None = None
+        # マイク録音状態。start_mic_recording / stop_mic_recording で操作。録音中は
+        # _mic_reader_thread が別 thread で `MIC_PCM:<size>\n<binary>` を受信し続け、
+        # _mic_pcm_buffer に蓄積 + (設定されていれば) _mic_on_pcm_chunk callback に
+        # チャンクを渡す。WAV 再生・他コマンドは録音中は競合する (I2S 共有のため
+        # ファームが Speaker を止めている) ので、host 側でも mutual exclusion を取る。
+        self._mic_recording: bool = False
+        self._mic_reader_thread: threading.Thread | None = None
+        self._mic_pcm_buffer: bytearray = bytearray()
+        self._mic_on_pcm_chunk: Callable[[bytes], None] | None = None
 
     def open(self):
         self.ser = serial.Serial(self.port, self.baud, timeout=5)
         time.sleep(0.5)
-        self.drain()
+        self._acquire_exclusive_lock()
+        # OS の serial 受信 buffer に前回 session の古い ack / log が残っていると、
+        # 次の send_command で expect_line がそれを拾って ack 取り違えが起きる
+        # (2026-05-27 22:00 で発生)。actor 起動前にリセットして「これから来る
+        # 応答だけを見る」状態にする。
+        try:
+            self.ser.reset_input_buffer()
+        except Exception:
+            pass
+        # SerialActor が唯一の serial reader として常時 read + parse する。
+        # 非同期 event (head_touch / audio_stopped / mic_watchdog_timeout) は
+        # add_line_listener 経由で _on_line に流す。
+        self.actor = SerialActor(self.ser)
+        self.actor.add_line_listener(self._on_line)
+        self.actor.start()
+        # ファーム reset 直後の boot ログや前回 session の遅延応答が USB CDC TX
+        # buffer に残っている。actor を 500ms 動かしてそれらを line listener 側で
+        # 消費させ、最後に start_transaction の clear で expect_queue からも除去。
+        # これで最初の send_command が前回の残骸 ack を拾う事故を防ぐ
+        # (2026-05-27 22:53 で VOLUME ack ズレの真因)。
+        time.sleep(0.5)
+        self.actor.start_transaction()
+        # 前回 session が SIGKILL/USB 切断等で MIC_STOP を送れずに死ぬと、ファームが
+        # MIC モードのまま PCM stream を吐き続けて次回起動時のシリアル通信が破綻する。
+        # ファーム watchdog (60s) を待つより、open() で強制 MIC_STOP を打って即時復帰。
+        # 既に speaker モードなら `{"status":"error","error":"not recording"}` が
+        # 返るだけで害は無い。応答内容は気にせず ack だけ受けて drop。
+        try:
+            self.actor.write(b"MIC_STOP\n")
+            self.actor.expect_line(
+                lambda l: l.startswith("{") and "event" not in l, timeout=2.0
+            )
+        except Exception:
+            pass
+        # MIC_PCM tail (binary) が来てるかもしれないので少し待ってから queue 再 clear。
+        time.sleep(0.3)
+        self.actor.start_transaction()
+
+    def _acquire_exclusive_lock(self) -> None:
+        """同一 USB serial port を複数プロセスが同時に開かないよう排他 lock を取得。
+
+        Linux/Mac は `fcntl.flock(fd, LOCK_EX|LOCK_NB)` で OS レベルの排他制御。
+        既に他プロセスが lock を持っていれば即 RuntimeError で abort。
+
+        2026-05-27 実機検証で発覚: nohup 経由で複数プロセスを起動して PID kill が
+        親 wrapper だけに当たり、4 プロセスが同 ACM port を同時アクセス →
+        multi access on port 警告 + シリアル汚染 + 録音 PCM 破綻と全て壊れた。
+
+        Windows は flock 非対応なので noop (代わりに OS の排他 open が効くはず)。
+        環境変数 `STACKCHAN_NO_SERIAL_LOCK=1` で明示的に無効化可能。
+        """
+        if os.environ.get("STACKCHAN_NO_SERIAL_LOCK", "") in ("1", "true"):
+            return
+        if platform.system() == "Windows":
+            return
+        try:
+            import fcntl
+
+            fcntl.flock(self.ser.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError) as exc:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+            self.ser = None
+            raise RuntimeError(
+                f"{self.port} is already in use by another process "
+                f"(fcntl.flock LOCK_EX failed: {exc}). "
+                "STACKCHAN_NO_SERIAL_LOCK=1 で lock を無効化できる。"
+            )
 
     def close(self):
+        if self.actor is not None:
+            try:
+                self.actor.stop()
+            except Exception:
+                pass
+            self.actor = None
         if self.ser and self.ser.is_open:
             self.ser.close()
 
     def drain(self):
-        # 単に捨てるのではなく、行単位で読んで非同期 event 行 (audio_stopped 等) を
-        # フラグに反映してから捨てる。これで send_wav 前の drain でユーザ stop を
-        # 取りこぼさない。
-        while self.ser and self.ser.in_waiting:
-            try:
-                raw = self.ser.readline()
-            except Exception:
-                break
-            if not raw:
-                break
-            line = raw.decode("utf-8", errors="replace").strip()
-            if line:
-                self._detect_async_event(line)
+        # SerialActor 移行後は no-op。actor が常時 ser.read() で byte stream を
+        # 消費し、line / binary を parser で分類するので、外部 drain は不要。
+        # 互換のため method 自体は残す (古い callers が呼んでも害無し)。
+        return
+
+    def _resync_serial(self) -> None:
+        """IMAGE/WAV の READY/ack が来なかった時に呼ぶ再同期処理。
+
+        READY 不達 = ファームがまだ前フレームの受信ループに居座っている可能性が
+        高い。ファーム側のチャンク受信タイムアウト (IMAGE_CHUNK_TIMEOUT_MS) を超えて
+        待ってからコマンド待ちに復帰させ、その間に溜まった OS RX バッファの遅延
+        READY / エラー行を expect_queue ごとクリアして、次フレームをクリーンな状態
+        から始める。ファーム側タイムアウト短縮との二段構えでフレーム境界ずれの恒久化
+        を防ぐ (host が次の IMAGE:<size> を送る前にファームが必ず受信ループを抜ける)。
+        """
+        if self.actor is None:
+            return
+        # ファームの受信ループが必ず抜けるまで待つ (IMAGE_CHUNK_TIMEOUT_MS=1500ms +
+        # 余裕)。環境変数で調整可能。
+        wait_s = float(os.environ.get("STACKCHAN_RESYNC_WAIT_SECONDS", "1.8"))
+        time.sleep(wait_s)
+        # 遅延して届いた READY / 中間バイナリ由来のゴミ行を捨てる。
+        try:
+            self.actor.start_transaction()
+        except Exception:
+            pass
+
+    def _on_line(self, line: str) -> None:
+        """SerialActor から全 line が dispatch される入口。非同期 event を検出して
+        フラグ / callback に反映する。transaction の応答行は actor の expect_line
+        側で別途取得するので、ここでは event 検出のみ。
+        """
+        self._detect_async_event(line)
 
     def _detect_async_event(self, line: str) -> bool:
-        """ファームからの非同期 event 行 (`{"event":"audio_stopped",...}`) を検知して
-        backend 内部フラグを立てる。検知した場合 True を返す (応答行としては使わない)。
+        """ファームからの非同期 event 行 (`{"event":"audio_stopped",...}` /
+        `{"event":"head_touch",...}`) を検知して backend 内部フラグ or callback
+        に dispatch する。検知した場合 True を返す (応答行としては使わない)。
         """
-        if '"event"' in line and "audio_stopped" in line:
+        if '"event"' not in line:
+            return False
+        if "audio_stopped" in line:
             self.user_stopped = True
             return True
+        if "head_touch" in line:
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                # event 風だが parse 失敗。応答行扱いにせず drop。
+                return True
+            if self.on_head_touch is not None:
+                try:
+                    self.on_head_touch(data)
+                except Exception:
+                    # listener 側の例外でシリアル受信ループを壊さない。
+                    pass
+            return True
         return False
+
+    # === マイク録音 PCM stream ================================================
+    # ファームに `MIC_START\n` → ack → 別 thread で `MIC_PCM:<size>\n<binary>` を
+    # 受信し続ける → `MIC_STOP\n` → ack で停止。蓄積した PCM を WAV にして返す。
+    # CoreS3 は Mic と Speaker が I2S を共有するため、ファーム側で録音中は
+    # Speaker.end() している。録音中の WAV 送信や他コマンドは挙動が壊れるので、
+    # host 側でも _mic_recording=True の間は他経路を抑止する想定 (現状は呼び出し
+    # 側で気をつける運用、必要なら _lock で強制ガードに昇格)。
+
+    def start_mic_recording(
+        self,
+        on_pcm_chunk: Callable[[bytes], None] | None = None,
+    ) -> dict:
+        """`MIC_START` をファームに送り、ack 取得後に MIC_PCM stream 受信 thread を
+        起動する。on_pcm_chunk が指定されれば 1 チャンク (64ms 分、2048 byte) 受信
+        ごとに呼ばれる。蓄積バッファは stop_mic_recording で返す。
+        """
+        if self._mic_recording:
+            return {"status": "error", "error": "already recording"}
+
+        with self._lock:
+            # 録音中の binary 受信は actor の MIC_PCM listener 経由で buffer に積む。
+            # mic_reader_thread の自前 readline 経路は廃止 (race の根)。
+            self._mic_pcm_buffer = bytearray()
+            self._mic_on_pcm_chunk = on_pcm_chunk
+            self.actor.set_mic_pcm_listener(self._on_mic_pcm_chunk)
+
+            self.actor.start_transaction()
+            try:
+                self.actor.write(b"MIC_START\n")
+                ack_line = self.actor.expect_line(
+                    lambda l: l.startswith("{") and "event" not in l, timeout=2.0
+                )
+            finally:
+                self.actor.end_transaction()
+
+            if ack_line is None:
+                self.actor.set_mic_pcm_listener(None)
+                return {"status": "error", "error": "no mic start ack"}
+            try:
+                ack = json.loads(ack_line)
+            except json.JSONDecodeError:
+                self.actor.set_mic_pcm_listener(None)
+                return {"status": "error", "error": "invalid ack json", "raw": ack_line}
+            if ack.get("status") != "ok":
+                self.actor.set_mic_pcm_listener(None)
+                return {"status": "error", "error": "mic start failed", "raw": ack}
+
+            self._mic_recording = True
+        return ack
+
+    def _on_mic_pcm_chunk(self, body: bytes) -> None:
+        """SerialActor から MIC_PCM body が来た時の dispatch。buffer に積み + callback。
+        actor の reader thread から呼ばれる。"""
+        if not self._mic_recording:
+            return
+        self._mic_pcm_buffer.extend(body)
+        if self._mic_on_pcm_chunk is not None:
+            try:
+                self._mic_on_pcm_chunk(body)
+            except Exception:
+                pass
+
+    def stop_mic_recording(self) -> dict:
+        """`MIC_STOP` をファームに送って録音を終了、蓄積した PCM を WAV bytes に
+        wrap して返す。返却 dict には `pcm` (raw int16 LE) と `wav` の両方を含む。
+
+        SerialActor 経由: MIC_STOP 送信前から end_transaction せず、ファームが
+        停止する前に送ってくる末尾 MIC_PCM frame は actor の binary parser 経由で
+        引き続き _mic_pcm_buffer に積まれる。ack JSON `{"status":"ok","mode":"speaker"}`
+        を expect_line で待つ。
+        """
+        if not self._mic_recording:
+            return {"status": "error", "error": "not recording"}
+
+        with self._lock:
+            self.actor.start_transaction()
+            try:
+                self.actor.write(b"MIC_STOP\n")
+                ack_line = self.actor.expect_line(
+                    lambda l: l.startswith("{") and "event" not in l, timeout=3.0
+                )
+            finally:
+                self.actor.end_transaction()
+
+            # 録音終了 → 以後の MIC_PCM body は無視する。
+            self._mic_recording = False
+            self.actor.set_mic_pcm_listener(None)
+
+        try:
+            ack = json.loads(ack_line) if ack_line else None
+        except json.JSONDecodeError:
+            ack = None
+
+        pcm_bytes = bytes(self._mic_pcm_buffer)
+        wav_bytes = pcm_to_wav(pcm_bytes, sample_rate=16000, bits=16, channels=1)
+        result = dict(ack) if ack else {"status": "error", "error": "no ack"}
+        result.update({
+            "pcm": pcm_bytes,
+            "wav": wav_bytes,
+            "sample_rate": 16000,
+            "bits": 16,
+            "channels": 1,
+            "frames": len(pcm_bytes) // 2,
+            "duration_seconds": (len(pcm_bytes) // 2) / 16000.0,
+        })
+        return result
 
     def send_command(self, cmd: str) -> dict:
         # WAV 再生中の MOVE は skip_move_during_wav=True 時にスキップ。電流ラッシュ
@@ -169,21 +484,22 @@ class StackchanSerial:
         if self.skip_move_during_wav and self._wav_active and cmd.startswith("MOVE:"):
             return {"status": "skipped", "cmd": cmd, "reason": "wav playing"}
         with self._lock:
-            self.ser.write(f"{cmd}\n".encode())
-            self.ser.flush()
-            time.sleep(0.2)
-            response = ""
-            while self.ser.in_waiting:
-                line = self.ser.readline().decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                if self._detect_async_event(line):
-                    continue  # 非同期 event はフラグだけ立てて応答とは別扱い
-                response = line
+            self.actor.start_transaction()
             try:
-                return json.loads(response)
+                self.actor.write(f"{cmd}\n".encode())
+                # コマンド別の ack シグネチャで filter する。USB CDC バッファリングで
+                # 応答が遅延すると、前 transaction の ack がこの transaction の
+                # queue に流れ込んで誤拾いする事故 (2026-05-27 23:27 で頻発) を防ぐ。
+                pred = _ack_predicate_for(cmd)
+                ack_line = self.actor.expect_line(pred, timeout=3.0)
+            finally:
+                self.actor.end_transaction()
+            if ack_line is None:
+                return {"raw": ""}
+            try:
+                return json.loads(ack_line)
             except json.JSONDecodeError:
-                return {"raw": response}
+                return {"raw": ack_line}
 
     def send_wav(self, wav_data: bytes, chunk_size: int = 1024, chunk_delay: float = 0.005) -> dict:
         if not wav_data:
@@ -194,6 +510,14 @@ class StackchanSerial:
         # 後続 chunk の WAV 送信を全てスキップする (黙る挙動)。
         if self.user_stopped:
             return {"status": "skipped", "reason": "user_stopped", "size": len(wav_data)}
+
+        # マイク録音中はファームが Speaker.end() 状態 + シリアルに MIC_PCM stream を
+        # 流している。この間に WAV 送信を試みるとシリアル binary 衝突 + Speaker
+        # 無効で再生不可 + multi access on port 警告 + 録音 PCM 破綻と全て壊れる。
+        # voice_conversation モードでは MIC_STOP 後 (Speaker 復帰後) に送るのが
+        # 正しい挙動なので、ここでは skip 応答を返して呼び出し側に判断を委ねる。
+        if self._mic_recording:
+            return {"status": "skipped", "reason": "mic_recording", "size": len(wav_data)}
 
         # device_profile (rt_beta / atoms3r 等) で渡された WAV サイズ上限の早期
         # チェック。例: basic-main (M5Stack Basic) は内部 DRAM 96KB 制約。超過時は
@@ -239,6 +563,122 @@ class StackchanSerial:
             # _begin_wav_active 内で cancel されて新タイマーに置き換わる。
             pass
 
+    def send_image(self, image_jpeg: bytes, chunk_size: int = 1024, chunk_delay: float = 0.005) -> dict:
+        """Send a JPEG face image to firmware via IMAGE:<size>."""
+        if not image_jpeg:
+            return {"status": "error", "error": "empty image"}
+        with self._lock:
+            self.actor.start_transaction()
+            try:
+                self.actor.write(f"IMAGE:{len(image_jpeg)}\n".encode())
+                ready_or_err = self.actor.expect_line(
+                    lambda l: l == "READY"
+                    or (
+                        l.startswith("{")
+                        and ('"image"' in l or '"error"' in l)
+                        and '"event"' not in l
+                    ),
+                    timeout=3.0,
+                )
+                if ready_or_err is None:
+                    # READY が来ない = ファームがまだ前フレームの受信ループに居座って
+                    # いるか、コマンド/バイナリの境界がずれた状態。ここで JPEG 本体を
+                    # 送らず、入力バッファを掃除して次フレームをクリーンな状態から
+                    # 始められるようにする (フレーム境界ずれの恒久化を防ぐ)。
+                    self._resync_serial()
+                    return {"status": "error", "error": "no READY response"}
+                if ready_or_err != "READY":
+                    try:
+                        return json.loads(ready_or_err)
+                    except json.JSONDecodeError:
+                        return {"status": "error", "error": "invalid early ack", "raw": ready_or_err}
+
+                sent = 0
+                while sent < len(image_jpeg):
+                    end = min(sent + chunk_size, len(image_jpeg))
+                    self.actor.write(image_jpeg[sent:end])
+                    sent = end
+                    if chunk_delay > 0:
+                        time.sleep(chunk_delay)
+
+                ack_line = self.actor.expect_line(
+                    lambda l: l.startswith("{")
+                    and ('"image"' in l or '"error"' in l)
+                    and '"event"' not in l,
+                    timeout=5.0,
+                )
+                if ack_line is None:
+                    return {"status": "error", "error": "no image ack"}
+                try:
+                    return json.loads(ack_line)
+                except json.JSONDecodeError:
+                    return {"status": "error", "error": "invalid image ack json", "raw": ack_line}
+            finally:
+                self.actor.end_transaction()
+
+    def send_rect(
+        self,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        rgb565: bytes,
+        chunk_size: int = 4096,
+        chunk_delay: float = 0.0,
+    ) -> dict:
+        """Send an RGB565 dirty rectangle to firmware via RECT:x,y,w,h,size."""
+        if width <= 0 or height <= 0:
+            return {"status": "skipped", "reason": "empty rect"}
+        if not rgb565:
+            return {"status": "error", "error": "empty rect"}
+        expected = width * height * 2
+        if len(rgb565) != expected:
+            return {"status": "error", "error": "rect size mismatch", "size": len(rgb565), "expected": expected}
+
+        with self._lock:
+            self.actor.start_transaction()
+            try:
+                self.actor.write(f"RECT:{x},{y},{width},{height},{len(rgb565)}\n".encode())
+                ready_or_err = self.actor.expect_line(
+                    lambda l: l == "READY"
+                    or (
+                        l.startswith("{")
+                        and ('"rect"' in l or '"error"' in l)
+                        and '"event"' not in l
+                    ),
+                    timeout=3.0,
+                )
+                if ready_or_err is None:
+                    return {"status": "error", "error": "no READY response"}
+                if ready_or_err != "READY":
+                    try:
+                        return json.loads(ready_or_err)
+                    except json.JSONDecodeError:
+                        return {"status": "error", "error": "invalid early ack", "raw": ready_or_err}
+
+                sent = 0
+                while sent < len(rgb565):
+                    end = min(sent + chunk_size, len(rgb565))
+                    self.actor.write(rgb565[sent:end])
+                    sent = end
+                    if chunk_delay > 0:
+                        time.sleep(chunk_delay)
+
+                ack_line = self.actor.expect_line(
+                    lambda l: l.startswith("{")
+                    and ('"rect"' in l or '"error"' in l)
+                    and '"event"' not in l,
+                    timeout=5.0,
+                )
+                if ack_line is None:
+                    return {"status": "error", "error": "no rect ack"}
+                try:
+                    return json.loads(ack_line)
+                except json.JSONDecodeError:
+                    return {"status": "error", "error": "invalid rect ack json", "raw": ack_line}
+            finally:
+                self.actor.end_transaction()
+
     def _begin_wav_active(self, duration_seconds: float) -> None:
         """`_wav_active` を True にし、`duration_seconds` 秒後に False へ戻す
         タイマーを仕掛ける。連続 WAV 送信時は古い timer を cancel して新しい
@@ -259,72 +699,59 @@ class StackchanSerial:
             self._wav_end_timer = None
 
     def _send_wav_locked(self, wav_data: bytes, chunk_size: int, chunk_delay: float) -> dict:
-        self.drain()
-        self.ser.write(f"WAV:{len(wav_data)}\n".encode())
-        self.ser.flush()
+        # SerialActor 経由: WAV transaction を 1 つの start_transaction 内で完結。
+        # 1. WAV:<size>\n を書く
+        # 2. READY 行 / JSON ack エラー どちらか早い方を expect_line で待つ
+        #    (event 行は actor 側で自動 skip。size キーを持たない他コマンドの
+        #     ack はぐれを除外したいので、size または error を含む JSON のみ通す)
+        # 3. READY なら chunk 送信 → ack 待ち
+        self.actor.start_transaction()
+        try:
+            self.actor.write(f"WAV:{len(wav_data)}\n".encode())
+            ready_or_err = self.actor.expect_line(
+                lambda l: l == "READY"
+                or (
+                    l.startswith("{")
+                    and ('"size"' in l or '"error"' in l)
+                    and '"event"' not in l
+                ),
+                timeout=3.0,
+            )
+            if ready_or_err is None:
+                return {"status": "error", "error": "no READY response"}
+            if ready_or_err != "READY":
+                # 事前エラー (queue full / size=0 / size exceeds / ps_malloc failed)
+                try:
+                    return json.loads(ready_or_err)
+                except json.JSONDecodeError:
+                    return {"status": "error", "error": "invalid early ack", "raw": ready_or_err}
 
-        # READY 待ち。READY が来ればバイナリ送信フェーズに進む。`{` で始まる行が
-        # 来た場合はファームが事前エラー (queue full / size=0 / size exceeds /
-        # ps_malloc failed) を返したと見なして JSON を即返す (Step G で追加された
-        # 早期エラーパス)。
-        deadline = time.time() + 3
-        ready = False
-        while time.time() < deadline:
-            if self.ser.in_waiting:
-                line = self.ser.readline().decode("utf-8", errors="replace").strip()
-                if line == "READY":
-                    ready = True
-                    break
-                if line.startswith("{"):
-                    try:
-                        return json.loads(line)
-                    except json.JSONDecodeError:
-                        pass
-            time.sleep(0.05)
-        if not ready:
-            return {"status": "error", "error": "no READY response"}
+            # binary 送信
+            sent = 0
+            while sent < len(wav_data):
+                end = min(sent + chunk_size, len(wav_data))
+                self.actor.write(wav_data[sent:end])
+                sent = end
+                if chunk_delay > 0:
+                    time.sleep(chunk_delay)
 
-        sent = 0
-        while sent < len(wav_data):
-            end = min(sent + chunk_size, len(wav_data))
-            self.ser.write(wav_data[sent:end])
-            self.ser.flush()
-            sent = end
-            time.sleep(chunk_delay)
-
-        # ack 待ち。`readline()` は self.ser のグローバル timeout (=5s) で
-        # \n まで block するので、in_waiting で来た分だけ読んで自前で行分割
-        # する (デバイス側が大量のデバッグログを流す場合に readline ブロックで
-        # deadline を越えてしまう問題への対策)。
-        deadline = time.time() + 10
-        buf = b""
-        while time.time() < deadline:
-            avail = self.ser.in_waiting
-            if avail > 0:
-                buf += self.ser.read(avail)
-                while b"\n" in buf:
-                    raw_line, buf = buf.split(b"\n", 1)
-                    line = raw_line.decode("utf-8", errors="replace").strip()
-                    if not line.startswith("{"):
-                        continue
-                    try:
-                        parsed = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    # WAV ack のシグネチャ: ファーム xangi-bridge-0.4+ は
-                    # `{"status":"ok","size":N,"queued":n}` を返す。前 MOVE
-                    # ack や FACE ack (yaw/pitch/face フィールドを持つ) が
-                    # シリアル TX の遅延ではぐれてここに紛れ込むことがある
-                    # ので、`size` キーが無い ack は捨てて次の行を読む。
-                    # エラー ack (`error` キー有り) は WAV 起因なのでそのまま
-                    # 返す (size 無くても識別可能)。
-                    if "size" in parsed or "error" in parsed:
-                        return parsed
-                    # それ以外 (他コマンドの ack のはぐれ) は捨てて継続
-                    continue
-            else:
-                time.sleep(0.05)
-        return {"status": "ok", "size": len(wav_data), "note": "no confirmation received"}
+            # ack 待ち。WAV ack シグネチャ: {"status":"ok","size":N,"queued":n}。
+            # MOVE/FACE ack のはぐれ (size を持たない) は actor 側 expect_line の
+            # predicate で弾く。error ack も通す。
+            ack_line = self.actor.expect_line(
+                lambda l: l.startswith("{")
+                and ('"size"' in l or '"error"' in l)
+                and '"event"' not in l,
+                timeout=10.0,
+            )
+            if ack_line is None:
+                return {"status": "ok", "size": len(wav_data), "note": "no confirmation received"}
+            try:
+                return json.loads(ack_line)
+            except json.JSONDecodeError:
+                return {"status": "ok", "size": len(wav_data), "note": "invalid ack json", "raw": ack_line}
+        finally:
+            self.actor.end_transaction()
 
     def capture(self, timeout: float = 5.0) -> dict:
         """Phase 1A: CAPTURE コマンドで CoreS3 内蔵カメラ (GC0308) から JPEG 1 枚取得。
@@ -350,108 +777,46 @@ class StackchanSerial:
             return self._capture_locked(timeout)
 
     def _capture_locked(self, timeout: float) -> dict:
+        """SerialActor 経由: CAPTURE → IMG header → JPEG body → ack JSON。
+        IMG body は actor の binary parser が拾って pop_img_data で取れる。"""
         host_capture_start = time.time()
-        self.drain()
-        self.ser.write(b"CAPTURE\n")
-        self.ser.flush()
+        self.actor.start_transaction()
+        try:
+            # 古い IMG body は破棄
+            self.actor.pop_img_data()
+            self.actor.write(b"CAPTURE\n")
 
-        # 1 行目を待つ: "IMG:<size>" or error JSON
-        # in_waiting で来た分だけ読んで自前で行分割 (readline の timeout block 回避)。
-        deadline = time.time() + timeout
-        buf = b""
-        header_size: int | None = None
-        while time.time() < deadline:
-            avail = self.ser.in_waiting
-            if avail > 0:
-                buf += self.ser.read(avail)
-                while b"\n" in buf:
-                    raw_line, buf = buf.split(b"\n", 1)
-                    line = raw_line.decode("utf-8", errors="replace").strip()
-                    if not line:
-                        continue
-                    if line.startswith("IMG:"):
-                        try:
-                            header_size = int(line[4:])
-                        except ValueError:
-                            return {"status": "error", "error": f"invalid IMG header: {line}"}
-                        break
-                    if line.startswith("{"):
-                        try:
-                            return json.loads(line)
-                        except json.JSONDecodeError:
-                            return {"status": "error", "error": f"non-json line: {line}"}
-                    # ログ行 (`[bridge] ...`) などは捨てて継続
-                if header_size is not None:
-                    break
-            else:
-                time.sleep(0.02)
-        if header_size is None:
-            return {"status": "error", "error": "no IMG header (timeout)"}
-        if header_size <= 0:
-            return {"status": "error", "error": f"non-positive size: {header_size}"}
+            # error JSON が先に来るか、IMG header + body 後の ack JSON か。
+            # IMG header 自体は actor 内で binary mode に遷移する効果しかなく
+            # line listener には出ない (size のサニティチェックも内部)。
+            # → ack JSON を待ち、その時点で pop_img_data が body を持っていれば成功。
+            ack_line = self.actor.expect_line(
+                lambda l: l.startswith("{") and '"event"' not in l,
+                timeout=max(timeout, 5.0),
+            )
+            if ack_line is None:
+                return {"status": "error", "error": "no capture ack (timeout)"}
+            try:
+                ack = json.loads(ack_line)
+            except json.JSONDecodeError:
+                return {"status": "error", "error": "invalid capture ack json", "raw": ack_line}
 
-        # JPEG 本体 <header_size> bytes 読む。buf に既に取り込み済の余剰があれば
-        # それを使い、不足分のみ追加で read する。
-        # `ser.read(N)` は serial の global timeout (=5s) で block するので、
-        # `in_waiting` で来た分だけ読んで自前で進める (CAPTURE は数百 KB 規模、
-        # ack を待つだけで 5s 消費するのを避ける)。
-        jpeg = buf[:header_size]
-        buf = buf[header_size:]
-        remaining = header_size - len(jpeg)
-        deadline = time.time() + max(timeout, 10.0)
-        while remaining > 0 and time.time() < deadline:
-            avail = self.ser.in_waiting
-            if avail > 0:
-                chunk = self.ser.read(min(remaining, avail, 4096))
-                if chunk:
-                    jpeg += chunk
-                    remaining -= len(chunk)
-            else:
-                time.sleep(0.005)
-        if remaining > 0:
-            return {"status": "error", "error": f"binary recv timeout ({remaining}/{header_size} remaining)"}
+            if ack.get("status") == "error":
+                return ack
 
-        # ack JSON 待ち
-        deadline = time.time() + timeout
-        ack: dict | None = None
-        while ack is None and time.time() < deadline:
-            avail = self.ser.in_waiting
-            if avail > 0:
-                buf += self.ser.read(avail)
-                while b"\n" in buf:
-                    raw_line, buf = buf.split(b"\n", 1)
-                    line = raw_line.decode("utf-8", errors="replace").strip()
-                    if not line.startswith("{"):
-                        continue
-                    try:
-                        ack = json.loads(line)
-                        break
-                    except json.JSONDecodeError:
-                        continue
-            else:
-                time.sleep(0.02)
-        if ack is None:
-            # ack が来ない場合でも JPEG は取れているので、画像だけ返す (ack の欠落は
-            # 致命ではない)
-            return {
-                "status": "ok",
-                "image_jpeg": jpeg,
-                "size": len(jpeg),
-                "format": "jpeg",
-                "captured_at": host_capture_start,
-                "note": "ack missing",
-            }
-        if ack.get("status") == "error":
+            # 画像本体を pop。binary parser が IMG header 後に拾ってる想定。
+            jpeg = self.actor.pop_img_data()
+            if jpeg is None:
+                return {"status": "error", "error": "ack received but no image body"}
+
+            device_ms = ack.pop("captured_at", None)
+            if isinstance(device_ms, (int, float)):
+                ack["captured_at_device_ms"] = int(device_ms)
+            ack["image_jpeg"] = jpeg
+            ack["captured_at"] = host_capture_start
             return ack
-        # 成功 ack に画像本体と host 時刻を載せて返す。ファームが返す `captured_at`
-        # は device millis (起動からの相対時刻) なので、`captured_at_device_ms` に
-        # rename して保持し、`captured_at` は host 側の epoch sec で上書きする。
-        device_ms = ack.pop("captured_at", None)
-        if isinstance(device_ms, (int, float)):
-            ack["captured_at_device_ms"] = int(device_ms)
-        ack["image_jpeg"] = jpeg
-        ack["captured_at"] = host_capture_start
-        return ack
+        finally:
+            self.actor.end_transaction()
 
 
 class StackchanWifi:
@@ -491,6 +856,9 @@ class StackchanWifi:
         )
         response.raise_for_status()
         return response.json()
+
+    def send_image(self, image_jpeg: bytes, chunk_size: int = 1024, chunk_delay: float = 0.005) -> dict:
+        return {"status": "error", "error": "WiFi IMAGE not implemented"}
 
     def capture(self, timeout: float = 5.0) -> dict:
         # WiFi 経由のカメラ取得は Phase 2 (WiFi MJPEG ストリーム) で実装予定。
@@ -535,4 +903,3 @@ def create_backend(config: StackchanConfig):
     backend.max_wav_bytes = config.max_wav_bytes
     backend.skip_move_during_wav = config.skip_move_during_wav
     return backend
-

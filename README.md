@@ -11,13 +11,17 @@
 - `turn.complete` の最終テキストを piper-plus / VOICEVOX で音声化して再生。再生中は首がささやかに揺れる
 - 完了後は `neutral` 顔 + idle ポーズに戻る
 - `agent.error` では `sad` 顔 + 首を下げる
+- **スプライト顔モード (`--face-mode sprite`)**: `spritesheet.webp` を LCD 用 JPEG に変換して表示。row/state + filled-frame tick でまばたき/表情アニメーションする。スプライト本体は `assets/pets/...` にローカル配置し、リポジトリにはコミットしない
+- **バッテリー表示**: CoreS3 の残量を Avatar / スプライト顔の右上に表示し、`STATUS` に `battery_level` などを含める
 - **カメラスナップショット**: 内蔵 GC0308 カメラで JPEG 撮影 → 設定 UI / API で表示。LLM 連携は将来別 PR で対応
+- **アタマセンサ なでなで**: M5Stack 公式 StackChan K151 内蔵の Si12T 容量タッチ (3 ch) で Press / Release / Swipe を検出。Press で `nade nade!` Avatar 顔 + host へ `head_touch` event 通知
+- **音声対話モード (`--voice-conversation`)**: K151 のアタマセンサ tap で内蔵 PDM マイク録音 → 無音検出で自動停止 → faster-whisper STT (Silero VAD) → xangi `POST /api/chat` 投入。xangi 応答が piper-plus / VOICEVOX で発話される end-to-end ループ。詳細 `docs/usage.md` の「音声対話モード」
 
 表示 UI は持たず、デバイスの表情変更と音声再生に集中する。サーボの有無は起動時に自動判定され、サーボ無しの CoreS3 単体機では MOVE のみ unavailable 応答 (WAV/FACE/CAPTURE は通常動作) する graceful degradation 設計。
 
 ## 対応デバイス
 
-USB シリアル経由で Arduino (PlatformIO) ファームを焼く。機種ごとの本体ファームは `firmware/examples/<machine>/main/` に置かれていて、共通シリアルプロトコル (STATUS / VOLUME / WAV / FACE / MOVE / CAPTURE) を実装する。未搭載のハードは graceful degradation で `unavailable` 応答。
+USB シリアル経由で Arduino (PlatformIO) ファームを焼く。機種ごとの本体ファームは `firmware/examples/<machine>/main/` に置かれていて、共通シリアルプロトコル (STATUS / VOLUME / WAV / FACE / IMAGE / MOVE / CAPTURE) を実装する。未搭載のハードは graceful degradation で `unavailable` 応答。
 
 | デバイス | ファーム (PlatformIO env) | baud | MOVE | CAPTURE |
 |---------|---------|------|------|---------|
@@ -36,7 +40,7 @@ xangi (:18888)
       └─ xangi-stackchan (host bridge, Python)
           ├─ thread_id filter
           ├─ piper-plus persistent process
-          └─ device (USB serial 共通プロトコル: STATUS / FACE: / WAV:<size> / VOLUME: / MOVE: / CAPTURE)
+          └─ device (USB serial 共通プロトコル: STATUS / FACE: / IMAGE:<size> / WAV:<size> / VOLUME: / MOVE: / CAPTURE)
               ├─ M5Stack CoreS3 (K151 / K151-R / 単体機、firmware/examples/cores3/main、baud 921600)
               ├─ M5Stack AtomS3R + Atomic Voice/Echo Base (firmware/examples/atoms3r/main、baud 115200)
               └─ M5Stack Basic + アールティ Ver.β (firmware/examples/basic/main、baud 115200)
@@ -81,7 +85,7 @@ uv run xangi-stackchan --instance-id right --port /dev/stackchan-right --thread-
 
 ## AI エージェント連携
 
-[`SKILL.md`](./SKILL.md) を参照。Claude Code や borot 等の AI エージェントから本ブリッジを起動・操作してスタックチャンを動かすための手順を集約してある。
+[`SKILL.md`](./SKILL.md) を参照。Claude Code 等の AI エージェントから本ブリッジを起動・操作してスタックチャンを動かすための手順を集約してある。
 
 ## ドキュメント
 

@@ -13,3 +13,9 @@ tools/piper
 
 # release-scripts が clone する公開リポ
 public/
+
+# ローカルのスプライト資産。ユーザーごとの生成物なのでリポジトリには入れない。
+assets/pets/**/*.webp
+assets/pets/**/*.png
+assets/pets/**/*.jpg
+assets/pets/**/*.jpeg
