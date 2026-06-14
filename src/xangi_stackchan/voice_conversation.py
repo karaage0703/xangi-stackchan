@@ -95,8 +95,15 @@ class VoiceConversation:
         on_sent: callable = None,
         on_stop: callable = None,
         on_press: callable = None,
+        trigger_head_touch: bool = True,
+        trigger_mic_button: bool = True,
     ):
         self.backend = backend
+        # 録音トリガの選択。アタマセンサ press / LCD マイクボタン tap のどちらで録音を
+        # 開始するか。LCD ボタン運用ではアタマセンサを「なで反応」に残すため
+        # trigger_head_touch=False にする。
+        self.trigger_head_touch = trigger_head_touch
+        self.trigger_mic_button = trigger_mic_button
         self.xangi_base_url = xangi_base_url.rstrip("/")
         self.app_session_id = app_session_id
         self.silence_dbfs = silence_dbfs
@@ -121,6 +128,9 @@ class VoiceConversation:
 
         self._state_lock = threading.Lock()
         self._recording = False
+        # push-to-talk (LCD ボタンを押している間だけ録音) の時 True。VAD の無音自動
+        # 停止をスキップし、ボタンを離す (mic_button up) まで録音を続ける。
+        self._push_to_talk = False
         self._record_start_time = 0.0
         self._last_chunk_time = 0.0  # 直近 PCM chunk 受信時刻 (0 = まだ 1 つも来ていない)
         self._speech_started = False  # 録音開始後に一度でも有音を検知したか
@@ -146,7 +156,12 @@ class VoiceConversation:
         が MIC モードのまま PCM stream を吐き続け、次回起動時のシリアルが汚染される
         (2026-05-27 実機検証で確認済の既知パターン)。
         """
-        self.backend.on_head_touch = self._on_head_touch
+        if self.trigger_head_touch:
+            self.backend.on_head_touch = self._on_head_touch
+        # LCD マイクボタン (cores3-main-0.17+) を別トリガとして bind。アタマセンサと
+        # 別経路なので、ボタン運用時はアタマセンサをなで反応に残せる。
+        if self.trigger_mic_button:
+            self.backend.on_mic_button = self._on_mic_button
         atexit.register(self._atexit_cleanup)
         # SIGTERM (pkill default) で atexit が走らないので、明示的に signal handler を
         # 仕込んで MIC_STOP を保証する。SIGKILL (-9) は trap 不可なので諦め (代わりに
@@ -164,6 +179,7 @@ class VoiceConversation:
     def stop(self) -> None:
         """bind 解除。録音中なら停止。"""
         self.backend.on_head_touch = None
+        self.backend.on_mic_button = None
         self._watchdog_stop.set()  # watchdog thread を畳む
         if self._recording:
             self._schedule_stop()
@@ -195,12 +211,35 @@ class VoiceConversation:
         gesture = event.get("gesture")
         if gesture != "press":
             return  # release / swipe は無視
+        self._toggle_recording(event)
+
+    def _on_mic_button(self, event: dict) -> None:
+        # LCD マイクボタン。tap-to-talk: 押した瞬間 (down) に録音開始、喋り終わり (無音
+        # silence_seconds) で VAD 自動停止。離し (up) は無視する。録音中の再タップは停止。
+        #
+        # NOTE: 当初 push-to-talk (押している間だけ録音、離しで停止) を狙ったが、録音中は
+        # シリアルが MIC_PCM バイナリで占有され、離しの "up" イベント行が host に確実に
+        # 届かず録音が止まらない事象が再現した。確実性を優先して VAD 自動停止方式に変更。
+        # 真の push-to-talk は firmware 側で録音停止まで完結させる設計が必要 (別途)。
+        action = event.get("action")
+        if action == "up":
+            return
+        self._toggle_recording(event)
+
+    def _toggle_recording(self, event: dict) -> None:
         with self._state_lock:
             if self._recording:
-                # 録音中の press = toggle stop
+                # 録音中の再トリガ = toggle stop
                 self._schedule_stop()
                 return
+        self._begin_recording(event, push_to_talk=False)
+
+    def _begin_recording(self, event: dict, push_to_talk: bool = False) -> None:
+        with self._state_lock:
+            if self._recording:
+                return
             self._recording = True
+            self._push_to_talk = push_to_talk
             self._stopping = False
             self._record_start_time = time.time()
             self._last_chunk_time = 0.0
@@ -220,6 +259,17 @@ class VoiceConversation:
         if ack.get("status") != "ok":
             with self._state_lock:
                 self._recording = False
+            if self.on_stop is not None:
+                try:
+                    self.on_stop({
+                        **ack,
+                        "pcm": b"",
+                        "wav": b"",
+                        "frames": 0,
+                        "duration_seconds": 0.0,
+                    })
+                except Exception:
+                    pass
             return
         # PCM が来なくても max / stall で必ず stop する安全網を起動。
         self._start_watchdog()
@@ -231,9 +281,14 @@ class VoiceConversation:
         now = time.time()
         self._last_chunk_time = now  # watchdog の stall 判定用に活性を記録
 
-        # 最長録音時間到達
+        # 最長録音時間到達 (push-to-talk でも暴走防止に効かせる)
         if now - self._record_start_time >= self.max_record_seconds:
             self._schedule_stop()
+            return
+
+        # push-to-talk はボタンを離す (mic_button up) まで録音継続。VAD の無音自動
+        # 停止はしない (発話中の間 (ま) で切れないように)。
+        if self._push_to_talk:
             return
 
         dbfs = chunk_dbfs(chunk)

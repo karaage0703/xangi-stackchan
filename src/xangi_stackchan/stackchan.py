@@ -132,6 +132,8 @@ def _ack_predicate_for(cmd: str) -> Callable[[str], bool]:
         "FACE": '"face"',
         "IMAGE": '"image"',
         "MOVE": '"yaw"',
+        "PUZZLE": '"puzzle"',
+        "STACKLED": '"stack_led"',
         "HEADTOUCH_AVATAR": '"head_touch_avatar"',
         "MIC_START": '"mode":"recording"',
         "MIC_STOP": '"mode":"speaker"',
@@ -217,6 +219,10 @@ class StackchanSerial:
         # 両方の経路から呼ばれるので、登録側は thread-safety を考慮する (現状の
         # SerialReader は drain は main thread、send_command は呼び出し側 thread)。
         self.on_head_touch: Callable[[dict], None] | None = None
+        # ファームから `{"event":"mic_button","at":<ms>}` を受信した時のコールバック
+        # (LCD 下部のマイクボタンを短くタップした時)。アタマセンサ (on_head_touch) と
+        # 別トリガで、音声入力 (録音→STT→xangi) を起動するのに app.py で bind する。
+        self.on_mic_button: Callable[[dict], None] | None = None
         # マイク録音状態。start_mic_recording / stop_mic_recording で操作。録音中は
         # _mic_reader_thread が別 thread で `MIC_PCM:<size>\n<binary>` を受信し続け、
         # _mic_pcm_buffer に蓄積 + (設定されていれば) _mic_on_pcm_chunk callback に
@@ -226,6 +232,18 @@ class StackchanSerial:
         self._mic_reader_thread: threading.Thread | None = None
         self._mic_pcm_buffer: bytearray = bytearray()
         self._mic_on_pcm_chunk: Callable[[bytes], None] | None = None
+        # 稼働中のシリアル切断 (デバイス再起動 / USB 再列挙で ttyACMx が変わる) からの
+        # 自動再接続。SerialActor.on_dead → _on_serial_dead → 専用 thread が
+        # close + open を reconnect_interval 間隔で成功するまで繰り返す。
+        # 切断中の send_* は fail-fast でエラー dict を返す (呼び出し側の sprite
+        # animation / SSE event loop をブロックしない)。再接続成功時は
+        # on_reconnected callback (app.py が音量・表情の再初期化を登録) を呼ぶ。
+        self.reconnect_enabled: bool = True
+        self.reconnect_interval: float = 3.0
+        self.on_reconnected: Callable[[], None] | None = None
+        self._disconnected = threading.Event()
+        self._reconnect_thread: threading.Thread | None = None
+        self._closing = False
 
     def open(self):
         self.ser = serial.Serial(self.port, self.baud, timeout=5)
@@ -244,6 +262,7 @@ class StackchanSerial:
         # add_line_listener 経由で _on_line に流す。
         self.actor = SerialActor(self.ser)
         self.actor.add_line_listener(self._on_line)
+        self.actor.on_dead = self._on_serial_dead
         self.actor.start()
         # ファーム reset 直後の boot ログや前回 session の遅延応答が USB CDC TX
         # buffer に残っている。actor を 500ms 動かしてそれらを line listener 側で
@@ -302,14 +321,95 @@ class StackchanSerial:
             )
 
     def close(self):
+        self._closing = True
+        self._teardown()
+
+    def _teardown(self):
+        """actor / serial fd を黙って閉じる (close と reconnect 共用)。"""
         if self.actor is not None:
             try:
                 self.actor.stop()
             except Exception:
                 pass
             self.actor = None
-        if self.ser and self.ser.is_open:
-            self.ser.close()
+        if self.ser:
+            try:
+                if self.ser.is_open:
+                    self.ser.close()
+            except Exception:
+                pass
+            self.ser = None
+
+    @property
+    def is_connected(self) -> bool:
+        return not self._disconnected.is_set()
+
+    def _on_serial_dead(self, reason: str) -> None:
+        """SerialActor からの切断通知 (reader/writer thread 上で呼ばれる)。
+
+        重い処理はせず、フラグを立てて再接続 thread を起こすだけ。
+        """
+        if self._closing or not self.reconnect_enabled:
+            return
+        if self._disconnected.is_set():
+            return
+        self._disconnected.set()
+        print(
+            json.dumps({"serial": "disconnected", "reason": reason, "port": self.port}),
+            flush=True,
+        )
+        t = self._reconnect_thread
+        if t is not None and t.is_alive():
+            return
+        self._reconnect_thread = threading.Thread(
+            target=self._reconnect_loop, daemon=True, name="stackchan-serial-reconnect"
+        )
+        self._reconnect_thread.start()
+
+    def _reconnect_loop(self) -> None:
+        """切断後、成功するまで close + open を繰り返す。
+
+        port には udev 固定パス (/dev/stackchan) や /dev/serial/by-id/... の
+        安定パスが入っている前提なので、デバイスが再列挙されても同じパスで
+        開き直せる。USB が物理的に抜かれている間は open が失敗し続けるが、
+        挿し直された時点で次の試行が成功する (無期限リトライ)。
+        """
+        attempt = 0
+        while not self._closing:
+            attempt += 1
+            try:
+                with self._lock:
+                    self._teardown()
+                    self.open()
+            except Exception as exc:
+                if attempt == 1 or attempt % 10 == 0:
+                    print(
+                        json.dumps(
+                            {
+                                "serial": "reconnect_failed",
+                                "attempt": attempt,
+                                "error": f"{type(exc).__name__}: {exc}",
+                            }
+                        ),
+                        flush=True,
+                    )
+                time.sleep(self.reconnect_interval)
+                continue
+            self._disconnected.clear()
+            print(
+                json.dumps({"serial": "reconnected", "port": self.port, "attempt": attempt}),
+                flush=True,
+            )
+            cb = self.on_reconnected
+            if cb is not None:
+                try:
+                    cb()
+                except Exception as exc:
+                    print(
+                        json.dumps({"serial": "reconnect_callback_error", "error": str(exc)}),
+                        flush=True,
+                    )
+            return
 
     def drain(self):
         # SerialActor 移行後は no-op。actor が常時 ser.read() で byte stream を
@@ -367,6 +467,17 @@ class StackchanSerial:
                     self.on_head_touch(data)
                 except Exception:
                     # listener 側の例外でシリアル受信ループを壊さない。
+                    pass
+            return True
+        if "mic_button" in line:
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                return True
+            if self.on_mic_button is not None:
+                try:
+                    self.on_mic_button(data)
+                except Exception:
                     pass
             return True
         return False
@@ -478,7 +589,21 @@ class StackchanSerial:
         })
         return result
 
+    def _is_disconnected(self) -> bool:
+        # tests は __new__ で部分構築するので getattr で防御 (未初期化 = 接続扱い)
+        ev = getattr(self, "_disconnected", None)
+        return ev is not None and ev.is_set()
+
+    def _disconnected_error(self) -> dict:
+        return {
+            "status": "error",
+            "error": "serial disconnected (auto-reconnect in progress)",
+            "disconnected": True,
+        }
+
     def send_command(self, cmd: str) -> dict:
+        if self._is_disconnected():
+            return self._disconnected_error()
         # WAV 再生中の MOVE は skip_move_during_wav=True 時にスキップ。電流ラッシュ
         # 由来の USB シリアル切断を避けるための rt_beta 向け mutual exclusion。
         if self.skip_move_during_wav and self._wav_active and cmd.startswith("MOVE:"):
@@ -504,6 +629,8 @@ class StackchanSerial:
     def send_wav(self, wav_data: bytes, chunk_size: int = 1024, chunk_delay: float = 0.005) -> dict:
         if not wav_data:
             return {"status": "error", "error": "empty WAV"}
+        if self._is_disconnected():
+            return self._disconnected_error()
 
         # ユーザがファーム LCD を長押しで stop した状態 (audio_stopped event 受信済)。
         # 次の turn.started が来るまでホスト側でこのフラグを True に保持して、
@@ -567,6 +694,8 @@ class StackchanSerial:
         """Send a JPEG face image to firmware via IMAGE:<size>."""
         if not image_jpeg:
             return {"status": "error", "error": "empty image"}
+        if self._is_disconnected():
+            return self._disconnected_error()
         with self._lock:
             self.actor.start_transaction()
             try:
@@ -634,6 +763,8 @@ class StackchanSerial:
         expected = width * height * 2
         if len(rgb565) != expected:
             return {"status": "error", "error": "rect size mismatch", "size": len(rgb565), "expected": expected}
+        if self._is_disconnected():
+            return self._disconnected_error()
 
         with self._lock:
             self.actor.start_transaction()

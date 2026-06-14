@@ -46,6 +46,10 @@ class SpriteFaceRenderer:
         self._cache: dict[str, bytes] = {}
         self._last_frame: Image.Image | None = None
         self._pending_frame: Image.Image | None = None
+        # True なら各フレーム下部に「マイクボタン」を合成する (lcd_mic_voice モード)。
+        # firmware の MIC_BTN_Y_MIN=188 と揃った下部ストリップに描くので、ここをタップ
+        # するとファームが mic_button event を出す。
+        self.show_mic_button: bool = False
 
     def render_expression(self, expression: str) -> bytes:
         return self.render_expression_frame(expression, 0)
@@ -89,6 +93,16 @@ class SpriteFaceRenderer:
     def discard_pending_frame(self) -> None:
         self._pending_frame = None
 
+    def reset_frame_state(self) -> None:
+        """差分の基準フレームを破棄する。
+
+        デバイス再起動 / シリアル再接続後は LCD が boot 画面に戻っていて
+        ホスト側の差分基準と食い違うため、これを呼んで次フレームを
+        全画面送信にする。
+        """
+        self._last_frame = None
+        self._pending_frame = None
+
     def frame_columns_for_expression(self, expression: str) -> list[int]:
         row = EXPRESSION_TO_ROW.get((expression or "").strip().lower(), EXPRESSION_TO_ROW["neutral"])
         return self._detect_filled_frames()[row]
@@ -102,7 +116,7 @@ class SpriteFaceRenderer:
         label: str | None = None,
     ) -> bytes:
         canvas = self.render_cell_image(row=row, col=col, crop_head=crop_head, label=label)
-        key = f"{self.sheet_path}:{self._sheet_mtime}:{row}:{col}:{crop_head}:{label}:{self.quality}:jpeg"
+        key = f"{self.sheet_path}:{self._sheet_mtime}:{row}:{col}:{crop_head}:{label}:{self.show_mic_button}:{self.quality}:jpeg"
         cached = self._cache.get(key)
         if cached is not None:
             return cached
@@ -138,10 +152,24 @@ class SpriteFaceRenderer:
         x = (320 - cell.width) // 2
         y = (240 - cell.height) // 2
         canvas.paste(cell, (x, y), cell)
-        if label:
+        if label or self.show_mic_button:
             draw = ImageDraw.Draw(canvas)
-            draw.rounded_rectangle((88, 206, 232, 232), radius=6, fill=(0, 0, 0), outline=(255, 255, 255), width=2)
-            draw.text((111, 214), label, fill=(255, 255, 255))
+            if label:
+                # 録音中などの状態ラベルは下部に表示。
+                draw.rounded_rectangle((88, 206, 232, 232), radius=6, fill=(0, 0, 0), outline=(255, 255, 255), width=2)
+                draw.text((111, 214), label, fill=(255, 255, 255))
+            if self.show_mic_button:
+                # 左上にマイクボタン (firmware の inMicButton 領域 x<92,y<60 に合わせる)。
+                # 録音中 (listening label) は赤くして「押下中」を示す。
+                recording = label == "LISTENING"
+                fill = (210, 40, 40) if recording else (30, 90, 200)
+                draw.rounded_rectangle((6, 6, 86, 52), radius=8, fill=fill, outline=(255, 255, 255), width=2)
+                # マイクアイコン: カプセル本体 + アーチ + スタンド。
+                draw.rounded_rectangle((26, 13, 40, 33), radius=7, fill=(255, 255, 255))
+                draw.arc((22, 20, 44, 40), start=0, end=180, fill=(255, 255, 255), width=2)
+                draw.line((33, 40, 33, 46), fill=(255, 255, 255), width=2)
+                draw.line((26, 46, 40, 46), fill=(255, 255, 255), width=2)
+                draw.text((48, 22), "talk", fill=(255, 255, 255))
         return canvas
 
     @staticmethod

@@ -40,11 +40,14 @@
 //     DEFAULT_BAUD と一致)。
 
 #include <Avatar.h>
+#include <Adafruit_NeoPixel.h>
 #include <M5CoreS3.h>
 #include <M5Unified.h>
 #include <Preferences.h>
 #include <esp_camera.h>
+#include <esp_system.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -52,6 +55,7 @@
 
 #include "SCServo.h"
 #include "Si12T.h"
+#include "nade_voices.h"
 
 using m5avatar::Avatar;
 using m5avatar::Expression;
@@ -75,6 +79,10 @@ constexpr size_t   MAX_RECT_BYTES    = 320 * 240 * 2;  // host から送る RGB5
 // すればホストが諦める前に受信ループを抜けてコマンド待ちに復帰でき、自動再同期する。
 constexpr uint32_t IMAGE_CHUNK_TIMEOUT_MS = 1500;
 constexpr uint32_t BATTERY_UPDATE_MS = 5000;
+constexpr int      PUZZLE_LED_PIN    = 9;   // CoreS3 Grove PORT.B yellow
+constexpr uint16_t PUZZLE_LED_COUNT  = 64;  // M5Stack Puzzle Unit WS2812E 8x8
+constexpr uint8_t  PUZZLE_BRIGHTNESS = 24;  // 64 LEDs: keep default current modest
+constexpr uint8_t  STACK_LED_COUNT   = 12;  // K151 / K151-R body RGB LEDs (left 0-5, right 6-11)
 
 // === マイク録音 (MIC_START / MIC_STOP / MIC_PCM) ==============================
 // CoreS3 内蔵 PDM マイクで 16-bit signed mono PCM @ 16kHz を取得し、64ms 単位
@@ -107,7 +115,7 @@ constexpr const char* NVS_KEY_PITCH_ZERO = "pitch_zero";
 
 constexpr uint16_t MOVE_GOAL_TIME_MS = 500;  // setAngle 既定の移動時間
 
-static uint8_t g_volume = 128;
+static uint8_t g_volume = 255;  // スタンドアローン既定は最大音量 (デモ向け)。host は VOLUME: で上書き。
 static bool    g_servo_ready  = false;
 static bool    g_servo_torque = false;
 static bool    g_camera_ready = false;
@@ -123,6 +131,23 @@ static bool    g_head_touch_ready = false;
 // 優先して、なでなで feedback を抑制する。host から `HEADTOUCH_AVATAR:on|off` で
 // 切替。デフォルト on (従来挙動を維持)。
 static bool    g_head_touch_avatar = true;
+// なでなで反応モード (スタンドアローン): アタマを触ったら埋め込み音声をランダム再生
+// + Happy 顔。ホスト PC / AI 連携不要で、電源 ON だけでデモが回る。host が音声対話
+// 等で press を使いたい時は `HEADPET_SOUND:off` で抑制できる。デフォルト on。
+static bool     g_head_pet_sound       = true;
+// LCD 下部マイクボタンの有効/無効 (STATUS / コマンド / pollTouchStop から参照するため
+// 宣言を前方に置く)。デフォルト on。host が使わない場合も無害 (event を無視するだけ)。
+static bool     g_mic_button_enabled   = true;
+// 連打/なで続けで音が積み上がらないようにするクールダウン。発話 (再生) 終了後から
+// この時間は再発火しない。
+constexpr uint32_t HEAD_PET_COOLDOWN_MS = 1500;
+static uint32_t g_head_pet_last_ms     = 0;
+static bool     g_puzzle_ready         = false;
+static char     g_puzzle_pattern[16]   = "off";
+static bool     g_stack_led_ready      = false;
+static char     g_stack_led_pattern[16] = "off";
+
+static Adafruit_NeoPixel puzzle(PUZZLE_LED_COUNT, PUZZLE_LED_PIN, NEO_GRB + NEO_KHZ800);
 
 // マイク録音状態。host 側 `MIC_START` で true、`MIC_STOP` で false。録音中は
 // micRecordTask が PDM マイクから 16-bit PCM をチャンクで切り出して Serial に
@@ -135,6 +160,29 @@ static int16_t       g_mic_buffer[MIC_CHUNK_SAMPLES];
 
 enum class State { Booting, Ready, Receiving, Playing, Error };
 static State g_state = State::Booting;
+
+// 直前のリセット理由。予期しない再起動 (panic / watchdog / brownout) の事後診断用。
+// boot banner と STATUS の "reset_reason" で host から参照できる。再起動の瞬間の
+// シリアルログは USB 再列挙で host に届かないことが多いので、次回 boot に痕跡を残す。
+static esp_reset_reason_t g_reset_reason = ESP_RST_UNKNOWN;
+
+static const char* resetReasonStr(esp_reset_reason_t r) {
+    switch (r) {
+        case ESP_RST_POWERON:   return "poweron";
+        case ESP_RST_EXT:       return "external";
+        case ESP_RST_SW:        return "software";
+        case ESP_RST_PANIC:     return "panic";
+        case ESP_RST_INT_WDT:   return "int_watchdog";
+        case ESP_RST_TASK_WDT:  return "task_watchdog";
+        case ESP_RST_WDT:       return "other_watchdog";
+        case ESP_RST_DEEPSLEEP: return "deepsleep";
+        case ESP_RST_BROWNOUT:  return "brownout";
+        case ESP_RST_SDIO:      return "sdio";
+        case ESP_RST_USB:       return "usb";
+        case ESP_RST_JTAG:      return "jtag";
+        default:                return "unknown";
+    }
+}
 
 static const char* stateStr(State s) {
     switch (s) {
@@ -181,6 +229,24 @@ static bool wavQueuePush(uint8_t* data, size_t len) {
 static Avatar avatar;
 static SCServo servo(Serial1, SERVO_RX_PIN, SERVO_TX_PIN);
 
+// servo UART を複数タスクから同時に叩くと half-duplex バスが化ける。host の MOVE
+// (command loop の handleMove) と、なでなで反応の首振り (wiggleTask の
+// nadeWiggle) は別タスクなので、各 UART transaction を mutex で直列化する。
+// xangi 連携 (host が MOVE 駆動) とスタンドアローン (firmware が首振り) を両立させる肝。
+// servo 無し機では生成しても使わないだけ。take/give は setup でタスク起動前に生成済み
+// 前提。未生成 (nullptr) なら素通り。
+static SemaphoreHandle_t g_servo_mutex = nullptr;
+static inline void servoLock()   { if (g_servo_mutex) xSemaphoreTake(g_servo_mutex, portMAX_DELAY); }
+static inline void servoUnlock() { if (g_servo_mutex) xSemaphoreGive(g_servo_mutex); }
+
+// Serial 書き込みの排他。録音中は micRecordTask が `MIC_PCM:<size>\n<binary>` を
+// 流し続ける一方、loop() の pollTouchStop が mic_button "up" 等の JSON 行を書く。
+// mutex 無しだと両者のバイトが混線し、host が "up" を取りこぼして録音が止まらない
+// (push-to-talk が「押しっぱなし」になる不具合)。各 1 行 / 1 フレームを atomic に書く。
+static SemaphoreHandle_t g_serial_mutex = nullptr;
+static inline void serialLock()   { if (g_serial_mutex) xSemaphoreTake(g_serial_mutex, portMAX_DELAY); }
+static inline void serialUnlock() { if (g_serial_mutex) xSemaphoreGive(g_serial_mutex); }
+
 // スプライトを host 側で JPEG 化して送る画像顔モード。
 // IMAGE を受けたら Avatar draw task を suspend し、以後 LCD にはこの JPEG と
 // バッテリー overlay を描く。FACE を受けたら Avatar モードに戻る。
@@ -202,9 +268,16 @@ constexpr uint8_t  I2C_ADDR         = 0x6F;
 constexpr uint32_t I2C_FREQ         = 100000;
 constexpr uint8_t  REG_VERSION      = 0x02;
 constexpr uint8_t  REG_GPIO_DIR_L   = 0x03;
+constexpr uint8_t  REG_GPIO_DIR_H   = 0x04;
 constexpr uint8_t  REG_GPIO_OUT_L   = 0x05;
 constexpr uint8_t  REG_GPIO_PU_L    = 0x09;
+constexpr uint8_t  REG_GPIO_PU_H    = 0x0A;
+constexpr uint8_t  REG_GPIO_DRV_L   = 0x13;
+constexpr uint8_t  REG_GPIO_DRV_H   = 0x14;
+constexpr uint8_t  REG_LED_CFG      = 0x24;
+constexpr uint8_t  REG_LED_RAM_START = 0x30;
 constexpr uint8_t  SERVO_VM_EN_PIN  = 0;
+constexpr uint8_t  STACK_LED_PIN    = 13;
 
 static bool waitReady(uint32_t timeoutMs = 1500) {
     const uint32_t start = millis();
@@ -230,6 +303,42 @@ static bool enableServoPower() {
     delay(200);  // VM rail 安定待ち
     Serial.printf("[py32] servo power %s\n", ok ? "ON" : "FAILED");
     return ok;
+}
+
+static bool setPinBit(uint8_t reg_l, uint8_t reg_h, uint8_t pin, bool value) {
+    const uint8_t reg = pin < 8 ? reg_l : reg_h;
+    const uint8_t mask = 1 << (pin < 8 ? pin : pin - 8);
+    return value ? M5.In_I2C.bitOn(I2C_ADDR, reg, mask, I2C_FREQ)
+                 : M5.In_I2C.bitOff(I2C_ADDR, reg, mask, I2C_FREQ);
+}
+
+static bool initStackLed() {
+    if (!waitReady(200)) return false;
+    bool ok = true;
+    ok &= setPinBit(REG_GPIO_DIR_L, REG_GPIO_DIR_H, STACK_LED_PIN, true);
+    ok &= setPinBit(REG_GPIO_PU_L, REG_GPIO_PU_H, STACK_LED_PIN, true);
+    ok &= setPinBit(REG_GPIO_DRV_L, REG_GPIO_DRV_H, STACK_LED_PIN, false);
+    ok &= M5.In_I2C.writeRegister8(I2C_ADDR, REG_LED_CFG, STACK_LED_COUNT & 0x3F, I2C_FREQ);
+    Serial.printf("[py32] stack LED %s\n", ok ? "ready" : "FAILED");
+    return ok;
+}
+
+static uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
+    return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+}
+
+static bool setStackLedColor(uint8_t index, uint8_t r, uint8_t g, uint8_t b) {
+    const uint16_t color = rgb565(r, g, b);
+    const uint8_t reg = REG_LED_RAM_START + index * 2;
+    bool ok = true;
+    ok &= M5.In_I2C.writeRegister8(I2C_ADDR, reg, color & 0xFF, I2C_FREQ);
+    ok &= M5.In_I2C.writeRegister8(I2C_ADDR, reg + 1, (color >> 8) & 0xFF, I2C_FREQ);
+    return ok;
+}
+
+static bool refreshStackLed() {
+    const uint8_t val = M5.In_I2C.readRegister8(I2C_ADDR, REG_LED_CFG, I2C_FREQ);
+    return M5.In_I2C.writeRegister8(I2C_ADDR, REG_LED_CFG, val | (1 << 6), I2C_FREQ);
 }
 }  // namespace py32
 
@@ -423,16 +532,26 @@ static void sendAckUnsupported(const char* cmd) {
 
 static void handleStatus() {
     updateBatteryInfo(true);
-    Serial.printf("{\"state\":\"%s\",\"volume\":%u,\"version\":\"cores3-main-0.15\","
+    Serial.printf("{\"state\":\"%s\",\"volume\":%u,\"version\":\"cores3-main-0.19\","
                   "\"servo\":%s,\"torque\":%s,\"camera\":%s,\"head_touch\":%s,"
+                  "\"puzzle\":%s,\"puzzle_pattern\":\"%s\","
+                  "\"stack_led\":%s,\"stack_led_pattern\":\"%s\","
+                  "\"head_pet_sound\":%s,\"mic_button\":%s,"
                   "\"mic_recording\":%s,\"queued\":%d,\"playing\":%s,"
                   "\"image_face\":%s,\"battery_level\":%ld,"
-                  "\"battery_voltage_mv\":%d,\"charging\":\"%s\"}\n",
+                  "\"battery_voltage_mv\":%d,\"charging\":\"%s\","
+                  "\"reset_reason\":\"%s\",\"uptime_ms\":%lu}\n",
                   stateStr(g_state), g_volume,
                   g_servo_ready  ? "true" : "false",
                   g_servo_torque ? "true" : "false",
                   g_camera_ready ? "true" : "false",
                   g_head_touch_ready ? "true" : "false",
+                  g_puzzle_ready ? "true" : "false",
+                  g_puzzle_pattern,
+                  g_stack_led_ready ? "true" : "false",
+                  g_stack_led_pattern,
+                  g_head_pet_sound ? "true" : "false",
+                  g_mic_button_enabled ? "true" : "false",
                   g_mic_recording ? "true" : "false",
                   wavQueueCount(),
                   g_wav_playing ? "true" : "false",
@@ -440,8 +559,132 @@ static void handleStatus() {
                   static_cast<long>(g_battery_level),
                   g_battery_voltage_mv,
                   g_battery_charging == m5::Power_Class::is_charging ? "charging" :
-                    (g_battery_charging == m5::Power_Class::is_discharging ? "discharging" : "unknown"));
+                    (g_battery_charging == m5::Power_Class::is_discharging ? "discharging" : "unknown"),
+                  resetReasonStr(g_reset_reason),
+                  static_cast<unsigned long>(millis()));
     Serial.flush();
+}
+
+static uint32_t puzzleColor(uint8_t r, uint8_t g, uint8_t b) {
+    return puzzle.Color(r, g, b);
+}
+
+static uint32_t puzzleWheel(uint8_t pos) {
+    pos = 255 - pos;
+    if (pos < 85) {
+        return puzzleColor(255 - pos * 3, 0, pos * 3);
+    }
+    if (pos < 170) {
+        pos -= 85;
+        return puzzleColor(0, pos * 3, 255 - pos * 3);
+    }
+    pos -= 170;
+    return puzzleColor(pos * 3, 255 - pos * 3, 0);
+}
+
+static void puzzleFill(uint32_t color) {
+    for (uint16_t i = 0; i < PUZZLE_LED_COUNT; i++) {
+        puzzle.setPixelColor(i, color);
+    }
+}
+
+static void puzzleApplyPattern(const char* pattern) {
+    if (strcmp(pattern, "off") == 0) {
+        puzzle.clear();
+    } else if (strcmp(pattern, "red") == 0 || strcmp(pattern, "error") == 0) {
+        puzzleFill(puzzleColor(255, 0, 0));
+    } else if (strcmp(pattern, "green") == 0 || strcmp(pattern, "talking") == 0) {
+        puzzleFill(puzzleColor(0, 255, 0));
+    } else if (strcmp(pattern, "blue") == 0 || strcmp(pattern, "thinking") == 0) {
+        puzzleFill(puzzleColor(0, 0, 255));
+    } else if (strcmp(pattern, "white") == 0) {
+        puzzleFill(puzzleColor(255, 255, 255));
+    } else if (strcmp(pattern, "rainbow") == 0) {
+        for (uint16_t i = 0; i < PUZZLE_LED_COUNT; i++) {
+            puzzle.setPixelColor(i, puzzleWheel((i * 256 / PUZZLE_LED_COUNT) & 255));
+        }
+    }
+    puzzle.show();
+}
+
+static bool puzzlePatternKnown(const char* pattern) {
+    return strcmp(pattern, "off") == 0 ||
+           strcmp(pattern, "red") == 0 ||
+           strcmp(pattern, "green") == 0 ||
+           strcmp(pattern, "blue") == 0 ||
+           strcmp(pattern, "white") == 0 ||
+           strcmp(pattern, "rainbow") == 0 ||
+           strcmp(pattern, "thinking") == 0 ||
+           strcmp(pattern, "talking") == 0 ||
+           strcmp(pattern, "error") == 0;
+}
+
+static void stackLedFill(uint8_t r, uint8_t g, uint8_t b) {
+    for (uint8_t i = 0; i < STACK_LED_COUNT; i++) {
+        py32::setStackLedColor(i, r, g, b);
+    }
+}
+
+static void stackLedApplyPattern(const char* pattern) {
+    if (strcmp(pattern, "off") == 0) {
+        stackLedFill(0, 0, 0);
+    } else if (strcmp(pattern, "red") == 0 || strcmp(pattern, "error") == 0) {
+        stackLedFill(168, 0, 0);
+    } else if (strcmp(pattern, "green") == 0 || strcmp(pattern, "talking") == 0) {
+        stackLedFill(0, 168, 0);
+    } else if (strcmp(pattern, "blue") == 0 || strcmp(pattern, "thinking") == 0) {
+        stackLedFill(0, 0, 168);
+    } else if (strcmp(pattern, "white") == 0) {
+        stackLedFill(168, 168, 168);
+    } else if (strcmp(pattern, "rainbow") == 0) {
+        const uint8_t colors[][3] = {
+            {168, 0, 0}, {168, 84, 0}, {168, 168, 0}, {0, 168, 0},
+            {0, 168, 168}, {0, 0, 168}, {84, 0, 168}, {168, 0, 168},
+        };
+        for (uint8_t i = 0; i < STACK_LED_COUNT; i++) {
+            const uint8_t* c = colors[i % 8];
+            py32::setStackLedColor(i, c[0], c[1], c[2]);
+        }
+    }
+    py32::refreshStackLed();
+}
+
+// PUZZLE:<off|red|green|blue|white|rainbow|thinking|talking|error>\n
+static void handlePuzzle(const char* arg) {
+    if (!g_puzzle_ready) {
+        sendAckError("puzzle not ready");
+        return;
+    }
+    if (!puzzlePatternKnown(arg)) {
+        char err[64];
+        snprintf(err, sizeof(err), "unknown puzzle pattern: %s", arg);
+        sendAckError(err);
+        return;
+    }
+    snprintf(g_puzzle_pattern, sizeof(g_puzzle_pattern), "%s", arg);
+    puzzleApplyPattern(g_puzzle_pattern);
+    char extra[64];
+    snprintf(extra, sizeof(extra), "\"puzzle\":\"%s\"", g_puzzle_pattern);
+    sendAckOk(extra);
+}
+
+// STACKLED:<off|red|green|blue|white|rainbow|thinking|talking|error>\n
+static void handleStackLed(const char* arg) {
+    if (!g_stack_led_ready) {
+        sendAckError("stack LED not ready");
+        return;
+    }
+    if (!puzzlePatternKnown(arg)) {
+        char err[64];
+        snprintf(err, sizeof(err), "unknown stack LED pattern: %s", arg);
+        sendAckError(err);
+        return;
+    }
+    snprintf(g_stack_led_pattern, sizeof(g_stack_led_pattern), "%s", arg);
+    stackLedApplyPattern(g_stack_led_pattern);
+    char extra[64];
+    snprintf(extra, sizeof(extra), "\"stack_led\":\"%s\"", g_stack_led_pattern);
+    sendAckOk(extra);
 }
 
 // CAPTURE\n
@@ -573,10 +816,11 @@ static void handleMove(const char* arg) {
     float pitchClamped = constrain(pitchDeg, PITCH_SAFE_MIN_DEG, PITCH_SAFE_MAX_DEG);
     bool  clamped      = (yawClamped != yawDeg || pitchClamped != pitchDeg);
 
+    servoLock();
     ensureTorqueOn();
-
     bool ok_yaw   = servo.setAngleYaw(yawClamped,   MOVE_GOAL_TIME_MS);
     bool ok_pitch = servo.setAnglePitch(pitchClamped, MOVE_GOAL_TIME_MS);
+    servoUnlock();
     if (!ok_yaw || !ok_pitch) {
         Serial.printf("[bridge] MOVE failed: yaw_ok=%d pitch_ok=%d\n", ok_yaw, ok_pitch);
         sendAckError("setAngle failed");
@@ -933,20 +1177,48 @@ static void wavPlayTask(void* /*param*/) {
 constexpr uint32_t TOUCH_HOLD_MS = 1000;  // 1 秒長押しで stop (誤タッチ防止)
 static uint32_t g_touch_press_start_ms = 0;
 static bool     g_touch_stop_armed     = false;  // この press で stop を出したか
+static int16_t  g_touch_start_x        = -1;     // 押し始めの座標 (mic button 判定用)
+static int16_t  g_touch_start_y        = -1;
+
+// LCD 左上のマイクボタン領域。押している間だけ録音する push-to-talk。押した瞬間に
+// {"event":"mic_button","action":"down"}、離した時に "up" を host に通知する。host は
+// down で録音開始、up で停止 → STT → xangi。アタマセンサ (なで反応) と別トリガなので
+// 「なで + xangi連携 + 音声入力」が同居する。ボタンの見た目は sprite mode では host が
+// 画像左上に合成、avatar mode では未描画 (押下は効く)。CoreS3 LCD は 320x240、左上
+// ~92x60px をボタン領域にする。
+constexpr int16_t  MIC_BTN_X_MAX     = 92;
+constexpr int16_t  MIC_BTN_Y_MAX     = 60;
+static bool        g_mic_btn_active  = false;  // push-to-talk 押下中フラグ
+
+static inline bool inMicButton(int16_t x, int16_t y) {
+    return x >= 0 && x < MIC_BTN_X_MAX && y >= 0 && y < MIC_BTN_Y_MAX;
+}
+
+static void emitMicButton(const char* action) {
+    serialLock();
+    Serial.printf("{\"event\":\"mic_button\",\"action\":\"%s\",\"at\":%lu}\n",
+                  action, static_cast<unsigned long>(millis()));
+    Serial.flush();
+    serialUnlock();
+}
 
 static void emitAudioStopped(const char* reason) {
     // ホスト向け非同期イベント行。`pollSerialCommand` のコマンド応答とは別の
     // 行で、host 側は SerialReader thread で逐次読み取って _user_stopped を立てる。
+    serialLock();
     Serial.printf("{\"event\":\"audio_stopped\",\"reason\":\"%s\",\"at\":%lu}\n",
                   reason, static_cast<unsigned long>(millis()));
+    serialUnlock();
 }
 
 // アタマタッチセンサ (Si12T) のジェスチャ通知。M5Stack 公式 StackChan K151 の
 // 頭部 3 ch capacitive touch (前/中/後ろ) を Press / Release / SwipeForward /
 // SwipeBackward の 4 ジェスチャに集約。host 側は音声入力トリガ等として利用する。
 static void emitHeadTouch(const char* gesture) {
+    serialLock();
     Serial.printf("{\"event\":\"head_touch\",\"gesture\":\"%s\",\"at\":%lu}\n",
                   gesture, static_cast<unsigned long>(millis()));
+    serialUnlock();
 }
 
 static const char* headTouchGestureName(Si12T::Gesture g) {
@@ -964,6 +1236,8 @@ static const char* headTouchGestureName(Si12T::Gesture g) {
 // (g_wav_playing = talking 顔) は触らず、それぞれの UX feedback を保つ。
 static void applyHeadTouchAvatar(Si12T::Gesture g) {
     if (!g_head_touch_avatar) return;  // host から抑制指示あり (voice_conversation 中)
+    if (g_image_face_active) return;   // sprite(画像)モード中は avatar を描かない
+                                       // (なでた瞬間に borot 画像が avatar 顔に戻る不具合)
     if (g_mic_recording || g_wav_playing) return;
     switch (g) {
         case Si12T::Gesture::Press:
@@ -983,16 +1257,127 @@ static void applyHeadTouchAvatar(Si12T::Gesture g) {
     }
 }
 
-static void headTouchPollTask(void* /*param*/) {
+// なでなで反応 (スタンドアローン): 埋め込み音声 (nade_voices.h) からランダムに 1 つ
+// 選んで WAV キューに積む。実際の再生 + 口パク + バッファ free は wavPlayTask が処理
+// する。Happy 顔 + 吹き出しも出す。録音中 / 再生中 / クールダウン中 / キュー満杯時は
+// 何もしない。ホスト PC や AI 連携なしで、電源 ON + なでるだけで反応するデモ用機構。
+// なでなで反応時の楽しい首振り。サーボがあれば「上を向く (うれしい) → 左右ふりふり →
+// センター」の動きで喜びを表現する。setAngle は非同期 (指定時間で動く) なので各ポーズ
+// 間を vTaskDelay で待つ。サーボ無し機 (CoreS3 単体) では何もしない。wiggleTask
+// から呼ばれるので loop() は止まらない (I2C 単一タスク原則は pollHeadTouch の解説参照)。
+// host 接続時 (voice / head-pet-reaction) は HEADPET_SOUND:off で playNadeReaction 自体が
+// 走らないため、host の TalkingSway 等とサーボ競合しない。
+// mutex を各 servo UART transaction だけに掛け、vTaskDelay はロック外で待つ
+// (ロックを ~1.4s 保持し続けると host の command 処理を止めてしまうため)。
+static void wiggleYaw(float deg, uint16_t t) {
+    servoLock(); servo.setAngleYaw(deg, t); servoUnlock();
+    vTaskDelay(pdMS_TO_TICKS(t));
+}
+static void wigglePitch(float deg, uint16_t t) {
+    servoLock(); servo.setAnglePitch(deg, t); servoUnlock();
+    vTaskDelay(pdMS_TO_TICKS(t));
+}
+
+static void nadeWiggle() {
+    if (!g_servo_ready) return;
+    servoLock(); ensureTorqueOn(); servoUnlock();
+    constexpr uint16_t T = 200;  // 各ポーズの移動時間 = 待ち時間
+    // pitch はプラスが上向き (マイナスだと下を向いて台座/足に当たる)。なでられて
+    // 上機嫌に「上を向く + 左右ふりふり」。下方向には振らない。
+    wigglePitch(14.0f, T);  // 上を向く (うれしい)
+    wiggleYaw( 20.0f, T);   // ふり →
+    wiggleYaw(-20.0f, T);   // ふり ←
+    wiggleYaw( 14.0f, T);   // ふり →
+    wiggleYaw( -8.0f, T);   // ふり ←
+    wiggleYaw(  0.0f, T);   // 正面戻し
+    wigglePitch( 6.0f, T);  // 軽く上向き気味で待機 (下げない)
+}
+
+// なでなで首振りの専用タスク。nadeWiggle は vTaskDelay 込みで ~1.4s かかるので
+// loop() から直接呼ぶとシリアル/画像処理が止まる。servo は UART (I2C ではない) +
+// g_servo_mutex で排他済みなので、別タスクに逃しても I2C 単一タスク原則を壊さない。
+// playNadeReaction (loop) から xTaskNotifyGive で起こす。
+static TaskHandle_t g_wiggle_task = nullptr;
+
+static void wiggleTask(void* /*param*/) {
     for (;;) {
-        if (g_head_touch_ready) {
-            Si12T::Gesture g = g_head_touch.poll();
-            if (g != Si12T::Gesture::None) {
-                emitHeadTouch(headTouchGestureName(g));
-                applyHeadTouchAvatar(g);
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        nadeWiggle();
+    }
+}
+
+static void playNadeReaction() {
+    if (!g_head_pet_sound) return;
+    if (g_mic_recording) return;  // 録音中だけは触らない (PCM stream 破綻防止)
+
+    uint32_t now = millis();
+    if (g_head_pet_last_ms != 0 && now - g_head_pet_last_ms < HEAD_PET_COOLDOWN_MS) {
+        return;
+    }
+    g_head_pet_last_ms = now;
+
+    // 首振り + Happy 顔 + 吹き出しは「喋っている最中でも」必ず反応する (タッチへの
+    // 即時フィードバック)。xangi 応答の発話中 (g_wav_playing) に触られても止めない。
+    if (!g_image_face_active) {
+        avatar.setExpression(Expression::Happy);
+        avatar.setSpeechText("nade nade!");
+    }
+
+    // 音声は「今 何も鳴っていない時だけ」鳴らす。発話中 (xangi 応答 / 直前のなで声) は
+    // 音の重なり・遅延堆積を避けてスキップし、首振りだけで反応する。
+    bool played = false;
+    if (!g_wav_playing && NADE_VOICE_COUNT > 0 && !wavQueueFull()) {
+        const NadeVoiceClip& clip = NADE_VOICES[esp_random() % NADE_VOICE_COUNT];
+        uint8_t* buf = static_cast<uint8_t*>(ps_malloc(clip.len));
+        if (buf != nullptr) {
+            memcpy(buf, clip.data, clip.len);
+            if (wavQueuePush(buf, clip.len)) {
+                played = true;
+            } else {
+                free(buf);
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    serialLock();
+    Serial.printf("{\"event\":\"head_pet_sound\",\"played\":%s,\"at\":%lu}\n",
+                  played ? "true" : "false",
+                  static_cast<unsigned long>(now));
+    serialUnlock();
+
+    // 首振りは専用タスクに通知して逃がす (nadeWiggle は ~1.4s、loop を止めない)。
+    // servo は g_servo_mutex で host MOVE と直列化済み。
+    if (g_wiggle_task != nullptr) {
+        xTaskNotifyGive(g_wiggle_task);
+    }
+}
+
+// アタマタッチセンサ (Si12T) の polling。loop() から 50ms 間隔で呼ぶ。
+//
+// 重要: 以前は専用タスク (headTouchPollTask) で polling していたが、M5.In_I2C は
+// タスク間排他が無く、loop() 側の I2C アクセス (M5.update の FT6336 タッチ読み /
+// AXP2101 バッテリー読み / MIC_START・STOP の ES7210・AW88298 コーデック設定) と
+// バス上で衝突する。実機で「FT6336 + Si12T だけ沈黙する部分死」(2026-06-12 22:08)
+// と「I2C ドライバごと固まる全体死」(同 22:39:46、なで反応とマイク切替直後 +
+// IMAGE 受信が重なった瞬間) の両方が再現した。対策として **内部 I2C に触るコードは
+// すべて loop() タスクに集約**する。50ms 周期は millis() ゲートで維持 (JPEG 描画や
+// WAV/IMAGE binary 受信中は poll が遅れるが、ジェスチャ検出用途では実害なし)。
+constexpr uint32_t HEAD_TOUCH_POLL_MS = 50;
+static uint32_t g_last_head_poll_ms = 0;
+
+static void pollHeadTouch() {
+    if (!g_head_touch_ready) return;
+    uint32_t now = millis();
+    if (now - g_last_head_poll_ms < HEAD_TOUCH_POLL_MS) return;
+    g_last_head_poll_ms = now;
+    Si12T::Gesture g = g_head_touch.poll();
+    if (g == Si12T::Gesture::None) return;
+    emitHeadTouch(headTouchGestureName(g));
+    applyHeadTouchAvatar(g);
+    // press / swipe を「なでた」とみなして音声反応 (スタンドアローン)。
+    if (g == Si12T::Gesture::Press ||
+        g == Si12T::Gesture::SwipeForward ||
+        g == Si12T::Gesture::SwipeBackward) {
+        playNadeReaction();
     }
 }
 
@@ -1008,10 +1393,12 @@ static void micRecordTask(void* /*param*/) {
         // のまま PCM stream を吐き続けて次回の host 起動時シリアル汚染が発生する
         // のを防ぐ (2026-05-27 21:01 事故の再発防止)。
         if (g_mic_start_ms != 0 && millis() - g_mic_start_ms > MIC_WATCHDOG_MS) {
+            serialLock();
             Serial.printf("{\"event\":\"mic_watchdog_timeout\",\"at\":%lu,"
                           "\"elapsed_ms\":%lu}\n",
                           static_cast<unsigned long>(millis()),
                           static_cast<unsigned long>(millis() - g_mic_start_ms));
+            serialUnlock();
             g_mic_recording = false;
             g_mic_watchdog_fired = true;  // loop() で Speaker 復帰させる
             break;
@@ -1030,8 +1417,10 @@ static void micRecordTask(void* /*param*/) {
         // ヘッダ + バイナリで送信。改行は付けない (host 側 reader が binary body の
         // 直後にコマンド応答や次の MIC_PCM ヘッダを受け取れるよう、binary は素直に
         // <size> byte ぴったりで終わる)。
+        serialLock();
         Serial.printf("MIC_PCM:%u\n", static_cast<unsigned>(MIC_CHUNK_BYTES));
         Serial.write(reinterpret_cast<uint8_t*>(g_mic_buffer), MIC_CHUNK_BYTES);
+        serialUnlock();
     }
     g_mic_task = nullptr;
     vTaskDelete(nullptr);
@@ -1127,22 +1516,38 @@ static void pollTouchStop() {
             // 押し始め
             g_touch_press_start_ms = millis();
             g_touch_stop_armed     = false;
+            g_touch_start_x        = t.x;
+            g_touch_start_y        = t.y;
             Serial.printf("[touch] pressed x=%d y=%d\n", t.x, t.y);
-        } else if (!g_touch_stop_armed && millis() - g_touch_press_start_ms >= TOUCH_HOLD_MS) {
-            // 1 秒経過 → 1 回だけ stop を発火 (連続発火を armed フラグで防ぐ)
+            // 左上マイクボタン領域なら印を付ける (この press は long-press stop に使わない)。
+            // トリガは「離した時 (tap)」に出す。押下中に MIC_START すると ack 周りで
+            // 詰まって録音が始まらない事象があったため、release-tap 方式にしている。
+            if (g_mic_button_enabled && inMicButton(t.x, t.y)) {
+                g_mic_btn_active = true;
+            }
+        } else if (!g_mic_btn_active && !g_touch_stop_armed
+                   && millis() - g_touch_press_start_ms >= TOUCH_HOLD_MS) {
+            // マイクボタン以外の 1 秒長押し → 1 回だけ stop を発火。
             g_touch_stop_armed = true;
             Serial.println("[touch] long-press detected, stopping audio");
             clearWavQueueAndStop();
             emitAudioStopped("touch");
         }
     } else {
-        // タッチ離れた → 状態リセット
+        // タッチ離れた → マイクボタンのタップなら音声入力トリガ + 状態リセット。
         if (g_touch_press_start_ms != 0) {
+            uint32_t dur = millis() - g_touch_press_start_ms;
             Serial.printf("[touch] released after %lu ms\n",
-                          static_cast<unsigned long>(millis() - g_touch_press_start_ms));
+                          static_cast<unsigned long>(dur));
+            if (g_mic_btn_active) {
+                emitMicButton("tap");
+            }
         }
         g_touch_press_start_ms = 0;
         g_touch_stop_armed     = false;
+        g_touch_start_x        = -1;
+        g_touch_start_y        = -1;
+        g_mic_btn_active       = false;
     }
 }
 
@@ -1196,6 +1601,12 @@ static void pollSerialCommand() {
             else if (strncmp(g_line, "MOVE:", 5) == 0) {
                 handleMove(g_line + 5);
             }
+            else if (strncmp(g_line, "PUZZLE:", 7) == 0) {
+                handlePuzzle(g_line + 7);
+            }
+            else if (strncmp(g_line, "STACKLED:", 9) == 0) {
+                handleStackLed(g_line + 9);
+            }
             else if (strcmp(g_line, "CAPTURE") == 0) {
                 handleCapture();
             }
@@ -1210,6 +1621,20 @@ static void pollSerialCommand() {
                 g_head_touch_avatar = (strcmp(arg, "on") == 0);
                 Serial.printf("{\"status\":\"ok\",\"head_touch_avatar\":%s}\n",
                               g_head_touch_avatar ? "true" : "false");
+                Serial.flush();
+            }
+            else if (strncmp(g_line, "HEADPET_SOUND:", 14) == 0) {
+                const char* arg = g_line + 14;
+                g_head_pet_sound = (strcmp(arg, "on") == 0);
+                Serial.printf("{\"status\":\"ok\",\"head_pet_sound\":%s}\n",
+                              g_head_pet_sound ? "true" : "false");
+                Serial.flush();
+            }
+            else if (strncmp(g_line, "MIC_BUTTON:", 11) == 0) {
+                const char* arg = g_line + 11;
+                g_mic_button_enabled = (strcmp(arg, "on") == 0);
+                Serial.printf("{\"status\":\"ok\",\"mic_button\":%s}\n",
+                              g_mic_button_enabled ? "true" : "false");
                 Serial.flush();
             }
             else {
@@ -1235,6 +1660,11 @@ void setup() {
     M5.begin(cfg);
     M5.Display.setRotation(1);
     M5.Display.setBrightness(128);
+    puzzle.begin();
+    puzzle.setBrightness(PUZZLE_BRIGHTNESS);
+    puzzle.clear();
+    puzzle.show();
+    g_puzzle_ready = true;
 
     // ESP32 Arduino の Serial RX バッファはデフォルト 256 byte。Python 側の
     // 1024 byte chunk を取りこぼさないため、Serial.begin の前に十分大きく確保。
@@ -1243,7 +1673,13 @@ void setup() {
     Serial.begin(SERIAL_BAUD);
     delay(100);
     Serial.println();
-    Serial.println("[bridge] xangi-stackchan / cores3-main 0.15 (avatar+spriteface+battery+servo+wavqueue+camera+touchstop+headtouch+headavatar+mic+micguard+micwatchdog+avtoggle+ackflush)");
+    Serial.println("[bridge] xangi-stackchan / cores3-main 0.19 (avatar+spriteface+battery+servo+wavqueue+camera+touchstop+micbutton+headtouch+headavatar+headpetsound+mic+micguard+micwatchdog+avtoggle+ackflush+i2c1task+resetreason)");
+
+    // 直前のリセット理由を boot で必ず 1 行残す。panic / watchdog / brownout 等の
+    // 「いつの間にか再起動していた」事象の一次証拠になる (host 側ログに残る)。
+    g_reset_reason = esp_reset_reason();
+    Serial.printf("{\"event\":\"boot\",\"reset_reason\":\"%s\"}\n", resetReasonStr(g_reset_reason));
+    Serial.flush();
 
     // Avatar 初期化。`init()` で内部スプライトを確保し、表情/口パク用の draw
     // task を起動する。M5.begin() の後で呼ぶ必要あり。
@@ -1265,7 +1701,15 @@ void setup() {
     // サーボ初期化 (PY32 VM_EN ON → SCServo UART1 → NVS zero load → torque OFF)。
     // 失敗してもファームは続行する (graceful degradation: WAV/FACE は動く、MOVE
     // だけが unavailable 応答になる)。HomeCalibration を先に焼くのが推奨。
+    // servo UART / Serial 書き込みの排他用 mutex を、使うタスク起動前に生成しておく。
+    g_servo_mutex  = xSemaphoreCreateMutex();
+    g_serial_mutex = xSemaphoreCreateMutex();
     g_servo_ready = initServo();
+    g_stack_led_ready = py32::initStackLed();
+    if (g_stack_led_ready) {
+        stackLedApplyPattern(g_stack_led_pattern);
+    }
+    Serial.printf("[bridge] stack_led: %s\n", g_stack_led_ready ? "ready" : "not present");
     if (!g_servo_ready) {
         avatar.setSpeechText("no servo");
         Serial.println("[bridge] servo init failed, MOVE will return error");
@@ -1290,11 +1734,10 @@ void setup() {
     Serial.printf("[bridge] head_touch: %s\n",
                   g_head_touch_ready ? "ready (Si12T@0x68)" : "not present");
     if (g_head_touch_ready) {
-        // priority 2 / core APP_CPU は loop と同じ。50ms 周期 polling なので CPU
-        // 負荷はほぼ無視できる。stack 4KB は Si12T::poll() の局所変数 + Serial.printf
-        // フォーマット用 buffer 分の余裕を見込んだサイズ。
-        xTaskCreatePinnedToCore(headTouchPollTask, "headTouch", 4096, nullptr, 2,
-                                nullptr, APP_CPU_NUM);
+        // polling 自体は loop() の pollHeadTouch (I2C 単一タスク原則、上の解説参照)。
+        // ここで起動するのは首振り専用タスク (servo UART のみ、I2C 非接触)。
+        xTaskCreatePinnedToCore(wiggleTask, "nadeWiggle", 4096, nullptr, 2,
+                                &g_wiggle_task, APP_CPU_NUM);
     }
 
     // WAV 再生タスクを core 1 (APP_CPU_NUM) に pin。loop task は core 1 で動く
@@ -1334,6 +1777,7 @@ void loop() {
     M5.update();
     pollSerialCommand();
     pollTouchStop();
+    pollHeadTouch();
     recoverFromMicWatchdog();
     updateBatteryInfo();
     if (g_image_face_active && millis() - g_last_battery_update_ms < 5) {

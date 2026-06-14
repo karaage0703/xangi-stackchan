@@ -120,12 +120,22 @@ def config_to_dict(config: BridgeConfig) -> dict[str, Any]:
         "move_talking_sway_yaw": config.move_talking_sway_yaw,
         "move_talking_sway_pitch": config.move_talking_sway_pitch,
         "move_talking_sway_interval": config.move_talking_sway_interval,
+        "puzzle_light_enabled": config.puzzle_light_enabled,
+        "puzzle_idle": config.puzzle_idle,
+        "puzzle_thinking": config.puzzle_thinking,
+        "puzzle_talking": config.puzzle_talking,
+        "puzzle_error": config.puzzle_error,
         "voice_conversation": config.voice_conversation,
         "voice_app_session_id": config.voice_app_session_id,
         "voice_silence_dbfs": config.voice_silence_dbfs,
         "voice_silence_seconds": config.voice_silence_seconds,
         "voice_max_seconds": config.voice_max_seconds,
         "voice_initial_grace_seconds": config.voice_initial_grace_seconds,
+        "lcd_mic_voice": config.lcd_mic_voice,
+        "speak_platforms": list(config.speak_platforms),
+        "head_pet_reaction": config.head_pet_reaction,
+        "head_pet_phrases": list(config.head_pet_phrases),
+        "head_pet_cooldown_seconds": config.head_pet_cooldown_seconds,
     }
 
 
@@ -154,6 +164,18 @@ def _float_or(value: Any, fallback: float) -> float:
 
 def _clamp(value: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, value))
+
+
+def _phrase_list(value: Any, fallback: list[str]) -> list[str]:
+    """なでなで反応のセリフ候補を list[str] に正規化する。config.json では list、
+    設定 UI のテキストエリアからは改行 or カンマ区切り文字列で来る。None は fallback。"""
+    if value is None:
+        return list(fallback)
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    text = str(value)
+    parts = text.replace("\n", ",").split(",")
+    return [p.strip() for p in parts if p.strip()]
 
 
 def merge_config(base: BridgeConfig, data: dict[str, Any]) -> BridgeConfig:
@@ -212,6 +234,13 @@ def merge_config(base: BridgeConfig, data: dict[str, Any]) -> BridgeConfig:
         move_talking_sway_interval=_float_or(
             data.get("move_talking_sway_interval"), base.move_talking_sway_interval
         ),
+        puzzle_light_enabled=_bool(
+            data.get("puzzle_light_enabled", base.puzzle_light_enabled)
+        ),
+        puzzle_idle=str(data.get("puzzle_idle", base.puzzle_idle)),
+        puzzle_thinking=str(data.get("puzzle_thinking", base.puzzle_thinking)),
+        puzzle_talking=str(data.get("puzzle_talking", base.puzzle_talking)),
+        puzzle_error=str(data.get("puzzle_error", base.puzzle_error)),
         voice_conversation=_bool(data.get("voice_conversation", base.voice_conversation)),
         voice_app_session_id=str(
             data.get("voice_app_session_id", base.voice_app_session_id)
@@ -227,6 +256,19 @@ def merge_config(base: BridgeConfig, data: dict[str, Any]) -> BridgeConfig:
         ),
         voice_initial_grace_seconds=_float_or(
             data.get("voice_initial_grace_seconds"), base.voice_initial_grace_seconds
+        ),
+        lcd_mic_voice=_bool(data.get("lcd_mic_voice", base.lcd_mic_voice)),
+        speak_platforms=_phrase_list(
+            data.get("speak_platforms"), base.speak_platforms
+        ),
+        head_pet_reaction=_bool(
+            data.get("head_pet_reaction", base.head_pet_reaction)
+        ),
+        head_pet_phrases=_phrase_list(
+            data.get("head_pet_phrases"), base.head_pet_phrases
+        ),
+        head_pet_cooldown_seconds=_float_or(
+            data.get("head_pet_cooldown_seconds"), base.head_pet_cooldown_seconds
         ),
     )
 
@@ -259,6 +301,10 @@ class RuntimeState:
         # run_bridge が config.voice_conversation=True + StackchanSerial backend のとき
         # set_voice_conversation で登録。`/api/voice/history` から history が読める。
         self._voice_conv: object | None = None
+        # なでなで反応モードの coordinator (HeadPetReaction インスタンス)。
+        # run_bridge が config.head_pet_reaction=True + StackchanSerial backend +
+        # voice 無効のとき set_head_pet_reaction で登録。
+        self._head_pet: object | None = None
 
     def snapshot(self) -> tuple[BridgeConfig, int]:
         with self._lock:
@@ -288,6 +334,14 @@ class RuntimeState:
     def get_voice_conversation(self) -> object | None:
         with self._lock:
             return self._voice_conv
+
+    def set_head_pet_reaction(self, head_pet: object | None) -> None:
+        with self._lock:
+            self._head_pet = head_pet
+
+    def get_head_pet_reaction(self) -> object | None:
+        with self._lock:
+            return self._head_pet
 
     def snapshot_dict(self) -> dict[str, Any]:
         with self._lock:

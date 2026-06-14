@@ -92,6 +92,19 @@ class SerialActor:
         self._expect_lock = threading.Lock()
         self._expect_cond = threading.Condition(self._expect_lock)
 
+        # シリアル切断 (USB 再列挙 / デバイス再起動) の検知。write が
+        # SerialException/OSError を投げた時、または read 系が連続して例外を
+        # 返し続けた時に「接続が死んだ」とみなして on_dead を 1 回だけ呼ぶ。
+        # write timeout (SerialTimeoutException) は一時的な詰まりであって
+        # 切断ではないので対象外。on_dead は reader/writer thread 上で呼ばれる
+        # ので、登録側は重い処理をせずフラグ/イベント通知に留めること。
+        self.on_dead: Callable[[str], None] | None = None
+        self._dead = False
+        self._dead_lock = threading.Lock()
+        # read 系例外の連続回数しきい値。_read_loop は例外時 50ms wait なので
+        # 20 回 ≈ 1 秒間 read が全滅したら切断と判定する。
+        self.read_error_threshold = 20
+
     # ------------------------------------------------------------------ public
     def start(self) -> None:
         if self._reader_thread is not None and self._reader_thread.is_alive():
@@ -167,6 +180,13 @@ class SerialActor:
                 except Exception:
                     pass
                 return False
+            except (serial.SerialException, OSError) as exc:
+                # USB 再列挙 / デバイス再起動で fd が死んだ ("write failed:
+                # [Errno 5] Input/output error" 等)。例外は伝播させず False を
+                # 返し、on_dead で上位 (StackchanSerial) に再接続を委ねる。
+                sys.stderr.write(f"[actor] write failed (dead?): {exc}\n")
+                self._mark_dead(f"write: {exc}")
+                return False
 
     def add_line_listener(self, fn: Callable[[str], None]) -> None:
         """全行 dispatch 先を追加 (非同期 event 検出等)。同一 thread から呼ばれる。"""
@@ -226,19 +246,43 @@ class SerialActor:
                 self._expect_cond.wait(timeout=remaining)
 
     # ----------------------------------------------------------------- internal
+    def _mark_dead(self, reason: str) -> None:
+        """切断検知を 1 回だけ on_dead に通知する (write/read どちらの thread からも安全)。"""
+        with self._dead_lock:
+            if self._dead:
+                return
+            self._dead = True
+        sys.stderr.write(f"[actor] serial dead: {reason}\n")
+        cb = self.on_dead
+        if cb is not None:
+            try:
+                cb(reason)
+            except Exception as exc:
+                sys.stderr.write(f"[actor] on_dead callback error: {exc}\n")
+
+    @property
+    def is_dead(self) -> bool:
+        return self._dead
+
     def _read_loop(self) -> None:
         debug = os.environ.get("STACKCHAN_SERIAL_DEBUG")
         last_dbg = 0.0
         loop_count = 0
+        consec_errors = 0
         while not self._stop_event.is_set():
             try:
                 avail = self.ser.in_waiting
             except Exception as exc:
                 if debug:
                     sys.stderr.write(f"[actor] in_waiting exc: {exc}\n")
+                consec_errors += 1
+                if consec_errors >= self.read_error_threshold:
+                    self._mark_dead(f"read: {exc}")
+                    return
                 self._stop_event.wait(0.05)
                 continue
             if avail <= 0:
+                consec_errors = 0  # idle は健全 (エラー無しで応答できている)
                 # 30 秒に 1 回 alive ping を出す
                 loop_count += 1
                 if debug and time.time() - last_dbg > 30:
@@ -248,9 +292,14 @@ class SerialActor:
                 continue
             try:
                 data = self.ser.read(avail)
+                consec_errors = 0
             except Exception as exc:
                 if debug:
                     sys.stderr.write(f"[actor] read exc: {exc}\n")
+                consec_errors += 1
+                if consec_errors >= self.read_error_threshold:
+                    self._mark_dead(f"read: {exc}")
+                    return
                 self._stop_event.wait(0.05)
                 continue
             if data:

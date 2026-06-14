@@ -164,6 +164,37 @@ def synthesize_text(
     raise RuntimeError(f"dance demo requires TTS (got tts={config.tts})")
 
 
+STATUS_LIGHTS = (
+    ("PUZZLE", "puzzle"),
+    ("STACKLED", "stack_led"),
+)
+
+
+def _status_lights_supported(backend, config: BridgeConfig) -> list[str]:
+    if not config.puzzle_light_enabled:
+        return []
+    try:
+        status = backend.send_command("STATUS")
+    except Exception:
+        return []
+    return [
+        command
+        for command, status_key in STATUS_LIGHTS
+        if status.get(status_key)
+    ]
+
+
+def _send_status_lights(backend, commands: list[str], pattern: str) -> None:
+    if not pattern:
+        return
+    for command in commands:
+        try:
+            result = backend.send_command(f"{command}:{pattern}")
+            print(f"[dance] {command}:{pattern} -> {result}", file=sys.stderr, flush=True)
+        except Exception as exc:
+            print(f"[dance] {command}:{pattern} error: {exc}", file=sys.stderr, flush=True)
+
+
 def run_demo(
     backend,
     piper_process: PiperProcess | None,
@@ -190,45 +221,56 @@ def run_demo(
     base_pitch = config.move_idle_pitch if idle_pitch is None else idle_pitch
     face_used = face if face is not None else config.face_talking
 
-    synthesized = synthesize_text(text, config, piper_process)
-    total_audio_seconds = sum(wav_duration_seconds(wav) for _, wav in synthesized)
-    total_bytes = sum(len(wav) for _, wav in synthesized)
+    status_lights = _status_lights_supported(backend, config)
+    if status_lights:
+        _send_status_lights(backend, status_lights, config.puzzle_thinking)
 
-    if face_used:
-        try:
-            backend.send_command(f"FACE:{face_used}")
-        except Exception:
-            pass
+    try:
+        synthesized = synthesize_text(text, config, piper_process)
+        total_audio_seconds = sum(wav_duration_seconds(wav) for _, wav in synthesized)
+        total_bytes = sum(len(wav) for _, wav in synthesized)
 
-    chunk_results: list[dict[str, object]] = []
-    send_seconds_last = 0.0
-    with DanceLoop(backend, pattern, base_yaw, base_pitch):
-        for idx, (chunk, wav) in enumerate(synthesized, start=1):
-            started = time.time()
+        if status_lights:
+            _send_status_lights(backend, status_lights, config.puzzle_talking)
+
+        if face_used:
             try:
-                result = backend.send_wav(wav)
-            except Exception as exc:
-                result = {"status": "error", "error": str(exc)}
-            send_seconds_last = time.time() - started
-            chunk_results.append(
-                {
-                    "chunk": idx,
-                    "text": chunk,
-                    "bytes": len(wav),
-                    "audio_seconds": round(wav_duration_seconds(wav), 2),
-                    "send_seconds": round(send_seconds_last, 2),
-                    "result": result,
-                }
-            )
-        # 最後の WAV は send_wav 完了時にはまだ再生中。総再生時間まで待つ。
-        remaining = max(0.0, total_audio_seconds - send_seconds_last)
-        time.sleep(remaining + 0.3)
+                backend.send_command(f"FACE:{face_used}")
+            except Exception:
+                pass
 
-    if face_used:
-        try:
-            backend.send_command(f"FACE:{config.face_idle}")
-        except Exception:
-            pass
+        chunk_results: list[dict[str, object]] = []
+        send_seconds_last = 0.0
+        with DanceLoop(backend, pattern, base_yaw, base_pitch):
+            for idx, (chunk, wav) in enumerate(synthesized, start=1):
+                started = time.time()
+                try:
+                    result = backend.send_wav(wav)
+                except Exception as exc:
+                    result = {"status": "error", "error": str(exc)}
+                send_seconds_last = time.time() - started
+                chunk_results.append(
+                    {
+                        "chunk": idx,
+                        "text": chunk,
+                        "bytes": len(wav),
+                        "audio_seconds": round(wav_duration_seconds(wav), 2),
+                        "send_seconds": round(send_seconds_last, 2),
+                        "result": result,
+                    }
+                )
+            # 最後の WAV は send_wav 完了時にはまだ再生中。総再生時間まで待つ。
+            remaining = max(0.0, total_audio_seconds - send_seconds_last)
+            time.sleep(remaining + 0.3)
+
+        if face_used:
+            try:
+                backend.send_command(f"FACE:{config.face_idle}")
+            except Exception:
+                pass
+    finally:
+        if status_lights:
+            _send_status_lights(backend, status_lights, config.puzzle_idle)
 
     return {
         "status": "ok",

@@ -122,6 +122,25 @@ def test_merge_config_accepts_move_overrides():
     assert config.move_talking_sway_interval == 0.8
 
 
+def test_merge_config_accepts_puzzle_light_overrides():
+    config = merge_config(
+        _base_config(),
+        {
+            "puzzle_light_enabled": False,
+            "puzzle_idle": "blue",
+            "puzzle_thinking": "rainbow",
+            "puzzle_talking": "green",
+            "puzzle_error": "red",
+        },
+    )
+
+    assert config.puzzle_light_enabled is False
+    assert config.puzzle_idle == "blue"
+    assert config.puzzle_thinking == "rainbow"
+    assert config.puzzle_talking == "green"
+    assert config.puzzle_error == "red"
+
+
 def test_merge_config_accepts_sprite_face_options():
     config = merge_config(
         _base_config(),
@@ -134,6 +153,72 @@ def test_merge_config_accepts_sprite_face_options():
     assert config.face_mode == "sprite"
     assert config.sprite_sheet == "assets/pets/default/spritesheet.webp"
     assert config.sprite_jpeg_quality == 95
+
+
+def test_cli_defaults_enable_lcd_mic_and_head_pet_reaction():
+    from xangi_stackchan.app import build_parser, config_from_args
+
+    config = config_from_args(build_parser().parse_args([]))
+
+    assert config.voice_conversation is False
+    assert config.lcd_mic_voice is True
+    assert config.head_pet_reaction is True
+    assert config.puzzle_light_enabled is True
+    assert config.puzzle_idle == "off"
+    assert config.puzzle_thinking == "thinking"
+    assert config.puzzle_talking == "talking"
+    assert config.puzzle_error == "error"
+
+
+def test_cli_can_disable_lcd_mic_and_head_pet_reaction():
+    from xangi_stackchan.app import build_parser, config_from_args
+
+    config = config_from_args(
+        build_parser().parse_args(["--no-lcd-mic-voice", "--no-head-pet-reaction"])
+    )
+
+    assert config.lcd_mic_voice is False
+    assert config.head_pet_reaction is False
+
+
+def test_voice_thread_alignment_only_in_voice_mode():
+    from dataclasses import replace
+
+    from xangi_stackchan.app import _align_voice_thread, _clear_stale_voice_thread_filter
+
+    base = _base_config()
+    voice = replace(
+        base,
+        voice_conversation=True,
+        voice_app_session_id="sid123",
+        thread_id="discord:old",
+    )
+    aligned = _align_voice_thread(voice)
+    assert aligned.thread_id == "web:sid123"
+
+    normal = replace(
+        aligned,
+        voice_conversation=False,
+        lcd_mic_voice=True,
+    )
+    cleared = _clear_stale_voice_thread_filter(normal)
+    assert cleared.thread_id is None
+
+
+def test_clear_stale_voice_thread_filter_keeps_explicit_thread():
+    from dataclasses import replace
+
+    from xangi_stackchan.app import _clear_stale_voice_thread_filter
+
+    config = replace(
+        _base_config(),
+        voice_conversation=False,
+        lcd_mic_voice=True,
+        voice_app_session_id="sid123",
+        thread_id="web:manual",
+    )
+
+    assert _clear_stale_voice_thread_filter(config).thread_id == "web:manual"
 
 
 # --- v1 -> v2 migration --------------------------------------------------

@@ -55,6 +55,33 @@ def test_no_pcm_chunk_after_start_auto_stops():
     backend.stop_mic_recording.assert_called()
 
 
+def test_mic_start_failure_calls_on_stop():
+    """MIC_START が失敗しても on_stop を呼び、listening UI を戻せること。"""
+    backend = _make_backend()
+    backend.start_mic_recording.return_value = {
+        "status": "error",
+        "error": "serial disconnected",
+        "disconnected": True,
+    }
+    on_stop = MagicMock()
+    vc = VoiceConversation(
+        backend=backend,
+        xangi_base_url="",
+        on_stop=on_stop,
+        pcm_stall_seconds=0.3,
+    )
+
+    vc._on_head_touch({"gesture": "press"})
+
+    assert vc._recording is False
+    backend.stop_mic_recording.assert_not_called()
+    on_stop.assert_called_once()
+    result = on_stop.call_args.args[0]
+    assert result["status"] == "error"
+    assert result["frames"] == 0
+    assert result["duration_seconds"] == 0.0
+
+
 def test_pcm_stream_stops_midway_auto_stops():
     """途中まで chunk が来て、その後 stream が死ぬ → watchdog が stall で stop。"""
     backend = _make_backend()

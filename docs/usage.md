@@ -68,7 +68,9 @@ uv run xangi-stackchan \
   --port /dev/stackchan \
   --device-profile cores3_k151 \
   --volume 200 \
-  --tts piper
+  --tts piper \
+  --lcd-mic-voice \
+  --head-pet-reaction
 
 # AtomS3R + Voice/Echo Base
 uv run xangi-stackchan \
@@ -126,9 +128,11 @@ uv run xangi-stackchan --no-settings-ui ...
 setsid -f bash -c 'cd /path/to/xangi-stackchan && exec uv run xangi-stackchan \
   --xangi-url http://127.0.0.1:18888 \
   --port /dev/stackchan \
-  --baud 921600 \
+  --device-profile cores3_k151 \
   --volume 200 \
   --tts piper \
+  --lcd-mic-voice \
+  --head-pet-reaction \
   --stackchan-retry-seconds 3 \
   --settings-port 7897' </dev/null >>/tmp/xangi-stackchan.log 2>&1
 ```
@@ -177,8 +181,12 @@ tail -f /tmp/xangi-stackchan.log
 - `--move-error-yaw` / `--move-error-pitch`: エラー時の首ポーズ (既定 `0` / `-10`、首下げ)
 - `--move-talking-sway-yaw` / `--move-talking-sway-pitch`: 喋り中のランダム揺らぎ振り幅 (既定 `±4` / `±2`)
 - `--move-talking-sway-interval`: 喋り中のランダム揺らぎ更新間隔 (秒、既定 `1.5`)
-- `--stackchan-retry-seconds`: デバイス切断時の再接続間隔 (秒)
+- `--puzzle-light-enabled` / `--no-puzzle-light-enabled`: 状態表示LEDを使う。ファーム `STATUS` が `puzzle:true` なら `PUZZLE:<pattern>`、`stack_led:true` なら `STACKLED:<pattern>` を送る。CoreS3 Grove PORT.B の Puzzle Unit WS2812E と K151 / K151-R 本体 12 RGB LED は自動検出
+- `--puzzle-idle`, `--puzzle-thinking`, `--puzzle-talking`, `--puzzle-error`: 状態ごとの LED pattern。既定は `off` / `thinking` / `talking` / `error`
+- `--stackchan-retry-seconds`: デバイス切断時の再接続間隔 (秒)。起動時だけでなく**稼働中の切断 (デバイス再起動 / USB 再列挙で `ttyACMx` が変わる) も自動検知して再接続**する。再接続成功時は音量・表情・首ポーズ・ファーム設定を自動で再初期化するので、ブリッジの手動再起動は不要。`--port` には番号非依存の固定パス (`/dev/serial/by-id/...` か udev の `/dev/stackchan`) を使うこと
 - `--voice-conversation`: アタマセンサ tap で録音 → STT (faster-whisper) → xangi `POST /api/chat` 投入の音声対話モード (M5Stackchan K151 専用、後述「音声対話モード」参照)
+- `--lcd-mic-voice` / `--no-lcd-mic-voice`: LCD 下部のマイクボタンで録音 → STT → xangi 投入。K151 通常運用では既定で有効
+- `--head-pet-reaction` / `--no-head-pet-reaction`: アタマセンサのなで反応。K151 通常運用では既定で有効
 - `--voice-app-session-id`: 音声対話で xangi に投げる appSessionId。空ならアプリ起動時に専用 web session を自動作成
 - `--voice-silence-dbfs`: VAD 無音判定の dBFS 閾値 (既定 -40、静かな部屋なら -50、騒がしい環境なら -30)
 - `--voice-silence-seconds`: 無音判定後の自動停止までの秒数 (既定 1.5)

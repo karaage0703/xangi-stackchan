@@ -36,7 +36,9 @@ def render_page(state: RuntimeState) -> str:
     cfg = state.snapshot_dict()
     checked = " checked" if cfg.get("wifi") else ""
     move_checked = " checked" if cfg.get("move_enabled") else ""
+    puzzle_checked = " checked" if cfg.get("puzzle_light_enabled") else ""
     voice_checked = " checked" if cfg.get("voice_conversation") else ""
+    head_pet_checked = " checked" if cfg.get("head_pet_reaction") else ""
     return f"""<!doctype html>
 <html lang="ja">
 <head>
@@ -108,6 +110,15 @@ def render_page(state: RuntimeState) -> str:
       {_field("move_talking_sway_interval", "talking sway interval (s)", cfg["move_talking_sway_interval"], "number")}
     </fieldset>
     <fieldset>
+      <legend>Puzzle Unit light (WS2812E)</legend>
+      <p class="hint">CoreS3 Grove PORT.B の Puzzle Unit を、xangi の状態や demo 発話に合わせて点灯する。ファームの <code>STATUS</code> が <code>puzzle:true</code> の時だけ送信。</p>
+      <label class="checkbox"><input name="puzzle_light_enabled" type="checkbox"{puzzle_checked}> Puzzle Unit を状態表示に使う</label>
+      {_field("puzzle_idle", "idle pattern", cfg["puzzle_idle"])}
+      {_field("puzzle_thinking", "thinking pattern", cfg["puzzle_thinking"])}
+      {_field("puzzle_talking", "talking pattern", cfg["puzzle_talking"])}
+      {_field("puzzle_error", "error pattern", cfg["puzzle_error"])}
+    </fieldset>
+    <fieldset>
       <legend>voice conversation (M5Stackchan K151 のアタマセンサ + 内蔵 PDM マイク経由)</legend>
       <p class="hint">tap で録音開始 → 無音 1.5 秒で自動停止 → faster-whisper STT → xangi <code>POST /api/chat</code> 投入。応答 TTS は既存経路で発話される。詳細 <code>docs/usage.md</code> の「音声対話モード」。</p>
       <label class="checkbox"><input name="voice_conversation" type="checkbox"{voice_checked}> 音声対話モードを有効化</label>
@@ -119,6 +130,13 @@ def render_page(state: RuntimeState) -> str:
         <strong>直近の発話履歴 (上から新しい順、5 秒ごと自動更新):</strong>
         <pre id="vc-history" style="background:#eee4d2; padding:8px; border-radius:8px; max-height:240px; overflow-y:auto; white-space:pre-wrap; margin-top:6px;">(まだ録音なし)</pre>
       </div>
+    </fieldset>
+    <fieldset>
+      <legend>なでなで反応 (アタマを触った瞬間にランダムなセリフを喋る / デモ向け)</legend>
+      <p class="hint">話しかけ不要。アタマ (head_touch) を press / swipe すると即セリフ。voice conversation が有効な時はそちらが優先 (同じ press を消費するため反応しない)。</p>
+      <label class="checkbox"><input name="head_pet_reaction" type="checkbox"{head_pet_checked}> なでなで反応モードを有効化</label>
+      {_field("head_pet_phrases", "セリフ候補 (カンマ区切り、空ならデフォルト)", ",".join(cfg.get("head_pet_phrases") or []))}
+      {_field("head_pet_cooldown_seconds", "クールダウン秒数 (発話完了後、次の反応まで)", cfg["head_pet_cooldown_seconds"], "number")}
     </fieldset>
     <button type="submit">保存して反映</button>
   </form>
@@ -209,7 +227,9 @@ def _flatten_form(raw: bytes) -> dict[str, object]:
     data = {key: values[-1] for key, values in parsed.items()}
     data["wifi"] = "wifi" in parsed
     data["move_enabled"] = "move_enabled" in parsed
+    data["puzzle_light_enabled"] = "puzzle_light_enabled" in parsed
     data["voice_conversation"] = "voice_conversation" in parsed
+    data["head_pet_reaction"] = "head_pet_reaction" in parsed
     return data
 
 

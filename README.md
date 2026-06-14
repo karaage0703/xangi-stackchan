@@ -13,6 +13,7 @@
 - `agent.error` では `sad` 顔 + 首を下げる
 - **スプライト顔モード (`--face-mode sprite`)**: `spritesheet.webp` を LCD 用 JPEG に変換して表示。row/state + filled-frame tick でまばたき/表情アニメーションする。スプライト本体は `assets/pets/...` にローカル配置し、リポジトリにはコミットしない
 - **バッテリー表示**: CoreS3 の残量を Avatar / スプライト顔の右上に表示し、`STATUS` に `battery_level` などを含める
+- **状態表示LED**: CoreS3 Grove PORT.B の Puzzle Unit WS2812E と、M5Stack 公式 StackChan K151 / K151-R の本体 12 RGB LED を自動検出し、思考中 (`thinking`) / 発話中 (`talking`) / エラー (`error`) に合わせて点灯する。未接続・旧ファームでは自動で無効化
 - **カメラスナップショット**: 内蔵 GC0308 カメラで JPEG 撮影 → 設定 UI / API で表示。LLM 連携は将来別 PR で対応
 - **アタマセンサ なでなで**: M5Stack 公式 StackChan K151 内蔵の Si12T 容量タッチ (3 ch) で Press / Release / Swipe を検出。Press で `nade nade!` Avatar 顔 + host へ `head_touch` event 通知
 - **音声対話モード (`--voice-conversation`)**: K151 のアタマセンサ tap で内蔵 PDM マイク録音 → 無音検出で自動停止 → faster-whisper STT (Silero VAD) → xangi `POST /api/chat` 投入。xangi 応答が piper-plus / VOICEVOX で発話される end-to-end ループ。詳細 `docs/usage.md` の「音声対話モード」
@@ -21,7 +22,7 @@
 
 ## 対応デバイス
 
-USB シリアル経由で Arduino (PlatformIO) ファームを焼く。機種ごとの本体ファームは `firmware/examples/<machine>/main/` に置かれていて、共通シリアルプロトコル (STATUS / VOLUME / WAV / FACE / IMAGE / MOVE / CAPTURE) を実装する。未搭載のハードは graceful degradation で `unavailable` 応答。
+USB シリアル経由で Arduino (PlatformIO) ファームを焼く。機種ごとの本体ファームは `firmware/examples/<machine>/main/` に置かれていて、共通シリアルプロトコル (STATUS / VOLUME / WAV / FACE / IMAGE / MOVE / CAPTURE / PUZZLE) を実装する。未搭載のハードは graceful degradation で `unavailable` 応答。
 
 | デバイス | ファーム (PlatformIO env) | baud | MOVE | CAPTURE |
 |---------|---------|------|------|---------|
@@ -40,7 +41,7 @@ xangi (:18888)
       └─ xangi-stackchan (host bridge, Python)
           ├─ thread_id filter
           ├─ piper-plus persistent process
-          └─ device (USB serial 共通プロトコル: STATUS / FACE: / IMAGE:<size> / WAV:<size> / VOLUME: / MOVE: / CAPTURE)
+          └─ device (USB serial 共通プロトコル: STATUS / FACE: / IMAGE:<size> / WAV:<size> / VOLUME: / MOVE: / CAPTURE / PUZZLE:)
               ├─ M5Stack CoreS3 (K151 / K151-R / 単体機、firmware/examples/cores3/main、baud 921600)
               ├─ M5Stack AtomS3R + Atomic Voice/Echo Base (firmware/examples/atoms3r/main、baud 115200)
               └─ M5Stack Basic + アールティ Ver.β (firmware/examples/basic/main、baud 115200)
