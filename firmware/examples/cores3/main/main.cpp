@@ -178,8 +178,12 @@ static const char* resetReasonStr(esp_reset_reason_t r) {
         case ESP_RST_DEEPSLEEP: return "deepsleep";
         case ESP_RST_BROWNOUT:  return "brownout";
         case ESP_RST_SDIO:      return "sdio";
+#ifdef ESP_RST_USB
         case ESP_RST_USB:       return "usb";
+#endif
+#ifdef ESP_RST_JTAG
         case ESP_RST_JTAG:      return "jtag";
+#endif
         default:                return "unknown";
     }
 }
