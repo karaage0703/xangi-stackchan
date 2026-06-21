@@ -198,7 +198,7 @@ tail -f /tmp/xangi-stackchan.log
 - `--piper-speaker`: マルチスピーカーモデル用の話者 ID (通常不要)
 - `--face-idle`, `--face-thinking`, `--face-talking`, `--face-error`: 状態ごとの表情
 - `--face-mode`: `avatar` (既定) / `sprite`。`sprite` はスプライトシートから状態ごとの画像を切り出して LCD に表示し、row/state + filled-frame tick でまばたき/表情アニメーションする
-- `--sprite-sheet`: `--face-mode sprite` 時に使う `spritesheet.webp`。既定 `assets/pets/default/spritesheet.webp`。このファイルはローカル資産として `.gitignore` 対象
+- `--sprite-sheet`: `--face-mode sprite` 時に使う `spritesheet.webp`。既定 `assets/pets/borot/spritesheet.webp`。このファイルはローカル資産として `.gitignore` 対象 (`assets/pets/**/*.webp`)。別キャラクターを使う場合は `assets/pets/<name>/spritesheet.webp` に置いて指定する
 - `--sprite-jpeg-quality`: `--face-mode sprite` 時にデバイスへ送る JPEG 品質 (1〜95、既定 85)
 - `--move-enabled` / `--no-move-enabled`: 首振り (MOVE) 機能 ON/OFF (既定 ON、K151 SCServo 専用)
 - `--move-idle-yaw` / `--move-idle-pitch`: idle 時の首ポーズ (既定 `0` / `+5`、少し上向き)

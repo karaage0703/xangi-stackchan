@@ -76,6 +76,14 @@ def split_text(text: str, max_len: int = 80) -> list[str]:
         part = part.strip()
         if not part:
             continue
+        while len(part) > max_len:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(part[:max_len])
+            part = part[max_len:]
+        if not part:
+            continue
         if current and len(current) + len(part) > max_len:
             chunks.append(current)
             current = part

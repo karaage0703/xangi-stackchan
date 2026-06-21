@@ -256,6 +256,7 @@ static inline void serialUnlock() { if (g_serial_mutex) xSemaphoreGive(g_serial_
 // バッテリー overlay を描く。FACE を受けたら Avatar モードに戻る。
 static uint8_t* g_image_face_jpeg = nullptr;
 static size_t   g_image_face_len = 0;
+static bool     g_image_face_owned = false;
 static bool     g_image_face_active = false;
 static bool     g_image_face_dirty = false;
 static M5Canvas g_image_face_canvas(&M5.Display);
@@ -264,6 +265,16 @@ static uint32_t g_last_battery_update_ms = 0;
 static int32_t  g_battery_level = -1;
 static int16_t  g_battery_voltage_mv = -1;
 static m5::Power_Class::is_charging_t g_battery_charging = m5::Power_Class::charge_unknown;
+constexpr size_t SPRITE_CACHE_SLOTS = 64;
+constexpr size_t SPRITE_ANIM_MAX_FRAMES = 16;
+static uint8_t* g_sprite_cache_jpeg[SPRITE_CACHE_SLOTS] = {};
+static size_t   g_sprite_cache_len[SPRITE_CACHE_SLOTS] = {};
+static bool     g_sprite_anim_enabled = false;
+static uint8_t  g_sprite_anim_slots[SPRITE_ANIM_MAX_FRAMES] = {};
+static size_t   g_sprite_anim_count = 0;
+static size_t   g_sprite_anim_index = 0;
+static uint32_t g_sprite_anim_interval_ms = 1000;
+static uint32_t g_sprite_anim_last_ms = 0;
 
 // === PY32 IO Expander 経由でサーボバス電源 (VM_EN) を ON にする =================
 // firmware/examples/cores3/safe-startup/main.cpp の py32 namespace と同一仕様 (docs §11.4.1)。
@@ -414,14 +425,6 @@ static void avatarSay(const char* msg) {
     avatar.setSpeechText(msg);
 }
 
-static void setState(State s) {
-    g_state = s;
-    if (!g_image_face_active) {
-        avatarSay(stateStr(s));
-    }
-    Serial.printf("[bridge] state=%s\n", stateStr(s));
-}
-
 static void updateBatteryInfo(bool force = false) {
     uint32_t now = millis();
     if (!force && now - g_last_battery_update_ms < BATTERY_UPDATE_MS) return;
@@ -488,8 +491,31 @@ static void drawImageFace(bool force = false) {
                   ok ? "ok" : "failed", static_cast<unsigned>(g_image_face_len));
 }
 
+static void releaseOwnedImageFace() {
+    if (g_image_face_owned && g_image_face_jpeg) {
+        free(g_image_face_jpeg);
+    }
+    g_image_face_jpeg = nullptr;
+    g_image_face_len = 0;
+    g_image_face_owned = false;
+}
+
+static void setState(State s) {
+    g_state = s;
+    if (g_image_face_active) {
+        // Keep sprite/image-face mode dominant during transient WAV states.
+        // Do not repaint JPEG frames here: WAV receiving/playing transitions happen
+        // right at speech start, and a forced LCD push can visibly tear the sprite.
+        avatar.suspend();
+    } else {
+        avatarSay(stateStr(s));
+    }
+    Serial.printf("[bridge] state=%s\n", stateStr(s));
+}
+
 static void activateAvatarFace() {
     if (g_image_face_active) {
+        g_sprite_anim_enabled = false;
         g_image_face_active = false;
         avatar.resume();
         avatar.setBatteryIcon(true);
@@ -536,7 +562,7 @@ static void sendAckUnsupported(const char* cmd) {
 
 static void handleStatus() {
     updateBatteryInfo(true);
-    Serial.printf("{\"state\":\"%s\",\"volume\":%u,\"version\":\"cores3-main-0.19\","
+    Serial.printf("{\"state\":\"%s\",\"volume\":%u,\"version\":\"cores3-main-0.23\","
                   "\"servo\":%s,\"torque\":%s,\"camera\":%s,\"head_touch\":%s,"
                   "\"puzzle\":%s,\"puzzle_pattern\":\"%s\","
                   "\"stack_led\":%s,\"stack_led_pattern\":\"%s\","
@@ -909,11 +935,10 @@ static void handleImage(size_t size) {
         }
     }
 
-    if (g_image_face_jpeg) {
-        free(g_image_face_jpeg);
-    }
+    releaseOwnedImageFace();
     g_image_face_jpeg = buf;
     g_image_face_len = received;
+    g_image_face_owned = true;
     g_image_face_active = true;
     g_image_face_dirty = true;
     avatar.suspend();
@@ -924,6 +949,191 @@ static void handleImage(size_t size) {
              static_cast<unsigned>(received), static_cast<long>(g_battery_level));
     sendAckOk(extra);
     drawImageFace(true);
+}
+
+// SIMG:<slot>,<size>\n
+// host 側の git 管理外 spritesheet から切り出した JPEG フレームをファーム PSRAM に
+// 一度だけキャッシュする。以後のアニメーションは SFRAME:<slot> だけで描画する。
+static void handleSpriteImage(const char* arg) {
+    int slot = -1;
+    long n = 0;
+    if (sscanf(arg, "%d,%ld", &slot, &n) != 2) {
+        sendAckError("SIMG syntax: slot,size");
+        return;
+    }
+    if (slot < 0 || slot >= static_cast<int>(SPRITE_CACHE_SLOTS)) {
+        sendAckError("slot out of range");
+        return;
+    }
+    if (n <= 0 || static_cast<size_t>(n) > MAX_IMAGE_BYTES) {
+        sendAckError("size out of range");
+        return;
+    }
+    size_t size = static_cast<size_t>(n);
+
+    uint8_t* buf = static_cast<uint8_t*>(ps_malloc(size));
+    if (!buf) {
+        sendAckError("ps_malloc failed");
+        return;
+    }
+
+    Serial.printf("[bridge] sprite cache recv slot=%d expect=%u\n",
+                  slot, static_cast<unsigned>(size));
+    Serial.println("READY");
+    Serial.flush();
+
+    size_t received = 0;
+    uint32_t last_byte_ms = millis();
+    while (received < size) {
+        int avail = Serial.available();
+        if (avail > 0) {
+            size_t want = static_cast<size_t>(avail);
+            if (want > size - received) want = size - received;
+            int got = Serial.readBytes(buf + received, want);
+            if (got > 0) {
+                received += static_cast<size_t>(got);
+                last_byte_ms = millis();
+            }
+        } else {
+            if (millis() - last_byte_ms > IMAGE_CHUNK_TIMEOUT_MS) {
+                free(buf);
+                sendAckError("recv timeout");
+                return;
+            }
+            M5.update();
+            delay(1);
+        }
+    }
+
+    if (g_sprite_cache_jpeg[slot]) {
+        if (g_image_face_jpeg == g_sprite_cache_jpeg[slot]) {
+            g_image_face_jpeg = nullptr;
+            g_image_face_len = 0;
+            g_image_face_owned = false;
+        }
+        free(g_sprite_cache_jpeg[slot]);
+    }
+    g_sprite_cache_jpeg[slot] = buf;
+    g_sprite_cache_len[slot] = received;
+
+    char extra[96];
+    snprintf(extra, sizeof(extra), "\"sprite_image\":%d,\"size\":%u",
+             slot, static_cast<unsigned>(received));
+    sendAckOk(extra);
+}
+
+// SFRAME:<slot>\n
+// PSRAM にキャッシュ済みの JPEG フレームを描画する。
+static void handleSpriteFrame(const char* arg) {
+    int slot = atoi(arg);
+    if (slot < 0 || slot >= static_cast<int>(SPRITE_CACHE_SLOTS)) {
+        sendAckError("slot out of range");
+        return;
+    }
+    if (!g_sprite_cache_jpeg[slot] || g_sprite_cache_len[slot] == 0) {
+        sendAckError("slot empty");
+        return;
+    }
+
+    g_sprite_anim_enabled = false;
+    releaseOwnedImageFace();
+    g_image_face_jpeg = g_sprite_cache_jpeg[slot];
+    g_image_face_len = g_sprite_cache_len[slot];
+    g_image_face_owned = false;
+    g_image_face_active = true;
+    g_image_face_dirty = true;
+    avatar.suspend();
+    updateBatteryInfo(true);
+    drawImageFace(true);
+
+    char extra[96];
+    snprintf(extra, sizeof(extra), "\"sprite_frame\":%d,\"size\":%u,\"battery_level\":%ld",
+             slot, static_cast<unsigned>(g_image_face_len), static_cast<long>(g_battery_level));
+    sendAckOk(extra);
+}
+
+// SANIM:0\n
+// SANIM:<interval_ms>,<slot0>,<slot1>[,<slotN>]\n
+// キャッシュ済み JPEG スプライトをファームの loop() 側で自走再生する。
+// 発話中に host が SFRAME を連投しないので、WAV/MOVE と LCD 更新が競合しにくい。
+static void handleSpriteAnimation(const char* arg) {
+    if (!arg || strcmp(arg, "0") == 0 || strcmp(arg, "off") == 0) {
+        g_sprite_anim_enabled = false;
+        sendAckOk("\"sprite_anim\":false");
+        return;
+    }
+
+    char buf[128];
+    strncpy(buf, arg, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char* save = nullptr;
+    char* token = strtok_r(buf, ",", &save);
+    if (!token) {
+        sendAckError("SANIM syntax: interval,slots...");
+        return;
+    }
+    long interval = atol(token);
+    if (interval < 50 || interval > 5000) {
+        sendAckError("interval out of range");
+        return;
+    }
+
+    uint8_t slots[SPRITE_ANIM_MAX_FRAMES] = {};
+    size_t count = 0;
+    while ((token = strtok_r(nullptr, ",", &save)) != nullptr && count < SPRITE_ANIM_MAX_FRAMES) {
+        long slot = atol(token);
+        if (slot < 0 || slot >= static_cast<long>(SPRITE_CACHE_SLOTS)) {
+            sendAckError("slot out of range");
+            return;
+        }
+        if (!g_sprite_cache_jpeg[slot] || g_sprite_cache_len[slot] == 0) {
+            sendAckError("slot empty");
+            return;
+        }
+        slots[count++] = static_cast<uint8_t>(slot);
+    }
+    if (count == 0) {
+        sendAckError("empty sprite animation");
+        return;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        g_sprite_anim_slots[i] = slots[i];
+    }
+    g_sprite_anim_count = count;
+    g_sprite_anim_index = 0;
+    g_sprite_anim_interval_ms = static_cast<uint32_t>(interval);
+    g_sprite_anim_last_ms = 0;
+    g_sprite_anim_enabled = true;
+
+    char extra[96];
+    snprintf(extra, sizeof(extra), "\"sprite_anim\":true,\"frames\":%u,\"interval_ms\":%u",
+             static_cast<unsigned>(count), static_cast<unsigned>(g_sprite_anim_interval_ms));
+    sendAckOk(extra);
+}
+
+static void pollSpriteAnimation() {
+    if (!g_sprite_anim_enabled || g_sprite_anim_count == 0) return;
+    if (millis() - g_sprite_anim_last_ms < g_sprite_anim_interval_ms) return;
+
+    uint8_t slot = g_sprite_anim_slots[g_sprite_anim_index % g_sprite_anim_count];
+    if (!g_sprite_cache_jpeg[slot] || g_sprite_cache_len[slot] == 0) {
+        g_sprite_anim_enabled = false;
+        return;
+    }
+
+    releaseOwnedImageFace();
+    g_image_face_jpeg = g_sprite_cache_jpeg[slot];
+    g_image_face_len = g_sprite_cache_len[slot];
+    g_image_face_owned = false;
+    g_image_face_active = true;
+    g_image_face_dirty = true;
+    avatar.suspend();
+    drawImageFace(true);
+
+    g_sprite_anim_index = (g_sprite_anim_index + 1) % g_sprite_anim_count;
+    g_sprite_anim_last_ms = millis();
 }
 
 // RECT:<x>,<y>,<w>,<h>,<size>\n
@@ -990,11 +1200,7 @@ static void handleRect(const char* arg) {
     }
 
     if (!g_image_face_active) {
-        if (g_image_face_jpeg) {
-            free(g_image_face_jpeg);
-            g_image_face_jpeg = nullptr;
-            g_image_face_len = 0;
-        }
+        releaseOwnedImageFace();
         g_image_face_active = true;
         avatar.suspend();
         M5.Display.fillScreen(TFT_BLACK);
@@ -1596,6 +1802,15 @@ static void pollSerialCommand() {
                     handleImage(static_cast<size_t>(n));
                 }
             }
+            else if (strncmp(g_line, "SIMG:", 5) == 0) {
+                handleSpriteImage(g_line + 5);
+            }
+            else if (strncmp(g_line, "SFRAME:", 7) == 0) {
+                handleSpriteFrame(g_line + 7);
+            }
+            else if (strncmp(g_line, "SANIM:", 6) == 0) {
+                handleSpriteAnimation(g_line + 6);
+            }
             else if (strncmp(g_line, "RECT:", 5) == 0) {
                 handleRect(g_line + 5);
             }
@@ -1677,7 +1892,7 @@ void setup() {
     Serial.begin(SERIAL_BAUD);
     delay(100);
     Serial.println();
-    Serial.println("[bridge] xangi-stackchan / cores3-main 0.19 (avatar+spriteface+battery+servo+wavqueue+camera+touchstop+micbutton+headtouch+headavatar+headpetsound+mic+micguard+micwatchdog+avtoggle+ackflush+i2c1task+resetreason)");
+    Serial.println("[bridge] xangi-stackchan / cores3-main 0.23 (avatar+spriteface+spritecache+spriteanim+battery+servo+wavqueue+camera+touchstop+micbutton+headtouch+headavatar+headpetsound+mic+micguard+micwatchdog+avtoggle+ackflush+i2c1task+resetreason+sprite-state-guard+no-wav-state-redraw)");
 
     // 直前のリセット理由を boot で必ず 1 行残す。panic / watchdog / brownout 等の
     // 「いつの間にか再起動していた」事象の一次証拠になる (host 側ログに残る)。
@@ -1784,6 +1999,7 @@ void loop() {
     pollHeadTouch();
     recoverFromMicWatchdog();
     updateBatteryInfo();
+    pollSpriteAnimation();
     if (g_image_face_active && millis() - g_last_battery_update_ms < 5) {
         g_image_face_dirty = true;
     }

@@ -46,10 +46,35 @@ class SpriteFaceRenderer:
         self._cache: dict[str, bytes] = {}
         self._last_frame: Image.Image | None = None
         self._pending_frame: Image.Image | None = None
+        self._firmware_slots: dict[str, int] = {}
+        self._firmware_uploaded: set[str] = set()
+        self._next_firmware_slot = 0
         # True なら各フレーム下部に「マイクボタン」を合成する (lcd_mic_voice モード)。
         # firmware の MIC_BTN_Y_MIN=188 と揃った下部ストリップに描くので、ここをタップ
         # するとファームが mic_button event を出す。
         self.show_mic_button: bool = False
+
+    def firmware_slot_for_key(self, key: str) -> int:
+        slot = self._firmware_slots.get(key)
+        if slot is not None:
+            return slot
+        slot = self._next_firmware_slot % 64
+        self._next_firmware_slot += 1
+        for old_key, old_slot in list(self._firmware_slots.items()):
+            if old_slot == slot:
+                self._firmware_uploaded.discard(old_key)
+                del self._firmware_slots[old_key]
+        self._firmware_slots[key] = slot
+        return slot
+
+    def firmware_uploaded(self, key: str) -> bool:
+        return key in self._firmware_uploaded
+
+    def mark_firmware_uploaded(self, key: str) -> None:
+        self._firmware_uploaded.add(key)
+
+    def clear_firmware_uploads(self) -> None:
+        self._firmware_uploaded.clear()
 
     def render_expression(self, expression: str) -> bytes:
         return self.render_expression_frame(expression, 0)

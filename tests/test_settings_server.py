@@ -14,7 +14,7 @@ import pytest
 
 from xangi_stackchan.app_types import BridgeConfig
 from xangi_stackchan.settings import RuntimeState
-from xangi_stackchan.settings_server import start_settings_server
+from xangi_stackchan.settings_server import _execute_demo, start_settings_server
 from xangi_stackchan.stackchan import StackchanConfig
 
 
@@ -53,6 +53,46 @@ def _pick_free_port() -> int:
     with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+class FakeBackend:
+    def __init__(self):
+        self.wav_calls = []
+
+    def send_command(self, command: str) -> dict:
+        if command == "STATUS":
+            return {"status": "ok"}
+        return {"status": "ok", "command": command}
+
+    def send_wav(self, wav: bytes, chunk_size: int = 1024, chunk_delay: float = 0.005) -> dict:
+        self.wav_calls.append(
+            {"wav": wav, "chunk_size": chunk_size, "chunk_delay": chunk_delay}
+        )
+        return {"status": "ok", "size": len(wav)}
+
+
+class FakePiper:
+    def synthesize_many(self, chunks: list[str]) -> list[bytes]:
+        return [b"RIFFxxxxWAVE" for _ in chunks]
+
+
+class FakeSpriteAnimator:
+    def __init__(self):
+        self.events = []
+
+    def pause(self):
+        self.events.append("pause")
+
+    def resume(self):
+        self.events.append("resume")
+
+    def set_expression(self, expression: str):
+        self.events.append(("face", expression))
+
+
+class FakeLocalSpriteAnimator(FakeSpriteAnimator):
+    def keeps_running_during_wav(self):
+        return True
 
 
 def test_autoshift_picks_next_free_port(tmp_path: Path):
@@ -96,3 +136,29 @@ def test_binds_initial_port_when_free(tmp_path: Path):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_execute_demo_pauses_sprite_animator(tmp_path: Path):
+    state = _state(tmp_path)
+    state.update({"tts": "piper", "face_mode": "sprite"})
+    animator = FakeSpriteAnimator()
+    state.set_runtime(FakeBackend(), FakePiper())
+    state.set_sprite_animator(animator)
+
+    result = _execute_demo(state, {"text": "テストです", "preset": "chill"})
+
+    assert result["status"] == "ok"
+    assert animator.events == [("face", "happy"), "pause", "resume", ("face", "neutral")]
+
+
+def test_execute_demo_keeps_local_sprite_animation_running(tmp_path: Path):
+    state = _state(tmp_path)
+    state.update({"tts": "piper", "face_mode": "sprite"})
+    animator = FakeLocalSpriteAnimator()
+    state.set_runtime(FakeBackend(), FakePiper())
+    state.set_sprite_animator(animator)
+
+    result = _execute_demo(state, {"text": "テストです", "preset": "chill"})
+
+    assert result["status"] == "ok"
+    assert animator.events == [("face", "happy"), ("face", "neutral")]

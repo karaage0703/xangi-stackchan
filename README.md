@@ -11,7 +11,7 @@
 - `turn.complete` の最終テキストを piper-plus / VOICEVOX で音声化して再生。再生中は首がささやかに揺れる
 - 完了後は `neutral` 顔 + idle ポーズに戻る
 - `agent.error` では `sad` 顔 + 首を下げる
-- **スプライト顔モード (`--face-mode sprite`)**: `spritesheet.webp` を LCD 用 JPEG に変換して表示。row/state + filled-frame tick でまばたき/表情アニメーションする。スプライト本体は `assets/pets/...` にローカル配置し、リポジトリにはコミットしない
+- **スプライト顔モード (`--face-mode sprite`)**: `spritesheet.webp` を LCD 用 JPEG に変換して表示。row/state + filled-frame tick でまばたき/表情アニメーションする。スプライト本体は `assets/pets/<name>/spritesheet.webp` にローカル配置し、リポジトリにはコミットしない (`assets/pets/**/*.webp` は `.gitignore` 対象)
 - **バッテリー表示**: CoreS3 の残量を Avatar / スプライト顔の右上に表示し、`STATUS` に `battery_level` などを含める
 - **状態表示LED**: CoreS3 Grove PORT.B の Puzzle Unit WS2812E と、M5Stack 公式 StackChan K151 / K151-R の本体 12 RGB LED を自動検出し、思考中 (`thinking`) / 発話中 (`talking`) / エラー (`error`) に合わせて点灯する。未接続・旧ファームでは自動で無効化
 - **カメラスナップショット**: 内蔵 GC0308 カメラで JPEG 撮影 → 設定 UI / API で表示。LLM 連携は将来別 PR で対応
@@ -62,6 +62,8 @@ uv run xangi-stackchan \
 ```
 
 起動すると設定 UI が `http://127.0.0.1:7897/` で立ち上がる。xangi URL / 接続先 / 音量 / TTS / 表情をブラウザから変更でき、保存すると `~/.xangi/xangi-stackchan/config.json` に永続化される。
+
+スプライト顔を使う場合は、起動前にローカルのスプライトシートをリポジトリ直下の `assets/pets/borot/spritesheet.webp` に置く。`assets/pets/**/*.webp` は `.gitignore` 対象なので、画像本体は git 管理されない。別キャラクターを使う場合は `assets/pets/<name>/spritesheet.webp` に置き、`--sprite-sheet assets/pets/<name>/spritesheet.webp` を指定する。
 
 ### 実機なしでブラウザシミュレータを開く
 

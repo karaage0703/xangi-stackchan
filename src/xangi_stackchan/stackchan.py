@@ -746,6 +746,84 @@ class StackchanSerial:
             finally:
                 self.actor.end_transaction()
 
+    def cache_image_frame(
+        self,
+        slot: int,
+        image_jpeg: bytes,
+        chunk_size: int = 1024,
+        chunk_delay: float = 0.005,
+    ) -> dict:
+        """Upload a JPEG sprite frame to firmware PSRAM cache."""
+        if not image_jpeg:
+            return {"status": "error", "error": "empty image"}
+        if slot < 0 or slot >= 64:
+            return {"status": "error", "error": "slot out of range"}
+        if self._is_disconnected():
+            return self._disconnected_error()
+        with self._lock:
+            self.actor.start_transaction()
+            try:
+                self.actor.write(f"SIMG:{slot},{len(image_jpeg)}\n".encode())
+                ready_or_err = self.actor.expect_line(
+                    lambda l: l == "READY"
+                    or (
+                        l.startswith("{")
+                        and ('"sprite_image"' in l or '"error"' in l)
+                        and '"event"' not in l
+                    ),
+                    timeout=3.0,
+                )
+                if ready_or_err is None:
+                    self._resync_serial()
+                    return {"status": "error", "error": "no READY response"}
+                if ready_or_err != "READY":
+                    try:
+                        return json.loads(ready_or_err)
+                    except json.JSONDecodeError:
+                        return {"status": "error", "error": "invalid early ack", "raw": ready_or_err}
+
+                sent = 0
+                while sent < len(image_jpeg):
+                    end = min(sent + chunk_size, len(image_jpeg))
+                    self.actor.write(image_jpeg[sent:end])
+                    sent = end
+                    if chunk_delay > 0:
+                        time.sleep(chunk_delay)
+
+                ack_line = self.actor.expect_line(
+                    lambda l: l.startswith("{")
+                    and ('"sprite_image"' in l or '"error"' in l)
+                    and '"event"' not in l,
+                    timeout=5.0,
+                )
+                if ack_line is None:
+                    return {"status": "error", "error": "no sprite image ack"}
+                try:
+                    return json.loads(ack_line)
+                except json.JSONDecodeError:
+                    return {"status": "error", "error": "invalid sprite image ack json", "raw": ack_line}
+            finally:
+                self.actor.end_transaction()
+
+    def show_cached_image(self, slot: int) -> dict:
+        """Draw a firmware-cached sprite frame by slot."""
+        if slot < 0 or slot >= 64:
+            return {"status": "error", "error": "slot out of range"}
+        return self.send_command(f"SFRAME:{slot}")
+
+    def start_cached_sprite_animation(self, slots: list[int], interval_ms: int) -> dict:
+        """Start firmware-local animation using cached sprite frame slots."""
+        clean_slots = [int(slot) for slot in slots if 0 <= int(slot) < 64]
+        if not clean_slots:
+            return {"status": "error", "error": "empty sprite animation"}
+        interval_ms = max(50, min(5000, int(interval_ms)))
+        slot_csv = ",".join(str(slot) for slot in clean_slots[:16])
+        return self.send_command(f"SANIM:{interval_ms},{slot_csv}")
+
+    def stop_cached_sprite_animation(self) -> dict:
+        """Stop firmware-local sprite animation without changing the current frame."""
+        return self.send_command("SANIM:0")
+
     def send_rect(
         self,
         x: int,
@@ -837,10 +915,13 @@ class StackchanSerial:
         #    (event 行は actor 側で自動 skip。size キーを持たない他コマンドの
         #     ack はぐれを除外したいので、size または error を含む JSON のみ通す)
         # 3. READY なら chunk 送信 → ack 待ち
-        self.actor.start_transaction()
+        actor = self.actor
+        if actor is None:
+            return self._disconnected_error()
+        actor.start_transaction()
         try:
-            self.actor.write(f"WAV:{len(wav_data)}\n".encode())
-            ready_or_err = self.actor.expect_line(
+            actor.write(f"WAV:{len(wav_data)}\n".encode())
+            ready_or_err = actor.expect_line(
                 lambda l: l == "READY"
                 or (
                     l.startswith("{")
@@ -862,7 +943,7 @@ class StackchanSerial:
             sent = 0
             while sent < len(wav_data):
                 end = min(sent + chunk_size, len(wav_data))
-                self.actor.write(wav_data[sent:end])
+                actor.write(wav_data[sent:end])
                 sent = end
                 if chunk_delay > 0:
                     time.sleep(chunk_delay)
@@ -870,7 +951,7 @@ class StackchanSerial:
             # ack 待ち。WAV ack シグネチャ: {"status":"ok","size":N,"queued":n}。
             # MOVE/FACE ack のはぐれ (size を持たない) は actor 側 expect_line の
             # predicate で弾く。error ack も通す。
-            ack_line = self.actor.expect_line(
+            ack_line = actor.expect_line(
                 lambda l: l.startswith("{")
                 and ('"size"' in l or '"error"' in l)
                 and '"event"' not in l,
@@ -883,7 +964,7 @@ class StackchanSerial:
             except json.JSONDecodeError:
                 return {"status": "ok", "size": len(wav_data), "note": "invalid ack json", "raw": ack_line}
         finally:
-            self.actor.end_transaction()
+            actor.end_transaction()
 
     def capture(self, timeout: float = 5.0) -> dict:
         """Phase 1A: CAPTURE コマンドで CoreS3 内蔵カメラ (GC0308) から JPEG 1 枚取得。
@@ -1115,6 +1196,38 @@ class StackchanSimulator:
                 pattern = cmd.split(":", 1)[1].strip() or "off"
                 self._state["stack_led"] = pattern
                 return {"status": "ok", "stack_led": pattern, "simulator": True}
+            if cmd.startswith("SFRAME:"):
+                try:
+                    slot = max(0, min(63, int(cmd.split(":", 1)[1])))
+                except ValueError:
+                    return {"status": "error", "error": "SFRAME parse error"}
+                self._state["face"] = "sprite"
+                self._state["sprite_slot"] = slot
+                return {"status": "ok", "sprite_frame": slot, "simulator": True}
+            if cmd.startswith("SANIM:"):
+                raw = cmd.split(":", 1)[1].strip()
+                if raw == "0":
+                    self._state["sprite_anim"] = False
+                    return {"status": "ok", "sprite_anim": False, "simulator": True}
+                try:
+                    parts = [int(x) for x in raw.split(",") if x.strip()]
+                except ValueError:
+                    return {"status": "error", "error": "SANIM parse error"}
+                if len(parts) < 2:
+                    return {"status": "error", "error": "SANIM syntax: interval,slots..."}
+                interval_ms = max(50, min(5000, parts[0]))
+                slots = [max(0, min(63, slot)) for slot in parts[1:17]]
+                self._state["face"] = "sprite"
+                self._state["sprite_anim"] = True
+                self._state["sprite_anim_interval_ms"] = interval_ms
+                self._state["sprite_anim_slots"] = slots
+                return {
+                    "status": "ok",
+                    "sprite_anim": True,
+                    "interval_ms": interval_ms,
+                    "frames": len(slots),
+                    "simulator": True,
+                }
             if cmd.startswith("ROTATE:"):
                 try:
                     rotation = int(cmd.split(":", 1)[1]) % 4
@@ -1145,6 +1258,34 @@ class StackchanSimulator:
             self._state["face"] = "sprite"
             self._state["image_bytes"] = len(image_jpeg)
             return {"status": "ok", "image": len(image_jpeg), "simulator": True}
+
+    def cache_image_frame(
+        self,
+        slot: int,
+        image_jpeg: bytes,
+        chunk_size: int = 1024,
+        chunk_delay: float = 0.005,
+    ) -> dict:
+        with self._lock:
+            if not image_jpeg:
+                return {"status": "error", "error": "empty image"}
+            slot = max(0, min(63, int(slot)))
+            self._touch(f"SIMG:{slot},{len(image_jpeg)}")
+            self._state.setdefault("sprite_cache", {})[slot] = len(image_jpeg)
+            return {"status": "ok", "sprite_image": slot, "size": len(image_jpeg), "simulator": True}
+
+    def show_cached_image(self, slot: int) -> dict:
+        return self.send_command(f"SFRAME:{int(slot)}")
+
+    def start_cached_sprite_animation(self, slots: list[int], interval_ms: int) -> dict:
+        clean_slots = [int(slot) for slot in slots if 0 <= int(slot) < 64]
+        if not clean_slots:
+            return {"status": "error", "error": "empty sprite animation"}
+        interval_ms = max(50, min(5000, int(interval_ms)))
+        return self.send_command(f"SANIM:{interval_ms}," + ",".join(str(slot) for slot in clean_slots[:16]))
+
+    def stop_cached_sprite_animation(self) -> dict:
+        return self.send_command("SANIM:0")
 
     def capture(self, timeout: float = 5.0) -> dict:
         try:

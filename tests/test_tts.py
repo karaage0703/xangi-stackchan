@@ -12,6 +12,15 @@ def test_split_text_keeps_japanese_sentences():
     ]
 
 
+def test_split_text_hard_splits_long_sentence_without_punctuation():
+    assert split_text("長い文章が句読点なしで続くケース", max_len=5) == [
+        "長い文章が",
+        "句読点なし",
+        "で続くケー",
+        "ス",
+    ]
+
+
 def test_wait_for_complete_file_waits_for_stable_size(tmp_path):
     target = tmp_path / "out.wav"
 

@@ -92,7 +92,7 @@ setsid -f bash -c 'cd '"$PWD"' && STACKCHAN_WHISPER_MODEL=medium exec uv run xan
 - `--volume`: 0〜255 (既定 255、AtomS3R + Voice Base は ES8311 過変調防止で 192 以下推奨)
 - `--tts`: `piper` / `voicevox` / `none`
 - `--face-mode`: `avatar` / `sprite`。`sprite` は `spritesheet.webp` を LCD 画像顔として送り、filled-frame tick でまばたき/表情アニメーションする
-- `--sprite-sheet`: `--face-mode sprite` 用の `spritesheet.webp` (既定 `assets/pets/default/spritesheet.webp`)。スプライト本体は `.gitignore` 対象でコミットしない
+- `--sprite-sheet`: `--face-mode sprite` 用の `spritesheet.webp` (既定 `assets/pets/borot/spritesheet.webp`)。スプライト本体は `assets/pets/<name>/spritesheet.webp` にローカル配置し、`.gitignore` 対象なのでコミットしない
 - `--settings-port`: 設定 UI の port (既定 7897)
 - `--settings-bind`: 既定 `127.0.0.1`。同一マシン以外 (LAN / Tailscale 等の別端末) から設定 UI を開きたい場合のみ `0.0.0.0`
 - `--voice-conversation`: アタマセンサなで → 録音 → STT → xangi 投入の音声対話モード (K151 専用)

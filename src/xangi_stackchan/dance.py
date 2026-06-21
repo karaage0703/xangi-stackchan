@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import math
+import os
 import sys
 import threading
 import time
@@ -16,7 +17,7 @@ import wave
 from typing import TypedDict
 
 from .app_types import BridgeConfig
-from .tts import PiperProcess, split_text, voicevox_synthesize
+from .tts import PiperProcess, downsample_wav, split_text, voicevox_synthesize
 
 
 class DancePattern(TypedDict):
@@ -136,6 +137,8 @@ class DanceLoop:
             and abs(self._current[1] - pitch) < 0.5
         ):
             return
+        if not _backend_ready(self._backend):
+            return
         try:
             self._backend.send_command(f"MOVE:{yaw:.1f},{pitch:.1f}")
         except Exception as exc:
@@ -150,11 +153,14 @@ def synthesize_text(
     config: BridgeConfig,
     piper_process: PiperProcess | None,
 ) -> list[tuple[str, bytes]]:
-    chunks = split_text(text)
+    chunks = split_text(text, max_len=12)
     if config.tts == "piper":
         if not piper_process:
             raise RuntimeError("piper process is not initialized")
         wavs = piper_process.synthesize_many(chunks)
+        downsample_factor = int(os.environ.get("STACKCHAN_TTS_DOWNSAMPLE", "2"))
+        if downsample_factor > 1:
+            wavs = [downsample_wav(wav, downsample_factor) for wav in wavs]
         return list(zip(chunks, wavs))
     if config.tts == "voicevox":
         return [
@@ -169,9 +175,23 @@ STATUS_LIGHTS = (
     ("STACKLED", "stack_led"),
 )
 
+DEMO_SPRITE_RESUME_DELAY_SECONDS = 0.35
+DEMO_MOTION_START_DELAY_SECONDS = 0.25
+
+
+def _backend_ready(backend) -> bool:
+    connected = getattr(backend, "is_connected", True)
+    if isinstance(connected, bool) and not connected:
+        return False
+    if hasattr(backend, "actor") and getattr(backend, "actor") is None:
+        return False
+    return True
+
 
 def _status_lights_supported(backend, config: BridgeConfig) -> list[str]:
     if not config.puzzle_light_enabled:
+        return []
+    if not _backend_ready(backend):
         return []
     try:
         status = backend.send_command("STATUS")
@@ -187,12 +207,27 @@ def _status_lights_supported(backend, config: BridgeConfig) -> list[str]:
 def _send_status_lights(backend, commands: list[str], pattern: str) -> None:
     if not pattern:
         return
+    if not _backend_ready(backend):
+        return
     for command in commands:
         try:
             result = backend.send_command(f"{command}:{pattern}")
             print(f"[dance] {command}:{pattern} -> {result}", file=sys.stderr, flush=True)
         except Exception as exc:
             print(f"[dance] {command}:{pattern} error: {exc}", file=sys.stderr, flush=True)
+
+
+def _send_demo_face(backend, config: BridgeConfig, expression: str) -> None:
+    if not expression:
+        return
+    if (config.face_mode or "avatar").strip().lower() == "sprite":
+        return
+    if not _backend_ready(backend):
+        return
+    try:
+        backend.send_command(f"FACE:{expression}")
+    except Exception:
+        pass
 
 
 def run_demo(
@@ -205,6 +240,8 @@ def run_demo(
     idle_yaw: float | None = None,
     idle_pitch: float | None = None,
     face: str | None = None,
+    before_wav_send=None,
+    after_wav_send=None,
 ) -> dict[str, object]:
     """Run dance demo synchronously: TTS → send_wav loop wrapped in DanceLoop.
 
@@ -233,41 +270,59 @@ def run_demo(
         if status_lights:
             _send_status_lights(backend, status_lights, config.puzzle_talking)
 
-        if face_used:
-            try:
-                backend.send_command(f"FACE:{face_used}")
-            except Exception:
-                pass
+        _send_demo_face(backend, config, face_used)
 
         chunk_results: list[dict[str, object]] = []
         send_seconds_last = 0.0
-        with DanceLoop(backend, pattern, base_yaw, base_pitch):
-            for idx, (chunk, wav) in enumerate(synthesized, start=1):
-                started = time.time()
-                try:
-                    result = backend.send_wav(wav)
-                except Exception as exc:
-                    result = {"status": "error", "error": str(exc)}
-                send_seconds_last = time.time() - started
-                chunk_results.append(
-                    {
-                        "chunk": idx,
-                        "text": chunk,
-                        "bytes": len(wav),
-                        "audio_seconds": round(wav_duration_seconds(wav), 2),
-                        "send_seconds": round(send_seconds_last, 2),
-                        "result": result,
-                    }
+        remaining = 0.0
+        for idx, (chunk, wav) in enumerate(synthesized, start=1):
+            started = time.time()
+            try:
+                if before_wav_send is not None:
+                    before_wav_send()
+                result = backend.send_wav(
+                    wav,
+                    chunk_size=config.serial_chunk,
+                    chunk_delay=config.serial_delay,
                 )
-            # 最後の WAV は send_wav 完了時にはまだ再生中。総再生時間まで待つ。
-            remaining = max(0.0, total_audio_seconds - send_seconds_last)
-            time.sleep(remaining + 0.3)
+            except Exception as exc:
+                result = {"status": "error", "error": str(exc)}
+            send_seconds_last = time.time() - started
+            chunk_audio_seconds = wav_duration_seconds(wav)
+            chunk_results.append(
+                {
+                    "chunk": idx,
+                    "text": chunk,
+                    "bytes": len(wav),
+                    "audio_seconds": round(chunk_audio_seconds, 2),
+                    "send_seconds": round(send_seconds_last, 2),
+                    "result": result,
+                }
+            )
+            remaining += max(0.0, chunk_audio_seconds - send_seconds_last)
+
+        # WAV のシリアル転送が終わってから少し待って sprite / MOVE を戻す。
+        # 再生開始直後は CoreS3 側の音声処理と描画・サーボ開始が重なると
+        # 一瞬だけ表示ノイズが出やすいので、発話の立ち上がりを避ける。
+        if after_wav_send is not None:
+            if remaining > 0.0:
+                resume_delay = min(DEMO_SPRITE_RESUME_DELAY_SECONDS, remaining)
+                time.sleep(resume_delay)
+                remaining = max(0.0, remaining - resume_delay)
+            after_wav_send()
+
+        if remaining > 0.0:
+            motion_delay = min(DEMO_MOTION_START_DELAY_SECONDS, remaining)
+            if motion_delay > 0.0:
+                time.sleep(motion_delay)
+                remaining = max(0.0, remaining - motion_delay)
+            with DanceLoop(backend, pattern, base_yaw, base_pitch):
+                time.sleep(remaining + 0.3)
+        else:
+            time.sleep(0.3)
 
         if face_used:
-            try:
-                backend.send_command(f"FACE:{config.face_idle}")
-            except Exception:
-                pass
+            _send_demo_face(backend, config, config.face_idle)
     finally:
         if status_lights:
             _send_status_lights(backend, status_lights, config.puzzle_idle)

@@ -208,9 +208,45 @@ def _send_sprite_frame(
     sprite_renderer: list[SpriteFaceRenderer | None],
 ):
     renderer = _get_sprite_renderer(config, sprite_renderer)
-    key = f"sprite:{expression}:{step}:{config.sprite_sheet}:{config.sprite_jpeg_quality}"
+    frame_columns = renderer.frame_columns_for_expression(expression)
+    frame_phase = step % len(frame_columns) if frame_columns else 0
+    key = f"sprite:{expression}:{frame_phase}:{config.sprite_sheet}:{config.sprite_jpeg_quality}"
     if current_face[0] == key:
         return True
+
+    if hasattr(backend, "cache_image_frame") and hasattr(backend, "show_cached_image"):
+        slot = renderer.firmware_slot_for_key(key)
+        if not renderer.firmware_uploaded(key):
+            image = renderer.render_expression_frame(expression, step)
+            result = backend.cache_image_frame(
+                slot, image, chunk_size=config.serial_chunk, chunk_delay=config.serial_delay
+            )
+            log({
+                "face": expression,
+                "mode": "sprite_cache",
+                "step": step,
+                "slot": slot,
+                "bytes": len(image),
+                "result": result,
+            })
+            if result.get("status") != "ok":
+                renderer.clear_firmware_uploads()
+                return False
+            renderer.mark_firmware_uploaded(key)
+        result = backend.show_cached_image(slot)
+        if result.get("raw") == "":
+            result = backend.show_cached_image(slot)
+        log({
+            "face": expression,
+            "mode": "sprite_cached",
+            "step": step,
+            "slot": slot,
+            "result": result,
+        })
+        if result.get("status") == "ok":
+            current_face[0] = key
+            return True
+        return False
 
     image = renderer.render_expression_frame(expression, step)
     result = backend.send_image(image, chunk_size=config.serial_chunk, chunk_delay=config.serial_delay)
@@ -219,6 +255,42 @@ def _send_sprite_frame(
         current_face[0] = key
         return True
     return False
+
+
+def _ensure_sprite_animation_frames(
+    backend,
+    config: BridgeConfig,
+    expression: str,
+    sprite_renderer: list[SpriteFaceRenderer | None],
+) -> list[int] | None:
+    renderer = _get_sprite_renderer(config, sprite_renderer)
+    frame_columns = renderer.frame_columns_for_expression(expression)
+    if not frame_columns:
+        return None
+
+    slots: list[int] = []
+    for step in range(len(frame_columns)):
+        key = f"sprite:{expression}:{step}:{config.sprite_sheet}:{config.sprite_jpeg_quality}"
+        slot = renderer.firmware_slot_for_key(key)
+        if not renderer.firmware_uploaded(key):
+            image = renderer.render_expression_frame(expression, step)
+            result = backend.cache_image_frame(
+                slot, image, chunk_size=config.serial_chunk, chunk_delay=config.serial_delay
+            )
+            log({
+                "face": expression,
+                "mode": "sprite_cache",
+                "step": step,
+                "slot": slot,
+                "bytes": len(image),
+                "result": result,
+            })
+            if result.get("status") != "ok":
+                renderer.clear_firmware_uploads()
+                return None
+            renderer.mark_firmware_uploaded(key)
+        slots.append(slot)
+    return slots
 
 
 class SpriteAnimationLoop:
@@ -231,15 +303,32 @@ class SpriteAnimationLoop:
         self._step = 0
         self._pause_until = 0.0
         self._manual_pause = False
+        self._local_animation_supported: bool | None = None
+        self._local_animation_active = False
+        self._local_animation_expression: str | None = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="sprite-face-animation", daemon=True)
 
+    def _backoff_seconds(self) -> float:
+        return max(float(getattr(self.backend, "reconnect_interval", 5.0) or 5.0) + 1.0, 5.0)
+
+    def _pause_after_send_error(self) -> None:
+        self._pause_until = time.time() + self._backoff_seconds()
+
+    def _backend_connected(self) -> bool:
+        connected = getattr(self.backend, "is_connected", True)
+        if isinstance(connected, bool):
+            return connected
+        return True
+
     def start(self):
         self._thread.start()
+        self.set_expression(self._expression)
 
     def stop(self):
         self._stop.set()
+        self._stop_local_animation()
         self._thread.join(timeout=1.0)
 
     def pause(self):
@@ -249,6 +338,12 @@ class SpriteAnimationLoop:
     def resume(self):
         with self._lock:
             self._manual_pause = False
+            expression_now = self._expression
+        self._try_start_local_animation(expression_now)
+
+    def keeps_running_during_wav(self) -> bool:
+        with self._lock:
+            return bool(self._local_animation_active)
 
     def set_expression(self, expression: str):
         if not expression:
@@ -259,12 +354,66 @@ class SpriteAnimationLoop:
                 self._step = 0
             expression_now = self._expression
             step_now = self._step
+        if self._try_start_local_animation(expression_now):
+            return
         try:
             if not _send_sprite_frame(self.backend, self.config, expression_now, step_now, self.current_face, self.sprite_renderer):
-                self._pause_until = time.time() + 5.0
+                self._pause_after_send_error()
         except Exception as exc:
-            self._pause_until = time.time() + 5.0
+            self._pause_after_send_error()
             log({"face": expression_now, "mode": "sprite", "error": str(exc)})
+
+    def _stop_local_animation(self) -> None:
+        if not self._local_animation_active or not hasattr(self.backend, "stop_cached_sprite_animation"):
+            return
+        try:
+            result = self.backend.stop_cached_sprite_animation()
+            log({"mode": "sprite_anim_stop", "result": result})
+        except Exception as exc:
+            log({"mode": "sprite_anim_stop", "error": str(exc)})
+        finally:
+            self._local_animation_active = False
+            self._local_animation_expression = None
+
+    def _try_start_local_animation(self, expression: str) -> bool:
+        if self._local_animation_supported is False:
+            return False
+        if not hasattr(self.backend, "start_cached_sprite_animation"):
+            self._local_animation_supported = False
+            return False
+        if not self._backend_connected():
+            return False
+        with self._lock:
+            if self._manual_pause:
+                return True
+            if self._local_animation_active and self._local_animation_expression == expression:
+                return True
+
+        slots = _ensure_sprite_animation_frames(self.backend, self.config, expression, self.sprite_renderer)
+        if not slots:
+            return False
+        interval_ms = max(50, int(round(1000.0 / SPRITE_FPS))) if SPRITE_FPS > 0 else 1000
+        try:
+            result = self.backend.start_cached_sprite_animation(slots, interval_ms)
+        except Exception as exc:
+            self._local_animation_supported = False
+            log({"face": expression, "mode": "sprite_anim", "error": str(exc)})
+            return False
+        log({
+            "face": expression,
+            "mode": "sprite_anim",
+            "slots": slots,
+            "interval_ms": interval_ms,
+            "result": result,
+        })
+        if result.get("status") != "ok":
+            self._local_animation_supported = False
+            return False
+        self._local_animation_supported = True
+        self._local_animation_active = True
+        self._local_animation_expression = expression
+        self.current_face[0] = f"sprite_anim:{expression}:{self.config.sprite_sheet}:{self.config.sprite_jpeg_quality}"
+        return True
 
     def _run(self):
         if SPRITE_FPS <= 0:
@@ -273,19 +422,24 @@ class SpriteAnimationLoop:
         while not self._stop.wait(interval):
             if getattr(self.backend, "_mic_recording", False):
                 continue
+            if not self._backend_connected():
+                self._pause_after_send_error()
+                continue
             if time.time() < self._pause_until:
                 continue
             with self._lock:
                 if self._manual_pause:
+                    continue
+                if self._local_animation_active:
                     continue
                 self._step += 1
                 expression_now = self._expression
                 step_now = self._step
             try:
                 if not _send_sprite_frame(self.backend, self.config, expression_now, step_now, self.current_face, self.sprite_renderer):
-                    self._pause_until = time.time() + 5.0
+                    self._pause_after_send_error()
             except Exception as exc:
-                self._pause_until = time.time() + 5.0
+                self._pause_after_send_error()
                 log({"face": expression_now, "mode": "sprite", "error": str(exc)})
 
 
@@ -419,7 +573,32 @@ def synthesize_chunks(chunks: list[str], config: BridgeConfig, piper_process: Pi
         yield idx, chunk, wav, time.time() - started
 
 
-def speak_text(backend, text: str, config: BridgeConfig, piper_process: PiperProcess | None):
+def _call_if_present(callback) -> None:
+    if callback is None:
+        return
+    try:
+        callback()
+    except Exception:
+        pass
+
+
+def _sprite_wav_hooks(sprite_animator):
+    if sprite_animator is None:
+        return None, None
+    keeps_running = getattr(sprite_animator, "keeps_running_during_wav", None)
+    if callable(keeps_running) and keeps_running():
+        return None, None
+    return sprite_animator.pause, sprite_animator.resume
+
+
+def speak_text(
+    backend,
+    text: str,
+    config: BridgeConfig,
+    piper_process: PiperProcess | None,
+    before_wav_send=None,
+    after_wav_send=None,
+):
     text = (text or "").strip()
     if not text or config.tts == "none":
         return
@@ -455,9 +634,12 @@ def speak_text(backend, text: str, config: BridgeConfig, piper_process: PiperPro
             wav = downsample_wav(wav, downsample_factor)
         started = time.time()
         try:
+            _call_if_present(before_wav_send)
             result = backend.send_wav(wav, chunk_size=config.serial_chunk, chunk_delay=config.serial_delay)
         except Exception as exc:
             result = {"status": "error", "error": str(exc)}
+        finally:
+            _call_if_present(after_wav_send)
         log(
             {
                 "chunk": idx,
@@ -581,6 +763,7 @@ def run_bridge(state: RuntimeState):
                 )
                 sprite_animator = None
                 state.set_runtime(None, None)
+                state.set_sprite_animator(None)
                 backend = open_backend_with_retry(config)
                 piper_process = None
                 if config.tts == "piper":
@@ -622,6 +805,7 @@ def run_bridge(state: RuntimeState):
                         backend, config.move_idle_yaw, config.move_idle_pitch, current_move
                     )
                 state.set_runtime(backend, piper_process)
+                state.set_sprite_animator(sprite_animator)
                 log({"config_applied": version})
 
                 # 音声対話モード起動 (シリアル backend のみ、WiFi backend は未対応)。
@@ -760,8 +944,8 @@ def run_bridge(state: RuntimeState):
                     def _pet_speak(text):
                         # 発話前に talking 顔、終わったら idle に戻す。speak_text は
                         # send_wav 完了までブロックする (専用 thread から呼ばれる)。
-                        if sprite_animator is not None:
-                            sprite_animator.pause()
+                        before_wav_send, after_wav_send = _sprite_wav_hooks(sprite_animator)
+                        _call_if_present(before_wav_send)
                         set_puzzle_light_if_needed(
                             backend, config, config.puzzle_talking, current_puzzle, puzzle_supported
                         )
@@ -770,7 +954,14 @@ def run_bridge(state: RuntimeState):
                             sprite_renderer, sprite_animator,
                         )
                         try:
-                            speak_text(backend, text, config, piper_process)
+                            speak_text(
+                                backend,
+                                text,
+                                config,
+                                piper_process,
+                                before_wav_send=before_wav_send,
+                                after_wav_send=after_wav_send,
+                            )
                         finally:
                             set_puzzle_light_if_needed(
                                 backend, config, config.puzzle_idle, current_puzzle, puzzle_supported
@@ -779,8 +970,7 @@ def run_bridge(state: RuntimeState):
                                 backend, config, config.face_idle, current_face,
                                 sprite_renderer, sprite_animator,
                             )
-                            if sprite_animator is not None:
-                                sprite_animator.resume()
+                            _call_if_present(after_wav_send)
 
                     def _pet_on_react(phrase, event):
                         log({
@@ -954,8 +1144,7 @@ def run_bridge(state: RuntimeState):
                                 backend, config, config.puzzle_talking, current_puzzle, puzzle_supported
                             )
                             if config.move_enabled:
-                                if sprite_animator is not None:
-                                    sprite_animator.pause()
+                                before_wav_send, after_wav_send = _sprite_wav_hooks(sprite_animator)
                                 with TalkingSway(
                                     backend,
                                     config.move_idle_yaw,
@@ -966,16 +1155,23 @@ def run_bridge(state: RuntimeState):
                                     current_move,
                                 ):
                                     speak_text(
-                                        backend, event.get("text", ""), config, piper_process
+                                        backend,
+                                        event.get("text", ""),
+                                        config,
+                                        piper_process,
+                                        before_wav_send=before_wav_send,
+                                        after_wav_send=after_wav_send,
                                     )
-                                if sprite_animator is not None:
-                                    sprite_animator.resume()
                             else:
-                                if sprite_animator is not None:
-                                    sprite_animator.pause()
-                                speak_text(backend, event.get("text", ""), config, piper_process)
-                                if sprite_animator is not None:
-                                    sprite_animator.resume()
+                                before_wav_send, after_wav_send = _sprite_wav_hooks(sprite_animator)
+                                speak_text(
+                                    backend,
+                                    event.get("text", ""),
+                                    config,
+                                    piper_process,
+                                    before_wav_send=before_wav_send,
+                                    after_wav_send=after_wav_send,
+                                )
                             set_visual_face_if_needed(
                                 backend, config, config.face_idle, current_face, sprite_renderer, sprite_animator
                             )

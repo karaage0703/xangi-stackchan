@@ -307,6 +307,9 @@ class RuntimeState:
         # run_bridge が config.head_pet_reaction=True + StackchanSerial backend +
         # voice 無効のとき set_head_pet_reaction で登録。
         self._head_pet: object | None = None
+        # sprite face animation coordinator. settings_server の `/api/demo` は
+        # 発話中に IMAGE tick がシリアル/LCDを奪い合わないよう一時停止する。
+        self._sprite_animator: object | None = None
 
     def snapshot(self) -> tuple[BridgeConfig, int]:
         with self._lock:
@@ -320,6 +323,14 @@ class RuntimeState:
     def get_runtime(self) -> tuple[object | None, object | None]:
         with self._lock:
             return self._backend, self._piper_process
+
+    def set_sprite_animator(self, sprite_animator: object | None) -> None:
+        with self._lock:
+            self._sprite_animator = sprite_animator
+
+    def get_sprite_animator(self) -> object | None:
+        with self._lock:
+            return self._sprite_animator
 
     def set_last_capture(self, capture: dict[str, Any] | None) -> None:
         with self._lock:

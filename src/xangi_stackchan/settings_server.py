@@ -16,6 +16,27 @@ DEFAULT_SETTINGS_PORT = 7897
 _DEMO_LOCK = threading.Lock()
 
 
+def _sprite_wav_hooks(sprite_animator):
+    if sprite_animator is None:
+        return None, None
+    keeps_running = getattr(sprite_animator, "keeps_running_during_wav", None)
+    if callable(keeps_running) and keeps_running():
+        return None, None
+    before = sprite_animator.pause if hasattr(sprite_animator, "pause") else None
+    after = sprite_animator.resume if hasattr(sprite_animator, "resume") else None
+    return before, after
+
+
+def _set_sprite_expression(sprite_animator, face: str) -> bool:
+    if sprite_animator is None:
+        return False
+    set_expression = getattr(sprite_animator, "set_expression", None)
+    if not callable(set_expression):
+        return False
+    set_expression(face)
+    return True
+
+
 def _field(name: str, label: str, value: object, input_type: str = "text") -> str:
     escaped = html.escape(str(value or ""), quote=True)
     return (
@@ -527,11 +548,29 @@ def _execute_demo(state: RuntimeState, payload: dict[str, object]) -> dict[str, 
 
     if not _DEMO_LOCK.acquire(blocking=False):
         return {"status": "error", "error": "another demo is running"}
+    sprite_animator = state.get_sprite_animator()
+    before_wav_send, after_wav_send = _sprite_wav_hooks(sprite_animator)
+    should_restore_sprite_expression = False
     try:
-        return run_dance_demo(backend, piper, config, text, preset, bpm_override=bpm)
+        if config.face_mode == "sprite":
+            should_restore_sprite_expression = _set_sprite_expression(
+                sprite_animator, config.face_talking
+            )
+        return run_dance_demo(
+            backend,
+            piper,
+            config,
+            text,
+            preset,
+            bpm_override=bpm,
+            before_wav_send=before_wav_send,
+            after_wav_send=after_wav_send,
+        )
     except Exception as exc:
         return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
     finally:
+        if should_restore_sprite_expression:
+            _set_sprite_expression(sprite_animator, config.face_idle)
         _DEMO_LOCK.release()
 
 
