@@ -114,6 +114,31 @@ UI から以下を変更できる。
 
 設定 UI を LAN / Tailscale 経由でも開きたい場合は `--settings-bind 0.0.0.0` を付ける (既定は `127.0.0.1`)。
 
+### ブラウザシミュレータ
+
+実機が手元に無いときは `--simulator` で USB/WiFi に接続しないバックエンドを使う。xangi の SSE イベント処理、TTS 後の WAV 送信、FACE / MOVE / PUZZLE / STACKLED の状態遷移は通常バックエンドと同じ経路を通り、ブラウザで確認できる。
+
+```bash
+uv run xangi-stackchan \
+  --xangi-url http://127.0.0.1:18888 \
+  --simulator \
+  --speak-platforms web \
+  --tts piper
+```
+
+起動後に `http://127.0.0.1:7897/simulator` を開く。設定 UI の上部リンクからも移動できる。
+
+使える確認口:
+
+- `GET /api/simulator/state`: 顔、yaw/pitch、Puzzle Unit、StackChan 本体 LED、直近コマンド履歴を JSON で取得
+- `POST /api/simulator/command` with `{"command":"FACE:happy"}`: `FACE:...` / `MOVE:yaw,pitch` / `PUZZLE:...` / `STACKLED:...` / `VOLUME:...` / `STATUS` を手動送信
+- `GET /api/simulator/audio/latest.wav`: 直近の TTS WAV を取得。ブラウザ画面では `enable audio` を一度押すと、以後の TTS WAV を再生する
+- `POST /api/demo`: 既存のダンスデモ API。`--tts none` では TTS 無効エラーになるので、発話込みで見る場合は piper / VOICEVOX を有効化する
+
+注意: xangi Web UI の入力に反応させたいときは `--thread-id` を付けない。Web セッションごとに `thread_id=web:<session>` が変わるため、固定のダミー thread filter を付けるとイベントを弾いてしまう。Discord 等のイベントを除外したい場合は `--speak-platforms web` を使う。
+
+既存候補としては M5Stack 汎用の M5Sim や、MuJoCo + Three.js の stackchan-simulator がある。xangi-stackchan 内蔵シミュレータは物理計算より「このブリッジがどの FACE/MOVE/WAV/PUZZLE を出したか」を見る用途に絞っている。
+
 ### 設定 UI を無効化
 
 ```bash

@@ -1,4 +1,5 @@
 import glob
+import io
 import json
 import os
 import platform
@@ -997,9 +998,189 @@ class StackchanWifi:
         return {"status": "error", "error": "WiFi capture not implemented (Phase 2)"}
 
 
+class StackchanSimulator:
+    """In-process browser simulator backend.
+
+    It implements the same small command surface as the firmware bridge, but
+    keeps all actuator state in memory so the settings server can render it.
+    """
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._state = {
+            "state": "ready",
+            "face": "neutral",
+            "yaw": 0.0,
+            "pitch": 5.0,
+            "volume": 255,
+            "puzzle": "off",
+            "stack_led": "off",
+            "rotation": 0,
+            "wav_id": 0,
+            "wav_bytes": 0,
+            "image_bytes": 0,
+            "last_command": "",
+            "last_updated": time.time(),
+            "history": [],
+            "simulator": True,
+        }
+        self._playing_timer: threading.Timer | None = None
+        self._last_wav: bytes | None = None
+
+    def open(self):
+        return None
+
+    def close(self):
+        with self._lock:
+            if self._playing_timer is not None:
+                self._playing_timer.cancel()
+                self._playing_timer = None
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            data = dict(self._state)
+            data["history"] = list(self._state["history"])
+            data["has_audio"] = self._last_wav is not None
+            return data
+
+    def latest_wav(self) -> bytes | None:
+        with self._lock:
+            return self._last_wav
+
+    def _touch(self, command: str):
+        self._state["last_command"] = command
+        self._state["last_updated"] = time.time()
+        history = self._state["history"]
+        history.append({"ts": self._state["last_updated"], "command": command})
+        del history[:-40]
+
+    def _set_ready_later(self, delay: float):
+        if self._playing_timer is not None:
+            self._playing_timer.cancel()
+        self._playing_timer = threading.Timer(delay, self._mark_ready)
+        self._playing_timer.daemon = True
+        self._playing_timer.start()
+
+    def _mark_ready(self):
+        with self._lock:
+            self._state["state"] = "ready"
+            self._state["last_updated"] = time.time()
+            self._playing_timer = None
+
+    def send_command(self, cmd: str) -> dict:
+        with self._lock:
+            self._touch(cmd)
+            if cmd == "STATUS":
+                return {
+                    "state": self._state["state"],
+                    "volume": self._state["volume"],
+                    "face": self._state["face"],
+                    "yaw": self._state["yaw"],
+                    "pitch": self._state["pitch"],
+                    "servo": True,
+                    "camera": True,
+                    "puzzle": True,
+                    "stack_led": True,
+                    "puzzle_pattern": self._state["puzzle"],
+                    "stack_led_pattern": self._state["stack_led"],
+                    "simulator": True,
+                }
+            if cmd.startswith("FACE:"):
+                face = cmd.split(":", 1)[1].strip() or "neutral"
+                self._state["face"] = face
+                return {"status": "ok", "face": face, "simulator": True}
+            if cmd.startswith("MOVE:"):
+                raw = cmd.split(":", 1)[1]
+                try:
+                    yaw_raw, pitch_raw = raw.split(",", 1)
+                    yaw = max(-100.0, min(100.0, float(yaw_raw)))
+                    pitch = max(-30.0, min(30.0, float(pitch_raw)))
+                except ValueError:
+                    return {"status": "error", "error": "MOVE syntax: yaw,pitch"}
+                self._state["yaw"] = yaw
+                self._state["pitch"] = pitch
+                return {"status": "ok", "yaw": yaw, "pitch": pitch, "simulator": True}
+            if cmd.startswith("VOLUME:"):
+                try:
+                    volume = max(0, min(255, int(float(cmd.split(":", 1)[1]))))
+                except ValueError:
+                    return {"status": "error", "error": "VOLUME parse error"}
+                self._state["volume"] = volume
+                return {"status": "ok", "volume": volume, "simulator": True}
+            if cmd.startswith("PUZZLE:"):
+                pattern = cmd.split(":", 1)[1].strip() or "off"
+                self._state["puzzle"] = pattern
+                return {"status": "ok", "puzzle": pattern, "simulator": True}
+            if cmd.startswith("STACKLED:"):
+                pattern = cmd.split(":", 1)[1].strip() or "off"
+                self._state["stack_led"] = pattern
+                return {"status": "ok", "stack_led": pattern, "simulator": True}
+            if cmd.startswith("ROTATE:"):
+                try:
+                    rotation = int(cmd.split(":", 1)[1]) % 4
+                except ValueError:
+                    return {"status": "error", "error": "ROTATE parse error"}
+                self._state["rotation"] = rotation
+                return {"status": "ok", "rotation": rotation, "simulator": True}
+            if cmd.startswith("HEADTOUCH_AVATAR:") or cmd.startswith("HEADPET_SOUND:"):
+                return {"status": "ok", "simulator": True}
+            return {"status": "error", "error": f"unsupported simulator command: {cmd}"}
+
+    def send_wav(self, wav_data: bytes, chunk_size: int = 1024, chunk_delay: float = 0.005) -> dict:
+        with self._lock:
+            if not wav_data:
+                return {"status": "error", "error": "empty WAV"}
+            self._touch(f"WAV:{len(wav_data)}")
+            self._state["state"] = "playing"
+            self._state["wav_id"] += 1
+            self._state["wav_bytes"] = len(wav_data)
+            self._last_wav = bytes(wav_data)
+            duration = estimate_wav_duration_seconds(wav_data) or min(3.0, max(0.4, len(wav_data) / 32000.0))
+            self._set_ready_later(duration)
+            return {"status": "ok", "size": len(wav_data), "duration_seconds": duration, "simulator": True}
+
+    def send_image(self, image_jpeg: bytes, chunk_size: int = 1024, chunk_delay: float = 0.005) -> dict:
+        with self._lock:
+            self._touch(f"IMAGE:{len(image_jpeg)}")
+            self._state["face"] = "sprite"
+            self._state["image_bytes"] = len(image_jpeg)
+            return {"status": "ok", "image": len(image_jpeg), "simulator": True}
+
+    def capture(self, timeout: float = 5.0) -> dict:
+        try:
+            from PIL import Image, ImageDraw
+        except Exception as exc:
+            return {"status": "error", "error": f"PIL unavailable: {exc}"}
+        with self._lock:
+            self._touch("CAPTURE")
+            image = Image.new("RGB", (320, 240), (235, 241, 244))
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((0, 160, 320, 240), fill=(214, 225, 219))
+            draw.ellipse((92, 45, 228, 181), fill=(248, 248, 243), outline=(45, 50, 55), width=4)
+            draw.ellipse((128, 96, 144, 112), fill=(30, 35, 38))
+            draw.ellipse((176, 96, 192, 112), fill=(30, 35, 38))
+            draw.arc((130, 104, 190, 146), 15, 165, fill=(30, 35, 38), width=3)
+            draw.text((10, 12), "xangi-stackchan simulator", fill=(45, 50, 55))
+            buf = io.BytesIO()
+            image.save(buf, format="JPEG", quality=85)
+            jpeg = buf.getvalue()
+            return {
+                "status": "ok",
+                "size": len(jpeg),
+                "format": "jpeg",
+                "width": 320,
+                "height": 240,
+                "captured_at_device_ms": int(time.time() * 1000),
+                "captured_at": time.time(),
+                "image_jpeg": jpeg,
+                "simulator": True,
+            }
+
+
 @dataclass
 class StackchanConfig:
     wifi: bool = False
+    simulator: bool = False
     host: str = DEFAULT_WIFI_HOST
     port: str = ""
     baud: int = DEFAULT_BAUD
@@ -1028,6 +1209,8 @@ def apply_profile_defaults(config: StackchanConfig) -> StackchanConfig:
 
 
 def create_backend(config: StackchanConfig):
+    if config.simulator:
+        return StackchanSimulator()
     if config.wifi:
         return StackchanWifi(config.host)
     backend = StackchanSerial(config.port or detect_serial_port(), config.baud)

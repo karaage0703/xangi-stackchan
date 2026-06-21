@@ -1049,6 +1049,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-retry-seconds", type=float, default=30.0)
 
     parser.add_argument("--wifi", action="store_true")
+    parser.add_argument(
+        "--simulator",
+        action="store_true",
+        help="USB/WiFi デバイスに接続せず、ブラウザ /simulator 用の in-memory "
+        "バックエンドを使う。実機なしで FACE/MOVE/WAV/PUZZLE の流れを確認する。",
+    )
     parser.add_argument("--host", default=DEFAULT_WIFI_HOST)
     parser.add_argument("--port", default="")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD)
@@ -1243,6 +1249,7 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
         thread_id=args.thread_id,
         stackchan=StackchanConfig(
             wifi=args.wifi,
+            simulator=args.simulator,
             host=args.host,
             port=args.port,
             baud=args.baud,

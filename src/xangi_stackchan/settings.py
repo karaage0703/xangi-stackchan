@@ -84,6 +84,7 @@ def config_to_dict(config: BridgeConfig) -> dict[str, Any]:
         "xangi_url": config.xangi_url,
         "thread_id": config.thread_id or "",
         "wifi": config.stackchan.wifi,
+        "simulator": config.stackchan.simulator,
         "host": config.stackchan.host,
         "port": config.stackchan.port,
         "baud": config.stackchan.baud,
@@ -182,6 +183,7 @@ def merge_config(base: BridgeConfig, data: dict[str, Any]) -> BridgeConfig:
     stackchan = replace(
         base.stackchan,
         wifi=_bool(data.get("wifi", base.stackchan.wifi)),
+        simulator=_bool(data.get("simulator", base.stackchan.simulator)),
         host=str(data.get("host", base.stackchan.host)),
         port=str(data.get("port", base.stackchan.port)),
         baud=_int_or(data.get("baud"), base.stackchan.baud),

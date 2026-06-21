@@ -63,6 +63,20 @@ uv run xangi-stackchan \
 
 起動すると設定 UI が `http://127.0.0.1:7897/` で立ち上がる。xangi URL / 接続先 / 音量 / TTS / 表情をブラウザから変更でき、保存すると `~/.xangi/xangi-stackchan/config.json` に永続化される。
 
+### 実機なしでブラウザシミュレータを開く
+
+スタックチャンが手元に無いときは `--simulator` で USB/WiFi に接続しない in-memory backend を起動できる。既存の xangi SSE 処理・FACE/MOVE/WAV/PUZZLE コマンドはそのまま流れ、ブラウザ `http://127.0.0.1:7897/simulator` に顔・首角度・ライト・発話状態が反映される。
+
+```bash
+uv run xangi-stackchan \
+  --xangi-url http://127.0.0.1:18888 \
+  --simulator \
+  --speak-platforms web \
+  --tts piper
+```
+
+シミュレータ画面のボタンや `POST /api/simulator/command` から `FACE:happy` / `MOVE:20,8` / `PUZZLE:thinking` などのプロトコルコマンドを手動送信できる。`/api/simulator/state` は現在状態を JSON で返すので、UI 開発やデモの確認にも使える。xangi Web UI の入力に反応させたい場合は `--thread-id` を付けず、`--speak-platforms web` で Discord 等のイベントだけを除外する。音声をブラウザで鳴らすには `--tts piper` / `--tts voicevox` で起動し、シミュレータ画面の `enable audio` を一度押す。
+
 ## 複数台で動かす
 
 xangi-stackchan は同じマシンで複数プロセスを並列起動できる (1 プロセス = 1 スタックチャン)。
