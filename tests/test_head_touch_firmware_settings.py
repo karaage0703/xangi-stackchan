@@ -53,3 +53,18 @@ def test_host_head_pet_mode_keeps_avatar_and_suppresses_builtin_sound():
         "HEADTOUCH_AVATAR:on",
         "HEADPET_SOUND:off",
     ]
+
+
+def test_firmware_settings_helper_returns_command_results():
+    backend = FakeBackend()
+
+    result = _apply_head_touch_firmware_settings(
+        backend,
+        suppress_head_touch_avatar=False,
+        suppress_head_pet_sound=True,
+    )
+
+    assert result == {
+        "head_touch_avatar": {"status": "ok"},
+        "head_pet_sound": {"status": "ok"},
+    }

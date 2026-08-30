@@ -1,0 +1,87 @@
+diff --git a/components/microlink/src/ml_wg_mgr.c b/components/microlink/src/ml_wg_mgr.c
+index ed40942..c5ec795 100644
+--- a/components/microlink/src/ml_wg_mgr.c
++++ b/components/microlink/src/ml_wg_mgr.c
+@@ -195,11 +195,19 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
+              (int)dest_port,
+              len >= 1 ? data[0] : -1);
+ 
+-    /* Use raw PCB to send — safe from any thread context */
++    /* Raw lwIP APIs require the core lock when the callback runs from the WG
++     * manager task. The ESP-IDF lock is not recursive, so do not take it
++     * again when TCP output invokes this callback while already holding it. */
+     if (!s_wg_output_pcb) return ERR_CONN;
+
++    bool needs_core_lock =
++        !sys_thread_tcpip(LWIP_CORE_LOCK_QUERY_HOLDER);
++    if (needs_core_lock) LOCK_TCPIP_CORE();
+     struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, len, PBUF_RAM);
+-    if (!p) return ERR_MEM;
++    if (!p) {
++        if (needs_core_lock) UNLOCK_TCPIP_CORE();
++        return ERR_MEM;
++    }
+     memcpy(p->payload, data, len);
+ 
+     ip_addr_t dst;
+@@ -207,6 +214,7 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
+ 
+     err_t err = udp_sendto(s_wg_output_pcb, p, &dst, dest_port);
+     pbuf_free(p);
++    if (needs_core_lock) UNLOCK_TCPIP_CORE();
+     return err;
+ }
+ 
+@@ -233,6 +241,10 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
+     wg_init.listen_port = 51820;
+     wg_init.bind_netif = NULL;
+ 
++    /* Registration is initiated by the WG manager task rather than lwIP's
++     * tcpip thread, so protect netif and raw-PCB operations. */
++    LOCK_TCPIP_CORE();
++
+     /* Disable internal socket binding (we use magicsock mode) */
+     wireguardif_disable_socket_bind();
+ 
+@@ -241,6 +254,7 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
+     err_t err = wireguardif_init(netif);
+     if (err != ERR_OK) {
+         ESP_LOGE(TAG, "wireguardif_init failed: %d", err);
++        UNLOCK_TCPIP_CORE();
+         free(netif);
+         return ESP_FAIL;
+     }
+@@ -288,6 +302,8 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
+         }
+     }
+ 
++    UNLOCK_TCPIP_CORE();
++
+     /* Register output callbacks for magicsock mode */
+     wireguardif_set_derp_output(netif, wg_derp_output_cb, ml);
+     wireguardif_set_udp_output(netif, wg_udp_output_cb, ml);
+@@ -1619,7 +1635,9 @@ void ml_wg_mgr_task(void *arg) {
+         uint64_t now = ml_get_time_ms();
+         if (ml->wg_netif && now - last_wg_periodic_ms >= 400) {
+             uint64_t t0 = now;
++            LOCK_TCPIP_CORE();
+             wireguardif_periodic((struct netif *)ml->wg_netif);
++            UNLOCK_TCPIP_CORE();
+             uint64_t dt = ml_get_time_ms() - t0;
+             last_wg_periodic_ms = now;
+             ESP_LOGI(TAG, "wireguardif_periodic: %llu ms", (unsigned long long)dt);
+@@ -1642,11 +1660,13 @@ void ml_wg_mgr_task(void *arg) {
+     /* Shutdown WireGuard interface */
+     if (ml->wg_netif) {
+         struct netif *netif = (struct netif *)ml->wg_netif;
++        LOCK_TCPIP_CORE();
+         wireguardif_shutdown(netif);
+         netif_set_link_down(netif);
+         netif_set_down(netif);
+-        vTaskDelay(pdMS_TO_TICKS(100));
+         netif_remove(netif);
++        UNLOCK_TCPIP_CORE();
++        vTaskDelay(pdMS_TO_TICKS(100));
+         free(netif);
+         ml->wg_netif = NULL;
+     }

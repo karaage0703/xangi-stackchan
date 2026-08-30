@@ -47,6 +47,7 @@ firmware/
 - [m5stack/M5Unified](https://github.com/m5stack/M5Unified) (MIT)
 - [m5stack/M5CoreS3](https://github.com/m5stack/M5CoreS3) (MIT) — CoreS3 内蔵カメラ用、`cores3-main` のみ
 - [meganetaaan/M5Stack-Avatar](https://github.com/stack-chan/m5stack-avatar) (MIT)
+- [CamM2325/MicroLink](https://github.com/CamM2325/microlink) — `cores3-main-tailnet` のみ。setup script が固定 commit を取得
 - `lib/scservo/` (Apache-2.0、本リポ同梱、`docs/scservo_protocol.md` のプロトコル仕様に基づく Arduino C++ 実装)
 
 ## ビルド・書き込み
@@ -55,6 +56,11 @@ firmware/
 cd firmware
 pio run                              # default = cores3-main をビルド
 pio run -e cores3-main -t upload     # K151 / K151-R / CoreS3 単体に書き込み
+./scripts/setup_microlink.sh          # Tailnet版の固定依存を取得
+cp examples/cores3/main/tailnet_secrets.h.example \
+   examples/cores3/main/tailnet_secrets.h
+# tailnet_secrets.h を編集してから:
+pio run -e cores3-main-tailnet -t upload
 pio run -e atoms3r-main -t upload    # AtomS3R に書き込み
 pio run -e basic-main -t upload      # M5Stack Basic (アールティ Ver.β) に書き込み
 pio device monitor -e <env>          # シリアルログ確認
@@ -72,6 +78,10 @@ xangi シリアル経由で WAV 再生 + Avatar 表情・口パク + サーボ�
 - スプライト表示: ホスト側の `spritesheet.webp` は `.gitignore` 対象。初回だけ `SIMG` でフレーム JPEG を PSRAM にキャッシュし、以後は `SFRAME` で slot を切り替えて LCD 転送量を抑える
 
 Python 側は `src/xangi_stackchan/stackchan.py` の `StackchanSerial` がそのまま使える (baud 921600 一致)。テストは `scripts/test_xangi_bridge.py`。
+
+`cores3-main-tailnet` は同じ `main.cpp` にMicroLinkを追加した実験env。CoreS3がWi-FiからTailnetへ参加し、DGX Spark上のreverse TCP listenerへ自発接続する。接続先にはpeer slotを確実に予約できるTailnet IPv4（`100.x.y.z`）の指定を推奨。`STATUS / VOLUME / FACE / MOVE`、WAV再生、LCDマイクイベント、16kHz PCM録音を無線化し、USBシリアルはフォールバックとして同時に残す。画像・カメラ転送は未対応。
+
+認証情報はgitignore対象の `tailnet_secrets.h` にだけ置く。初回登録用のTailscale auth keyは短命・再利用不可を推奨し、登録後のmachine/WireGuard keyはMicroLinkがNVSへ保存する。
 
 ### cores3/home-calibration
 

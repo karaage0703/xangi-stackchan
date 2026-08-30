@@ -1,7 +1,7 @@
 """faster-whisper / openai-whisper による Speech-to-Text。
 
 CoreS3 内蔵マイクから取得した 16kHz/16bit/mono PCM (WAV ラップ済) を text に
-変換する。voice_conversation モジュールが head_touch press → 録音 →
+変換する。voice_conversation モジュールがLCDマイク入力 → 録音 →
 無音検出 → STT → xangi `/api/chat` 投入の経路で利用する。
 
 バックエンド自動選択:
@@ -33,16 +33,16 @@ import threading
 import time
 import wave
 
-DEFAULT_MODEL    = os.environ.get("STACKCHAN_WHISPER_MODEL", "small")
+DEFAULT_MODEL = os.environ.get("STACKCHAN_WHISPER_MODEL", "small")
 # auto = ctranslate2 が CUDA 非対応でも torch-cuda にフォールバックさせるため既定を auto に。
-DEFAULT_DEVICE   = os.environ.get("STACKCHAN_WHISPER_DEVICE", "auto")
-DEFAULT_COMPUTE  = os.environ.get("STACKCHAN_WHISPER_COMPUTE", "int8")
+DEFAULT_DEVICE = os.environ.get("STACKCHAN_WHISPER_DEVICE", "auto")
+DEFAULT_COMPUTE = os.environ.get("STACKCHAN_WHISPER_COMPUTE", "int8")
 DEFAULT_LANGUAGE = os.environ.get("STACKCHAN_WHISPER_LANGUAGE", "ja")
-DEFAULT_BEAM     = int(os.environ.get("STACKCHAN_WHISPER_BEAM", "3"))
+DEFAULT_BEAM = int(os.environ.get("STACKCHAN_WHISPER_BEAM", "3"))
 # Silero VAD で発話区間のみ STT。ノイズ・無音の hallucination
 # (「ご視聴ありがとうございました」「エンディング」等) を抑える + 30倍高速。
 # faster-whisper 経路のみ有効 (openai-whisper は内蔵 VAD 非対応)。
-DEFAULT_VAD      = os.environ.get("STACKCHAN_WHISPER_VAD", "1") not in ("0", "false", "")
+DEFAULT_VAD = os.environ.get("STACKCHAN_WHISPER_VAD", "1") not in ("0", "false", "")
 
 # backend: "faster-whisper" | "openai-whisper"
 _model = None
@@ -65,7 +65,10 @@ def _detect_backend(requested_device: str) -> tuple[str, str]:
     try:
         import ctranslate2
 
-        if ctranslate2.get_cuda_device_count() > 0 and ctranslate2.get_supported_compute_types("cuda"):
+        if (
+            ctranslate2.get_cuda_device_count() > 0
+            and ctranslate2.get_supported_compute_types("cuda")
+        ):
             return "cuda", "faster-whisper"
     except Exception:
         pass

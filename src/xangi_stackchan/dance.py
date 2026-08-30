@@ -68,7 +68,9 @@ def wav_duration_seconds(wav_bytes: bytes) -> float:
         return 0.0
 
 
-def resolve_pattern(preset_name: str, bpm_override: float | None = None) -> DancePattern:
+def resolve_pattern(
+    preset_name: str, bpm_override: float | None = None
+) -> DancePattern:
     if preset_name not in PRESETS:
         raise ValueError(f"unknown preset: {preset_name}; choices={sorted(PRESETS)}")
     pattern: DancePattern = dict(PRESETS[preset_name])  # type: ignore[assignment]
@@ -92,7 +94,9 @@ class DanceLoop:
         self._pattern = pattern
         self._idle_yaw = idle_yaw
         self._idle_pitch = idle_pitch
-        self._send_interval = max(0.05, 60.0 / float(pattern["bpm"]) * send_interval_factor)
+        self._send_interval = max(
+            0.05, 60.0 / float(pattern["bpm"]) * send_interval_factor
+        )
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._current: list[float | None] = [None, None]
@@ -164,7 +168,12 @@ def synthesize_text(
         return list(zip(chunks, wavs))
     if config.tts == "voicevox":
         return [
-            (chunk, voicevox_synthesize(chunk, config.voicevox_url, config.voicevox_speaker))
+            (
+                chunk,
+                voicevox_synthesize(
+                    chunk, config.voicevox_url, config.voicevox_speaker
+                ),
+            )
             for chunk in chunks
         ]
     raise RuntimeError(f"dance demo requires TTS (got tts={config.tts})")
@@ -197,11 +206,7 @@ def _status_lights_supported(backend, config: BridgeConfig) -> list[str]:
         status = backend.send_command("STATUS")
     except Exception:
         return []
-    return [
-        command
-        for command, status_key in STATUS_LIGHTS
-        if status.get(status_key)
-    ]
+    return [command for command, status_key in STATUS_LIGHTS if status.get(status_key)]
 
 
 def _send_status_lights(backend, commands: list[str], pattern: str) -> None:
@@ -212,9 +217,13 @@ def _send_status_lights(backend, commands: list[str], pattern: str) -> None:
     for command in commands:
         try:
             result = backend.send_command(f"{command}:{pattern}")
-            print(f"[dance] {command}:{pattern} -> {result}", file=sys.stderr, flush=True)
+            print(
+                f"[dance] {command}:{pattern} -> {result}", file=sys.stderr, flush=True
+            )
         except Exception as exc:
-            print(f"[dance] {command}:{pattern} error: {exc}", file=sys.stderr, flush=True)
+            print(
+                f"[dance] {command}:{pattern} error: {exc}", file=sys.stderr, flush=True
+            )
 
 
 def _send_demo_face(backend, config: BridgeConfig, expression: str) -> None:

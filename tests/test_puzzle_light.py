@@ -31,7 +31,7 @@ def _config() -> BridgeConfig:
     return BridgeConfig(
         xangi_url="http://127.0.0.1:18888",
         thread_id=None,
-        stackchan=StackchanConfig(wifi=False, host="", port="/dev/null", baud=921600),
+        stackchan=StackchanConfig(port="/dev/null", baud=921600),
         volume=128,
         tts="none",
         piper_bin="",

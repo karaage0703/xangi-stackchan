@@ -19,3 +19,10 @@ assets/pets/**/*.webp
 assets/pets/**/*.png
 assets/pets/**/*.jpg
 assets/pets/**/*.jpeg
+
+# Firmware dependencies fetched at pinned commits by setup scripts.
+firmware/.deps/
+firmware/.pio/
+
+# Local Wi-Fi / Tailscale credentials for the CoreS3 Tailnet firmware.
+firmware/examples/cores3/main/tailnet_secrets.h

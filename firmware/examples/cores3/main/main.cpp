@@ -47,15 +47,32 @@
 #include <esp_camera.h>
 #include <esp_system.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "SCServo.h"
 #include "Si12T.h"
 #include "nade_voices.h"
+
+#ifdef XANGI_STACKCHAN_TAILNET
+#include <WiFi.h>
+#include "microlink.h"
+
+#if __has_include("tailnet_secrets.h")
+#include "tailnet_secrets.h"
+#else
+#define XANGI_TAILNET_WIFI_SSID ""
+#define XANGI_TAILNET_WIFI_PASSWORD ""
+#define XANGI_TAILNET_AUTH_KEY ""
+#define XANGI_TAILNET_SERVER ""
+#define XANGI_TAILNET_PORT 18765
+#endif
+#endif
 
 using m5avatar::Avatar;
 using m5avatar::Expression;
@@ -165,6 +182,206 @@ static State g_state = State::Booting;
 // boot banner と STATUS の "reset_reason" で host から参照できる。再起動の瞬間の
 // シリアルログは USB 再列挙で host に届かないことが多いので、次回 boot に痕跡を残す。
 static esp_reset_reason_t g_reset_reason = ESP_RST_UNKNOWN;
+
+#ifdef XANGI_STACKCHAN_TAILNET
+static inline void serialLock();
+static inline void serialUnlock();
+static void tailnetTransportLoop();
+
+static microlink_t* g_microlink = nullptr;
+static TaskHandle_t g_tailnet_task = nullptr;
+static QueueHandle_t g_tailnet_command_queue = nullptr;
+static QueueHandle_t g_tailnet_response_queue = nullptr;
+static QueueHandle_t g_tailnet_outgoing_queue = nullptr;
+static bool g_capture_tailnet_response = false;
+static char g_tailnet_response[768];
+static uint8_t* g_tailnet_response_binary = nullptr;
+static size_t g_tailnet_response_binary_len = 0;
+static char g_tailnet_response_binary_kind[8] = {};
+
+struct TailnetCommand {
+    char line[MAX_LINE_LEN];
+    uint8_t* binary = nullptr;
+    size_t binary_len = 0;
+};
+
+struct TailnetResponse {
+    char line[sizeof(g_tailnet_response)];
+    uint8_t* binary = nullptr;
+    size_t binary_len = 0;
+    char binary_kind[8] = {};
+};
+
+constexpr size_t TAILNET_OUTGOING_MAX = MIC_CHUNK_BYTES + 32;
+struct TailnetOutgoing {
+    size_t len;
+    uint8_t data[TAILNET_OUTGOING_MAX];
+};
+
+static void queueTailnetLine(const char* line) {
+    if (g_tailnet_outgoing_queue == nullptr) return;
+    const size_t len = strlen(line);
+    if (len + 1 > TAILNET_OUTGOING_MAX) return;
+    TailnetOutgoing outgoing{};
+    outgoing.len = len + 1;
+    memcpy(outgoing.data, line, len);
+    outgoing.data[len] = '\n';
+    xQueueSend(g_tailnet_outgoing_queue, &outgoing, 0);
+}
+
+constexpr uint32_t TAILNET_WIFI_TIMEOUT_MS = 30000;
+
+static const char* tailnetStateName(microlink_state_t state) {
+    switch (state) {
+        case ML_STATE_IDLE:         return "idle";
+        case ML_STATE_WIFI_WAIT:    return "wifi_wait";
+        case ML_STATE_CONNECTING:   return "connecting";
+        case ML_STATE_REGISTERING:  return "registering";
+        case ML_STATE_CONNECTED:    return "connected";
+        case ML_STATE_RECONNECTING: return "reconnecting";
+        case ML_STATE_ERROR:        return "error";
+        default:                    return "unknown";
+    }
+}
+
+static void tailnetStateCallback(microlink_t* ml, microlink_state_t state,
+                                 void* /*user_data*/) {
+    char vpn_ip[16] = "0.0.0.0";
+    if (state == ML_STATE_CONNECTED) {
+        microlink_ip_to_str(microlink_get_vpn_ip(ml), vpn_ip);
+    }
+    serialLock();
+    Serial.printf("{\"event\":\"tailnet_state\",\"state\":\"%s\",\"ip\":\"%s\"}\n",
+                  tailnetStateName(state), vpn_ip);
+    serialUnlock();
+}
+
+static void tailnetTask(void* /*param*/) {
+    if (XANGI_TAILNET_WIFI_SSID[0] == '\0' || XANGI_TAILNET_AUTH_KEY[0] == '\0') {
+        serialLock();
+        Serial.println("[tailnet] disabled: create tailnet_secrets.h from the example");
+        serialUnlock();
+        g_tailnet_task = nullptr;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    uint32_t wifi_attempt = 0;
+    while (WiFi.status() != WL_CONNECTED) {
+        ++wifi_attempt;
+        // A failed Arduino STA connection can leave the radio retrying with
+        // stale scan state. Recreate the STA interface before every bounded
+        // attempt so a phone hotspot that temporarily disappeared can be
+        // discovered later without rebooting the CoreS3. USB remains usable
+        // while this background task waits.
+        WiFi.disconnect(true, false);
+        vTaskDelay(pdMS_TO_TICKS(250));
+        WiFi.mode(WIFI_STA);
+        WiFi.setSleep(false);
+        const int16_t network_count = WiFi.scanNetworks(false, true);
+        int16_t target_index = -1;
+        for (int16_t i = 0; i < network_count; ++i) {
+            if (WiFi.SSID(i) == XANGI_TAILNET_WIFI_SSID) {
+                target_index = i;
+                break;
+            }
+        }
+        serialLock();
+        if (target_index >= 0) {
+            Serial.printf("[tailnet] Wi-Fi scan: target found, networks=%d,"
+                          " rssi=%ld, channel=%d\n",
+                          network_count,
+                          static_cast<long>(WiFi.RSSI(target_index)),
+                          WiFi.channel(target_index));
+        } else {
+            Serial.printf("[tailnet] Wi-Fi scan: target missing, networks=%d\n",
+                          network_count);
+        }
+        serialUnlock();
+        WiFi.scanDelete();
+        WiFi.begin(XANGI_TAILNET_WIFI_SSID, XANGI_TAILNET_WIFI_PASSWORD);
+        serialLock();
+        Serial.printf("[tailnet] connecting Wi-Fi: %s (attempt %lu)\n",
+                      XANGI_TAILNET_WIFI_SSID,
+                      static_cast<unsigned long>(wifi_attempt));
+        serialUnlock();
+
+        const uint32_t started_ms = millis();
+        while (WiFi.status() != WL_CONNECTED &&
+               millis() - started_ms < TAILNET_WIFI_TIMEOUT_MS) {
+            vTaskDelay(pdMS_TO_TICKS(250));
+        }
+        if (WiFi.status() != WL_CONNECTED) {
+            serialLock();
+            Serial.printf("{\"event\":\"tailnet_error\","
+                          "\"error\":\"wifi timeout\",\"attempt\":%lu}\n",
+                          static_cast<unsigned long>(wifi_attempt));
+            serialUnlock();
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        }
+    }
+
+    // WireGuard handshake timestamps must remain newer than those sent before
+    // a reboot. Uptime resets to zero and is rejected by the peer as a replay,
+    // so wait for wall-clock synchronization before starting MicroLink.
+    configTime(0, 0, "pool.ntp.org", "time.google.com");
+    uint32_t time_attempt = 0;
+    while (time(nullptr) < 1700000000) {
+        ++time_attempt;
+        const uint32_t started_ms = millis();
+        while (time(nullptr) < 1700000000 &&
+               millis() - started_ms < TAILNET_WIFI_TIMEOUT_MS) {
+            vTaskDelay(pdMS_TO_TICKS(250));
+        }
+        if (time(nullptr) < 1700000000) {
+            serialLock();
+            Serial.printf("{\"event\":\"tailnet_error\","
+                          "\"error\":\"time sync timeout\",\"attempt\":%lu}\n",
+                          static_cast<unsigned long>(time_attempt));
+            serialUnlock();
+        }
+    }
+    serialLock();
+    Serial.printf("[tailnet] time synchronized: %lld\n",
+                  static_cast<long long>(time(nullptr)));
+    serialUnlock();
+
+    const microlink_config_t config = {
+        .auth_key = XANGI_TAILNET_AUTH_KEY,
+        .device_name = microlink_default_device_name(),
+        .enable_derp = true,
+        .enable_stun = true,
+        .enable_disco = true,
+        .max_peers = CONFIG_ML_MAX_PEERS,
+        .wifi_tx_power_dbm = 0,
+        .priority_peer_ip = microlink_parse_ip(XANGI_TAILNET_SERVER),
+        .disco_heartbeat_ms = 0,
+        .stun_interval_ms = 0,
+        .ctrl_watchdog_ms = 0,
+    };
+    g_microlink = microlink_init(&config);
+    if (g_microlink == nullptr) {
+        serialLock();
+        Serial.println("{\"event\":\"tailnet_error\",\"error\":\"microlink init failed\"}");
+        serialUnlock();
+        g_tailnet_task = nullptr;
+        vTaskDelete(nullptr);
+        return;
+    }
+    microlink_set_state_callback(g_microlink, tailnetStateCallback, nullptr);
+    const esp_err_t err = microlink_start(g_microlink);
+    if (err != ESP_OK) {
+        serialLock();
+        Serial.printf("{\"event\":\"tailnet_error\",\"error\":\"start failed\","
+                      "\"esp_err\":%ld}\n", static_cast<long>(err));
+        serialUnlock();
+    } else {
+        tailnetTransportLoop();
+    }
+    g_tailnet_task = nullptr;
+    vTaskDelete(nullptr);
+}
+#endif
 
 static const char* resetReasonStr(esp_reset_reason_t r) {
     switch (r) {
@@ -534,35 +751,52 @@ static bool exprFromString(const char* s, Expression& out) {
     return false;
 }
 
-// === シリアル送信 ============================================================
+// === コマンド応答 ============================================================
 // ESP32 Arduino の Serial.printf / println は内部 TX buffer に書くだけで自動 flush
 // しない。応答が「次の応答までまとめて batch 送信」されると host 側 send_command の
 // expect_line が timeout して順序がズレる (2026-05-27 23:27 で発覚)。各 ack 関数の
 // 末尾で Serial.flush() を呼んで即時送信する。
-static void sendAckOk(const char* extra = nullptr) {
-    if (extra) {
-        Serial.printf("{\"status\":\"ok\",%s}\n", extra);
-    } else {
-        Serial.println("{\"status\":\"ok\"}");
+// Tailnet command は main loop で実行し、同じ JSON 応答を queue へ capture する。
+static void sendResponseLine(const char* line) {
+#ifdef XANGI_STACKCHAN_TAILNET
+    if (g_capture_tailnet_response) {
+        snprintf(g_tailnet_response, sizeof(g_tailnet_response), "%s", line);
+        return;
     }
+#endif
+    Serial.println(line);
     Serial.flush();
+}
+
+static void sendAckOk(const char* extra = nullptr) {
+    char line[256];
+    if (extra) {
+        snprintf(line, sizeof(line), "{\"status\":\"ok\",%s}", extra);
+    } else {
+        snprintf(line, sizeof(line), "{\"status\":\"ok\"}");
+    }
+    sendResponseLine(line);
 }
 
 static void sendAckError(const char* err) {
-    Serial.printf("{\"status\":\"error\",\"error\":\"%s\"}\n", err);
-    Serial.flush();
+    char line[192];
+    snprintf(line, sizeof(line), "{\"status\":\"error\",\"error\":\"%s\"}", err);
+    sendResponseLine(line);
 }
 
 static void sendAckUnsupported(const char* cmd) {
-    Serial.printf("{\"status\":\"unsupported\",\"cmd\":\"%s\"}\n", cmd);
-    Serial.flush();
+    char line[192];
+    snprintf(line, sizeof(line), "{\"status\":\"unsupported\",\"cmd\":\"%s\"}", cmd);
+    sendResponseLine(line);
 }
 
 // === コマンド処理 ============================================================
 
 static void handleStatus() {
     updateBatteryInfo(true);
-    Serial.printf("{\"state\":\"%s\",\"volume\":%u,\"version\":\"cores3-main-0.23\","
+    char line[768];
+    snprintf(line, sizeof(line),
+                  "{\"state\":\"%s\",\"volume\":%u,\"version\":\"cores3-main-0.24\","
                   "\"servo\":%s,\"torque\":%s,\"camera\":%s,\"head_touch\":%s,"
                   "\"puzzle\":%s,\"puzzle_pattern\":\"%s\","
                   "\"stack_led\":%s,\"stack_led_pattern\":\"%s\","
@@ -592,7 +826,7 @@ static void handleStatus() {
                     (g_battery_charging == m5::Power_Class::is_discharging ? "discharging" : "unknown"),
                   resetReasonStr(g_reset_reason),
                   static_cast<unsigned long>(millis()));
-    Serial.flush();
+    sendResponseLine(line);
 }
 
 static uint32_t puzzleColor(uint8_t r, uint8_t g, uint8_t b) {
@@ -781,12 +1015,22 @@ static void handleCapture() {
 
     // バイナリ送信ヘッダ → JPEG 本体 → ack。ホスト側 (StackchanSerial.capture)
     // は "IMG:<size>\n" 受けたら <size> bytes バイナリ読み → 行頭が `{` の ack を待つ。
-    Serial.printf("IMG:%u\n", static_cast<unsigned>(out_jpg_len));
-    Serial.flush();
-    // 1 chunk で全部書き出す (256KB 上限なので 921600bps でも数百 ms)。
-    Serial.write(out_jpg, out_jpg_len);
-    Serial.flush();
-    free(out_jpg);
+#ifdef XANGI_STACKCHAN_TAILNET
+    if (g_capture_tailnet_response) {
+        g_tailnet_response_binary = out_jpg;
+        g_tailnet_response_binary_len = out_jpg_len;
+        snprintf(g_tailnet_response_binary_kind,
+                 sizeof(g_tailnet_response_binary_kind), "IMG");
+    } else
+#endif
+    {
+        Serial.printf("IMG:%u\n", static_cast<unsigned>(out_jpg_len));
+        Serial.flush();
+        // 1 chunk で全部書き出す (256KB 上限なので 921600bps でも数百 ms)。
+        Serial.write(out_jpg, out_jpg_len);
+        Serial.flush();
+        free(out_jpg);
+    }
 
     char extra[160];
     snprintf(extra, sizeof(extra),
@@ -886,8 +1130,289 @@ static void handleFace(const char* arg) {
     sendAckOk(extra);
 }
 
+#ifdef XANGI_STACKCHAN_TAILNET
+static uint32_t resolveTailnetServer() {
+    uint32_t ip = microlink_parse_ip(XANGI_TAILNET_SERVER);
+    if (ip == 0) {
+        ip = microlink_resolve(g_microlink, XANGI_TAILNET_SERVER);
+    }
+    return ip;
+}
+
+static bool sendTailnetLine(microlink_tcp_socket_t* sock, const char* line) {
+    if (microlink_tcp_send(sock, line, strlen(line)) != ESP_OK) return false;
+    return microlink_tcp_send(sock, "\n", 1) == ESP_OK;
+}
+
+static void tailnetTransportLoop() {
+    if (XANGI_TAILNET_SERVER[0] == '\0') {
+        serialLock();
+        Serial.println("[tailnet] command transport disabled: server is empty");
+        serialUnlock();
+        return;
+    }
+
+    for (;;) {
+        if (!microlink_is_connected(g_microlink)) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        const uint32_t server_ip = resolveTailnetServer();
+        if (server_ip == 0) {
+            serialLock();
+            Serial.println("[tailnet] command bridge: server resolve pending");
+            serialUnlock();
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            continue;
+        }
+
+        char server_ip_text[16];
+        microlink_ip_to_str(server_ip, server_ip_text);
+        serialLock();
+        Serial.printf("[tailnet] command bridge: connecting to %s:%u\n",
+                      server_ip_text, XANGI_TAILNET_PORT);
+        serialUnlock();
+        microlink_tcp_socket_t* sock = microlink_tcp_connect(
+            g_microlink, server_ip, XANGI_TAILNET_PORT, 15000);
+        if (sock == nullptr) {
+            serialLock();
+            Serial.println("[tailnet] command bridge: connect failed, retrying");
+            serialUnlock();
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            continue;
+        }
+
+        char ip[16];
+        microlink_ip_to_str(microlink_get_vpn_ip(g_microlink), ip);
+        char hello[160];
+        snprintf(hello, sizeof(hello),
+                 "{\"event\":\"stackchan_connected\",\"device\":\"%s\","
+                 "\"ip\":\"%s\",\"protocol\":3}",
+                 microlink_default_device_name(), ip);
+        if (!sendTailnetLine(sock, hello)) {
+            microlink_tcp_close(sock);
+            continue;
+        }
+
+        serialLock();
+        Serial.printf("[tailnet] command bridge connected to %s:%u\n",
+                      XANGI_TAILNET_SERVER, XANGI_TAILNET_PORT);
+        serialUnlock();
+
+        char receive_buffer[256];
+        char line[MAX_LINE_LEN];
+        size_t line_len = 0;
+        uint8_t* wav_data = nullptr;
+        size_t wav_expected = 0;
+        size_t wav_received = 0;
+        uint32_t wav_last_byte_ms = 0;
+        char binary_command[MAX_LINE_LEN] = {};
+        while (microlink_tcp_is_connected(sock)) {
+            TailnetOutgoing outgoing{};
+            while (g_tailnet_outgoing_queue != nullptr &&
+                   xQueueReceive(g_tailnet_outgoing_queue, &outgoing, 0) == pdTRUE) {
+                if (microlink_tcp_send(sock, outgoing.data, outgoing.len) != ESP_OK) break;
+            }
+            const int count = microlink_tcp_recv(
+                sock, receive_buffer, sizeof(receive_buffer), 50);
+            if (count < 0) break;
+            if (count == 0) {
+                if (wav_data != nullptr &&
+                    millis() - wav_last_byte_ms > WAV_CHUNK_TIMEOUT_MS) {
+                    free(wav_data);
+                    wav_data = nullptr;
+                    wav_expected = 0;
+                    wav_received = 0;
+                    sendTailnetLine(sock,
+                        "{\"status\":\"error\",\"error\":\"recv timeout\"}");
+                }
+                continue;
+            }
+
+            for (int i = 0; i < count; ++i) {
+                if (wav_data != nullptr) {
+                    wav_data[wav_received++] = static_cast<uint8_t>(receive_buffer[i]);
+                    wav_last_byte_ms = millis();
+                    if (wav_received == wav_expected) {
+                        if (strncmp(binary_command, "WAV:", 4) == 0 &&
+                            wavQueuePush(wav_data, wav_received)) {
+                            char ack[96];
+                            snprintf(ack, sizeof(ack),
+                                     "{\"status\":\"ok\",\"size\":%u,\"queued\":%d}",
+                                     static_cast<unsigned>(wav_received), wavQueueCount());
+                            sendTailnetLine(sock, ack);
+                        } else if (strncmp(binary_command, "WAV:", 4) == 0) {
+                            free(wav_data);
+                            sendTailnetLine(sock,
+                                "{\"status\":\"error\",\"error\":\"queue full after recv\"}");
+                        } else {
+                            TailnetCommand command{};
+                            snprintf(command.line, sizeof(command.line), "%s", binary_command);
+                            command.binary = wav_data;
+                            command.binary_len = wav_received;
+                            if (xQueueSend(g_tailnet_command_queue, &command,
+                                           pdMS_TO_TICKS(1000)) != pdTRUE) {
+                                free(wav_data);
+                                sendTailnetLine(sock,
+                                    "{\"status\":\"error\",\"error\":\"command queue full\"}");
+                            } else {
+                                TailnetResponse response{};
+                                if (xQueueReceive(g_tailnet_response_queue, &response,
+                                                  pdMS_TO_TICKS(10000)) != pdTRUE) {
+                                    sendTailnetLine(sock,
+                                        "{\"status\":\"error\",\"error\":\"command timeout\"}");
+                                } else {
+                                    sendTailnetLine(sock, response.line);
+                                }
+                            }
+                        }
+                        wav_data = nullptr;
+                        wav_expected = 0;
+                        wav_received = 0;
+                    }
+                    continue;
+                }
+                const char c = receive_buffer[i];
+                if (c == '\r') continue;
+                if (c != '\n') {
+                    if (line_len < sizeof(line) - 1) line[line_len++] = c;
+                    continue;
+                }
+                if (line_len == 0) continue;
+                line[line_len] = '\0';
+
+                if (strncmp(line, "WAV:", 4) == 0) {
+                    const long requested = atol(line + 4);
+                    line_len = 0;
+                    if (requested <= 0 || static_cast<size_t>(requested) > MAX_WAV_BYTES) {
+                        sendTailnetLine(sock,
+                            "{\"status\":\"error\",\"error\":\"invalid WAV size\"}");
+                        continue;
+                    }
+                    if (g_mic_recording || wavQueueFull()) {
+                        sendTailnetLine(sock, g_mic_recording
+                            ? "{\"status\":\"error\",\"error\":\"mic recording active\"}"
+                            : "{\"status\":\"error\",\"error\":\"queue full\"}");
+                        continue;
+                    }
+                    wav_data = static_cast<uint8_t*>(ps_malloc(static_cast<size_t>(requested)));
+                    if (wav_data == nullptr) {
+                        sendTailnetLine(sock,
+                            "{\"status\":\"error\",\"error\":\"ps_malloc failed\"}");
+                        continue;
+                    }
+                    wav_expected = static_cast<size_t>(requested);
+                    wav_received = 0;
+                    wav_last_byte_ms = millis();
+                    snprintf(binary_command, sizeof(binary_command), "%s", line);
+                    if (!sendTailnetLine(sock, "{\"status\":\"ready\"}")) break;
+                    continue;
+                }
+
+                if (strncmp(line, "IMAGE:", 6) == 0 ||
+                    strncmp(line, "SIMG:", 5) == 0 ||
+                    strncmp(line, "RECT:", 5) == 0) {
+                    const char* size_text = line + 6;
+                    if (strncmp(line, "SIMG:", 5) == 0 ||
+                        strncmp(line, "RECT:", 5) == 0) {
+                        const char* comma = strrchr(line, ',');
+                        size_text = comma ? comma + 1 : nullptr;
+                    }
+                    const long requested = size_text ? atol(size_text) : -1;
+                    const size_t binary_limit = strncmp(line, "RECT:", 5) == 0
+                        ? MAX_RECT_BYTES : MAX_IMAGE_BYTES;
+                    if (requested <= 0 || static_cast<size_t>(requested) > binary_limit) {
+                        line_len = 0;
+                        sendTailnetLine(sock,
+                            "{\"status\":\"error\",\"error\":\"invalid image size\"}");
+                        continue;
+                    }
+                    wav_data = static_cast<uint8_t*>(ps_malloc(static_cast<size_t>(requested)));
+                    if (wav_data == nullptr) {
+                        line_len = 0;
+                        sendTailnetLine(sock,
+                            "{\"status\":\"error\",\"error\":\"ps_malloc failed\"}");
+                        continue;
+                    }
+                    wav_expected = static_cast<size_t>(requested);
+                    wav_received = 0;
+                    wav_last_byte_ms = millis();
+                    snprintf(binary_command, sizeof(binary_command), "%s", line);
+                    line_len = 0;
+                    if (!sendTailnetLine(sock, "{\"status\":\"ready\"}")) break;
+                    continue;
+                }
+
+                TailnetCommand command{};
+                snprintf(command.line, sizeof(command.line), "%s", line);
+                line_len = 0;
+                if (xQueueSend(g_tailnet_command_queue, &command,
+                               pdMS_TO_TICKS(1000)) != pdTRUE) {
+                    sendTailnetLine(sock,
+                        "{\"status\":\"error\",\"error\":\"command queue full\"}");
+                    continue;
+                }
+
+                TailnetResponse response{};
+                if (xQueueReceive(g_tailnet_response_queue, &response,
+                                  pdMS_TO_TICKS(10000)) != pdTRUE) {
+                    sendTailnetLine(sock,
+                        "{\"status\":\"error\",\"error\":\"command timeout\"}");
+                    continue;
+                }
+                // MIC_STOP waits for micRecordTask to finish. Its final PCM frames are
+                // already queued, so flush them before the stop ack. The host treats
+                // that ack as the exact end-of-stream boundary.
+                if (strcmp(command.line, "MIC_STOP") == 0) {
+                    TailnetOutgoing pending{};
+                    while (g_tailnet_outgoing_queue != nullptr &&
+                           xQueueReceive(g_tailnet_outgoing_queue, &pending, 0) == pdTRUE) {
+                        if (microlink_tcp_send(sock, pending.data, pending.len) != ESP_OK) break;
+                    }
+                }
+                if (response.binary != nullptr && response.binary_len > 0) {
+                    char header[48];
+                    snprintf(header, sizeof(header), "%s:%u",
+                             response.binary_kind,
+                             static_cast<unsigned>(response.binary_len));
+                    if (!sendTailnetLine(sock, header) ||
+                        microlink_tcp_send(sock, response.binary,
+                                           response.binary_len) != ESP_OK) {
+                        free(response.binary);
+                        break;
+                    }
+                    free(response.binary);
+                    response.binary = nullptr;
+                }
+                if (!sendTailnetLine(sock, response.line)) break;
+            }
+        }
+        if (wav_data != nullptr) free(wav_data);
+        microlink_tcp_close(sock);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+#endif
+
 // IMAGE:<size>\n
 // host 側で 320x240 JPEG に変換済みの画像顔を受信して LCD に描画する。
+static void installImageBuffer(uint8_t* buf, size_t size) {
+    releaseOwnedImageFace();
+    g_image_face_jpeg = buf;
+    g_image_face_len = size;
+    g_image_face_owned = true;
+    g_image_face_active = true;
+    g_image_face_dirty = true;
+    avatar.suspend();
+    updateBatteryInfo(true);
+
+    char extra[96];
+    snprintf(extra, sizeof(extra), "\"image\":%u,\"battery_level\":%ld",
+             static_cast<unsigned>(size), static_cast<long>(g_battery_level));
+    sendAckOk(extra);
+    drawImageFace(true);
+}
+
 static void handleImage(size_t size) {
     if (g_mic_recording) {
         sendAckError("mic recording active");
@@ -935,25 +1460,30 @@ static void handleImage(size_t size) {
         }
     }
 
-    releaseOwnedImageFace();
-    g_image_face_jpeg = buf;
-    g_image_face_len = received;
-    g_image_face_owned = true;
-    g_image_face_active = true;
-    g_image_face_dirty = true;
-    avatar.suspend();
-    updateBatteryInfo(true);
-
-    char extra[96];
-    snprintf(extra, sizeof(extra), "\"image\":%u,\"battery_level\":%ld",
-             static_cast<unsigned>(received), static_cast<long>(g_battery_level));
-    sendAckOk(extra);
-    drawImageFace(true);
+    installImageBuffer(buf, received);
 }
 
 // SIMG:<slot>,<size>\n
 // host 側の git 管理外 spritesheet から切り出した JPEG フレームをファーム PSRAM に
 // 一度だけキャッシュする。以後のアニメーションは SFRAME:<slot> だけで描画する。
+static void installSpriteBuffer(int slot, uint8_t* buf, size_t size) {
+    if (g_sprite_cache_jpeg[slot]) {
+        if (g_image_face_jpeg == g_sprite_cache_jpeg[slot]) {
+            g_image_face_jpeg = nullptr;
+            g_image_face_len = 0;
+            g_image_face_owned = false;
+        }
+        free(g_sprite_cache_jpeg[slot]);
+    }
+    g_sprite_cache_jpeg[slot] = buf;
+    g_sprite_cache_len[slot] = size;
+
+    char extra[96];
+    snprintf(extra, sizeof(extra), "\"sprite_image\":%d,\"size\":%u",
+             slot, static_cast<unsigned>(size));
+    sendAckOk(extra);
+}
+
 static void handleSpriteImage(const char* arg) {
     int slot = -1;
     long n = 0;
@@ -1005,21 +1535,7 @@ static void handleSpriteImage(const char* arg) {
         }
     }
 
-    if (g_sprite_cache_jpeg[slot]) {
-        if (g_image_face_jpeg == g_sprite_cache_jpeg[slot]) {
-            g_image_face_jpeg = nullptr;
-            g_image_face_len = 0;
-            g_image_face_owned = false;
-        }
-        free(g_sprite_cache_jpeg[slot]);
-    }
-    g_sprite_cache_jpeg[slot] = buf;
-    g_sprite_cache_len[slot] = received;
-
-    char extra[96];
-    snprintf(extra, sizeof(extra), "\"sprite_image\":%d,\"size\":%u",
-             slot, static_cast<unsigned>(received));
-    sendAckOk(extra);
+    installSpriteBuffer(slot, buf, received);
 }
 
 // SFRAME:<slot>\n
@@ -1139,6 +1655,27 @@ static void pollSpriteAnimation() {
 // RECT:<x>,<y>,<w>,<h>,<size>\n
 // host 側で前フレームとの差分 bbox を RGB565 little-endian に変換済みの矩形。
 // JPEG 全画面再描画ではなく pushImage で変化した矩形だけ更新する。
+static void installRectBuffer(int x, int y, int w, int h, uint8_t* buf, size_t size) {
+    if (!g_image_face_active) {
+        releaseOwnedImageFace();
+        g_image_face_active = true;
+        avatar.suspend();
+        M5.Display.fillScreen(TFT_BLACK);
+        updateBatteryInfo(true);
+    }
+
+    M5.Display.pushImage(x, y, w, h, reinterpret_cast<uint16_t*>(buf));
+    free(buf);
+    drawBatteryOverlay();
+    g_image_face_dirty = false;
+
+    char extra[128];
+    snprintf(extra, sizeof(extra),
+             "\"rect\":[%d,%d,%d,%d],\"bytes\":%u,\"battery_level\":%ld",
+             x, y, w, h, static_cast<unsigned>(size), static_cast<long>(g_battery_level));
+    sendAckOk(extra);
+}
+
 static void handleRect(const char* arg) {
     if (g_mic_recording) {
         sendAckError("mic recording active");
@@ -1199,24 +1736,7 @@ static void handleRect(const char* arg) {
         }
     }
 
-    if (!g_image_face_active) {
-        releaseOwnedImageFace();
-        g_image_face_active = true;
-        avatar.suspend();
-        M5.Display.fillScreen(TFT_BLACK);
-        updateBatteryInfo(true);
-    }
-
-    M5.Display.pushImage(x, y, w, h, reinterpret_cast<uint16_t*>(buf));
-    free(buf);
-    drawBatteryOverlay();
-    g_image_face_dirty = false;
-
-    char extra[128];
-    snprintf(extra, sizeof(extra),
-             "\"rect\":[%d,%d,%d,%d],\"bytes\":%u,\"battery_level\":%ld",
-             x, y, w, h, static_cast<unsigned>(size), static_cast<long>(g_battery_level));
-    sendAckOk(extra);
+    installRectBuffer(x, y, w, h, buf, size);
 }
 
 // WAV:<size>\n
@@ -1405,30 +1925,48 @@ static inline bool inMicButton(int16_t x, int16_t y) {
 }
 
 static void emitMicButton(const char* action) {
+    char event[128];
+    snprintf(event, sizeof(event),
+             "{\"event\":\"mic_button\",\"action\":\"%s\",\"at\":%lu}",
+             action, static_cast<unsigned long>(millis()));
     serialLock();
-    Serial.printf("{\"event\":\"mic_button\",\"action\":\"%s\",\"at\":%lu}\n",
-                  action, static_cast<unsigned long>(millis()));
+    Serial.println(event);
     Serial.flush();
     serialUnlock();
+#ifdef XANGI_STACKCHAN_TAILNET
+    queueTailnetLine(event);
+#endif
 }
 
 static void emitAudioStopped(const char* reason) {
     // ホスト向け非同期イベント行。`pollSerialCommand` のコマンド応答とは別の
     // 行で、host 側は SerialReader thread で逐次読み取って _user_stopped を立てる。
+    char event[128];
+    snprintf(event, sizeof(event),
+             "{\"event\":\"audio_stopped\",\"reason\":\"%s\",\"at\":%lu}",
+             reason, static_cast<unsigned long>(millis()));
     serialLock();
-    Serial.printf("{\"event\":\"audio_stopped\",\"reason\":\"%s\",\"at\":%lu}\n",
-                  reason, static_cast<unsigned long>(millis()));
+    Serial.println(event);
     serialUnlock();
+#ifdef XANGI_STACKCHAN_TAILNET
+    queueTailnetLine(event);
+#endif
 }
 
 // アタマタッチセンサ (Si12T) のジェスチャ通知。M5Stack 公式 StackChan K151 の
 // 頭部 3 ch capacitive touch (前/中/後ろ) を Press / Release / SwipeForward /
 // SwipeBackward の 4 ジェスチャに集約。host 側は音声入力トリガ等として利用する。
 static void emitHeadTouch(const char* gesture) {
+    char event[128];
+    snprintf(event, sizeof(event),
+             "{\"event\":\"head_touch\",\"gesture\":\"%s\",\"at\":%lu}",
+             gesture, static_cast<unsigned long>(millis()));
     serialLock();
-    Serial.printf("{\"event\":\"head_touch\",\"gesture\":\"%s\",\"at\":%lu}\n",
-                  gesture, static_cast<unsigned long>(millis()));
+    Serial.println(event);
     serialUnlock();
+#ifdef XANGI_STACKCHAN_TAILNET
+    queueTailnetLine(event);
+#endif
 }
 
 static const char* headTouchGestureName(Si12T::Gesture g) {
@@ -1631,6 +2169,20 @@ static void micRecordTask(void* /*param*/) {
         Serial.printf("MIC_PCM:%u\n", static_cast<unsigned>(MIC_CHUNK_BYTES));
         Serial.write(reinterpret_cast<uint8_t*>(g_mic_buffer), MIC_CHUNK_BYTES);
         serialUnlock();
+#ifdef XANGI_STACKCHAN_TAILNET
+        TailnetOutgoing outgoing{};
+        const int header_len = snprintf(
+            reinterpret_cast<char*>(outgoing.data), sizeof(outgoing.data),
+            "MIC_PCM:%u\n", static_cast<unsigned>(MIC_CHUNK_BYTES));
+        if (header_len > 0 &&
+            static_cast<size_t>(header_len) + MIC_CHUNK_BYTES <= sizeof(outgoing.data)) {
+            memcpy(outgoing.data + header_len, g_mic_buffer, MIC_CHUNK_BYTES);
+            outgoing.len = static_cast<size_t>(header_len) + MIC_CHUNK_BYTES;
+            if (g_tailnet_outgoing_queue != nullptr) {
+                xQueueSend(g_tailnet_outgoing_queue, &outgoing, 0);
+            }
+        }
+#endif
     }
     g_mic_task = nullptr;
     vTaskDelete(nullptr);
@@ -1654,17 +2206,19 @@ static void handleMicStart() {
     }
     g_mic_recording = true;
     g_mic_start_ms = millis();  // watchdog の起点
-    xTaskCreatePinnedToCore(micRecordTask, "micRec", 4096, nullptr, 3, &g_mic_task,
+    xTaskCreatePinnedToCore(micRecordTask, "micRec", 8192, nullptr, 3, &g_mic_task,
                             APP_CPU_NUM);
     if (!g_image_face_active) {
         avatar.setExpression(Expression::Doubt);  // listening 顔 (doubt 流用)
         avatar.setSpeechText("listening...");
     }
-    Serial.printf("{\"status\":\"ok\",\"mode\":\"recording\",\"sample_rate\":%u,"
-                  "\"bits\":16,\"channels\":1,\"chunk_bytes\":%u}\n",
-                  static_cast<unsigned>(MIC_SAMPLE_RATE),
-                  static_cast<unsigned>(MIC_CHUNK_BYTES));
-    Serial.flush();
+    char extra[160];
+    snprintf(extra, sizeof(extra),
+             "\"mode\":\"recording\",\"sample_rate\":%u,\"bits\":16,"
+             "\"channels\":1,\"chunk_bytes\":%u",
+             static_cast<unsigned>(MIC_SAMPLE_RATE),
+             static_cast<unsigned>(MIC_CHUNK_BYTES));
+    sendAckOk(extra);
 }
 
 static void handleMicStop() {
@@ -1691,8 +2245,7 @@ static void handleMicStop() {
         avatar.setExpression(Expression::Neutral);
         avatar.setSpeechText("");
     }
-    Serial.println("{\"status\":\"ok\",\"mode\":\"speaker\"}");
-    Serial.flush();
+    sendAckOk("\"mode\":\"speaker\"");
 }
 
 static void clearWavQueueAndStop() {
@@ -1769,6 +2322,118 @@ static void resetLine() {
     g_line_len = 0;
     g_line[0]  = '\0';
 }
+
+#ifdef XANGI_STACKCHAN_TAILNET
+static void pollTailnetCommand() {
+    if (g_tailnet_command_queue == nullptr || g_tailnet_response_queue == nullptr) return;
+
+    TailnetCommand command{};
+    if (xQueueReceive(g_tailnet_command_queue, &command, 0) != pdTRUE) return;
+
+    g_tailnet_response[0] = '\0';
+    g_tailnet_response_binary = nullptr;
+    g_tailnet_response_binary_len = 0;
+    g_tailnet_response_binary_kind[0] = '\0';
+    g_capture_tailnet_response = true;
+    if (strcmp(command.line, "STATUS") == 0) {
+        handleStatus();
+    } else if (strncmp(command.line, "VOLUME:", 7) == 0) {
+        handleVolume(command.line + 7);
+    } else if (strncmp(command.line, "FACE:", 5) == 0) {
+        handleFace(command.line + 5);
+    } else if (strncmp(command.line, "MOVE:", 5) == 0) {
+        handleMove(command.line + 5);
+    } else if (strncmp(command.line, "IMAGE:", 6) == 0) {
+        const size_t expected = static_cast<size_t>(atol(command.line + 6));
+        if (command.binary == nullptr || command.binary_len != expected) {
+            if (command.binary) free(command.binary);
+            sendAckError("IMAGE binary size mismatch");
+        } else {
+            installImageBuffer(command.binary, command.binary_len);
+            command.binary = nullptr;
+        }
+    } else if (strncmp(command.line, "SIMG:", 5) == 0) {
+        int slot = -1;
+        long expected = 0;
+        if (sscanf(command.line + 5, "%d,%ld", &slot, &expected) != 2 ||
+            slot < 0 || slot >= static_cast<int>(SPRITE_CACHE_SLOTS) ||
+            command.binary == nullptr ||
+            command.binary_len != static_cast<size_t>(expected)) {
+            if (command.binary) free(command.binary);
+            sendAckError("SIMG binary mismatch");
+        } else {
+            installSpriteBuffer(slot, command.binary, command.binary_len);
+            command.binary = nullptr;
+        }
+    } else if (strncmp(command.line, "RECT:", 5) == 0) {
+        int x = 0, y = 0, w = 0, h = 0;
+        long expected = 0;
+        if (sscanf(command.line + 5, "%d,%d,%d,%d,%ld",
+                   &x, &y, &w, &h, &expected) != 5 ||
+            x < 0 || y < 0 || w <= 0 || h <= 0 || x + w > 320 || y + h > 240 ||
+            expected <= 0 || command.binary == nullptr ||
+            command.binary_len != static_cast<size_t>(expected) ||
+            command.binary_len != static_cast<size_t>(w) * static_cast<size_t>(h) * 2) {
+            if (command.binary) free(command.binary);
+            sendAckError("RECT binary mismatch");
+        } else {
+            installRectBuffer(x, y, w, h, command.binary, command.binary_len);
+            command.binary = nullptr;
+        }
+    } else if (strncmp(command.line, "SFRAME:", 7) == 0) {
+        handleSpriteFrame(command.line + 7);
+    } else if (strncmp(command.line, "SANIM:", 6) == 0) {
+        handleSpriteAnimation(command.line + 6);
+    } else if (strncmp(command.line, "PUZZLE:", 7) == 0) {
+        handlePuzzle(command.line + 7);
+    } else if (strncmp(command.line, "STACKLED:", 9) == 0) {
+        handleStackLed(command.line + 9);
+    } else if (strcmp(command.line, "CAPTURE") == 0) {
+        handleCapture();
+    } else if (strcmp(command.line, "MIC_START") == 0) {
+        handleMicStart();
+    } else if (strcmp(command.line, "MIC_STOP") == 0) {
+        handleMicStop();
+    } else if (strncmp(command.line, "MIC_BUTTON:", 11) == 0) {
+        const char* arg = command.line + 11;
+        g_mic_button_enabled = (strcmp(arg, "on") == 0);
+        char extra[48];
+        snprintf(extra, sizeof(extra), "\"mic_button\":%s",
+                 g_mic_button_enabled ? "true" : "false");
+        sendAckOk(extra);
+    } else if (strncmp(command.line, "HEADTOUCH_AVATAR:", 17) == 0) {
+        const char* arg = command.line + 17;
+        g_head_touch_avatar = (strcmp(arg, "on") == 0);
+        char extra[64];
+        snprintf(extra, sizeof(extra), "\"head_touch_avatar\":%s",
+                 g_head_touch_avatar ? "true" : "false");
+        sendAckOk(extra);
+    } else if (strncmp(command.line, "HEADPET_SOUND:", 14) == 0) {
+        const char* arg = command.line + 14;
+        g_head_pet_sound = (strcmp(arg, "on") == 0);
+        char extra[64];
+        snprintf(extra, sizeof(extra), "\"head_pet_sound\":%s",
+                 g_head_pet_sound ? "true" : "false");
+        sendAckOk(extra);
+    } else {
+        sendAckUnsupported(command.line);
+    }
+    g_capture_tailnet_response = false;
+
+    TailnetResponse response{};
+    snprintf(response.line, sizeof(response.line), "%s",
+             g_tailnet_response[0] ? g_tailnet_response :
+             "{\"status\":\"error\",\"error\":\"empty response\"}");
+    response.binary = g_tailnet_response_binary;
+    response.binary_len = g_tailnet_response_binary_len;
+    snprintf(response.binary_kind, sizeof(response.binary_kind), "%s",
+             g_tailnet_response_binary_kind);
+    if (xQueueSend(g_tailnet_response_queue, &response,
+                   pdMS_TO_TICKS(100)) != pdTRUE && response.binary != nullptr) {
+        free(response.binary);
+    }
+}
+#endif
 
 static void pollSerialCommand() {
     while (Serial.available()) {
@@ -1892,7 +2557,7 @@ void setup() {
     Serial.begin(SERIAL_BAUD);
     delay(100);
     Serial.println();
-    Serial.println("[bridge] xangi-stackchan / cores3-main 0.23 (avatar+spriteface+spritecache+spriteanim+battery+servo+wavqueue+camera+touchstop+micbutton+headtouch+headavatar+headpetsound+mic+micguard+micwatchdog+avtoggle+ackflush+i2c1task+resetreason+sprite-state-guard+no-wav-state-redraw)");
+    Serial.println("[bridge] xangi-stackchan / cores3-main 0.24 (avatar+spriteface+spritecache+spriteanim+battery+servo+wavqueue+camera+touchstop+micbutton+headtouch+headavatar+headpetsound+mic+micguard+micwatchdog+avtoggle+ackflush+i2c1task+resetreason+sprite-state-guard+no-wav-state-redraw+tailnet)");
 
     // 直前のリセット理由を boot で必ず 1 行残す。panic / watchdog / brownout 等の
     // 「いつの間にか再起動していた」事象の一次証拠になる (host 側ログに残る)。
@@ -1967,6 +2632,21 @@ void setup() {
 
     resetLine();
     setState(State::Ready);
+
+#ifdef XANGI_STACKCHAN_TAILNET
+    // Existing device features are ready before networking starts. Wi-Fi and
+    // MicroLink connect asynchronously, so USB serial remains a fallback.
+    g_tailnet_command_queue = xQueueCreate(4, sizeof(TailnetCommand));
+    g_tailnet_response_queue = xQueueCreate(4, sizeof(TailnetResponse));
+    g_tailnet_outgoing_queue = xQueueCreate(8, sizeof(TailnetOutgoing));
+    if (g_tailnet_command_queue != nullptr && g_tailnet_response_queue != nullptr &&
+        g_tailnet_outgoing_queue != nullptr) {
+        xTaskCreatePinnedToCore(tailnetTask, "tailnet", 12288, nullptr, 1,
+                                &g_tailnet_task, 0);
+    } else {
+        Serial.println("[tailnet] queue allocation failed");
+    }
+#endif
 }
 
 // watchdog 発火時の Speaker 復帰処理。micRecordTask 内から Mic.end / Speaker.begin
@@ -1995,6 +2675,9 @@ static void recoverFromMicWatchdog() {
 void loop() {
     M5.update();
     pollSerialCommand();
+#ifdef XANGI_STACKCHAN_TAILNET
+    pollTailnetCommand();
+#endif
     pollTouchStop();
     pollHeadTouch();
     recoverFromMicWatchdog();

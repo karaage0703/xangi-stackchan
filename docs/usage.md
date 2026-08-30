@@ -69,8 +69,7 @@ uv run xangi-stackchan \
   --device-profile cores3_k151 \
   --volume 200 \
   --tts piper \
-  --lcd-mic-voice \
-  --head-pet-reaction
+  --lcd-mic-voice
 
 # AtomS3R + Voice/Echo Base
 uv run xangi-stackchan \
@@ -157,7 +156,6 @@ setsid -f bash -c 'cd /path/to/xangi-stackchan && exec uv run xangi-stackchan \
   --volume 200 \
   --tts piper \
   --lcd-mic-voice \
-  --head-pet-reaction \
   --stackchan-retry-seconds 3 \
   --settings-port 7897' </dev/null >>/tmp/xangi-stackchan.log 2>&1
 ```
@@ -190,6 +188,37 @@ tail -f /tmp/xangi-stackchan.log
 - `--no-port-autoshift`: 設定 UI port を auto-shift せず最初の bind 失敗で終了
 - `--settings-bind`: 設定 UI の listen アドレス (既定 `127.0.0.1`、LAN/Tailscale 公開時は `0.0.0.0`)
 - `--no-settings-ui`: 設定 UI を起動しない
+- `--speak-responses` / `--no-speak-responses`: 通常応答の読み上げを個別にON/OFFする
+- `--completion-notifications` / `--no-completion-notifications`: 長時間turnの短い完了通知を個別にON/OFFする
+- `--firmware-head-pet-sound` / `--no-firmware-head-pet-sound`: firmware内蔵のなでなで音声をON/OFFする
+- `--completion-after-seconds`: 完了通知を行う最短作業時間 (既定 `30` 秒)
+- `--completion-summary-chars`: 完了要約の最大文字数 (既定 `100` 文字)
+
+## xangi managed Extension
+
+`uv sync` 後、このリポジトリをxangiのExtensionsへ登録すると、`xangi-extension.json`のmanaged HTTP entrypointで起動できる。イベントURLとインスタンスIDはxangiが実行時環境変数で渡すため、固定URLをExtension設定へ複製する必要はない。設定UIはBearer認証を要求し、xangiのExtensionプロキシから利用する。
+
+同じUSBデバイスをstandalone版とmanaged Extensionが同時に開かないよう、両モードはデバイス単位のプロセスロックを共有する。競合時は後発をエラーにする。
+
+設定画面または `/api/config` で保存した内容は、SSEイベントやstream timeoutを待たず実行中runtimeへ再適用される。transport切替、通常応答、完了通知、LCDマイク、本体内蔵なで音声の変更にExtension再起動は不要。
+
+`/api/health` は既存の `ready` / `service` に加え、HTTP serviceの起動状態、transport、実機接続状態、秘密情報を含まない直近診断を返す。`/api/diagnostics` も同じ診断payloadを返す。
+
+```json
+{
+  "ready": false,
+  "service": "xangi-stackchan",
+  "service_running": true,
+  "transport": "tailnet",
+  "device_connected": false,
+  "config_version": 3,
+  "diagnostics": {
+    "last_event": {"type": "turn.complete", "received_at": 1788098400.0},
+    "last_completion": {"notified": false, "reason": "below_threshold", "at": 1788098400.1},
+    "last_error": null
+  }
+}
+```
 - `--port --baud`: USB serial のポートと baudrate (XangiBridge ファーム既定値 `921600`)
 - `--volume`: デバイスの音量 (`0`〜`255`、既定 `255`)
 - `--tts`: `piper`, `voicevox`, `none`
@@ -209,18 +238,16 @@ tail -f /tmp/xangi-stackchan.log
 - `--puzzle-light-enabled` / `--no-puzzle-light-enabled`: 状態表示LEDを使う。ファーム `STATUS` が `puzzle:true` なら `PUZZLE:<pattern>`、`stack_led:true` なら `STACKLED:<pattern>` を送る。CoreS3 Grove PORT.B の Puzzle Unit WS2812E と K151 / K151-R 本体 12 RGB LED は自動検出
 - `--puzzle-idle`, `--puzzle-thinking`, `--puzzle-talking`, `--puzzle-error`: 状態ごとの LED pattern。既定は `off` / `thinking` / `talking` / `error`
 - `--stackchan-retry-seconds`: デバイス切断時の再接続間隔 (秒)。起動時だけでなく**稼働中の切断 (デバイス再起動 / USB 再列挙で `ttyACMx` が変わる) も自動検知して再接続**する。再接続成功時は音量・表情・首ポーズ・ファーム設定を自動で再初期化するので、ブリッジの手動再起動は不要。`--port` には番号非依存の固定パス (`/dev/serial/by-id/...` か udev の `/dev/stackchan`) を使うこと
-- `--voice-conversation`: アタマセンサ tap で録音 → STT (faster-whisper) → xangi `POST /api/chat` 投入の音声対話モード (M5Stackchan K151 専用、後述「音声対話モード」参照)
 - `--lcd-mic-voice` / `--no-lcd-mic-voice`: LCD 下部のマイクボタンで録音 → STT → xangi 投入。K151 通常運用では既定で有効
-- `--head-pet-reaction` / `--no-head-pet-reaction`: アタマセンサのなで反応。K151 通常運用では既定で有効
 - `--voice-app-session-id`: 音声対話で xangi に投げる appSessionId。空ならアプリ起動時に専用 web session を自動作成
 - `--voice-silence-dbfs`: VAD 無音判定の dBFS 閾値 (既定 -40、静かな部屋なら -50、騒がしい環境なら -30)
 - `--voice-silence-seconds`: 無音判定後の自動停止までの秒数 (既定 1.5)
 - `--voice-max-seconds`: 最大録音時間 (既定 15、これを超えたら強制停止)
-- `--voice-initial-grace-seconds`: なでてから最初の発話までの猶予秒数 (既定 5)。この間の無音では録音を止めない (考える時間)。最初の有音で通常の無音判定 (`--voice-silence-seconds`) に切り替わり、猶予内に一度も発話が無ければ誤タップとして停止。env `STACKCHAN_VC_INITIAL_GRACE_SECONDS` / 設定 UI でも調整可。
+- `--voice-initial-grace-seconds`: 録音開始から最初の発話までの猶予秒数 (既定 5)。この間の無音では録音を止めない。最初の有音で通常の無音判定 (`--voice-silence-seconds`) に切り替わる。
 
-## 音声対話モード
+## LCDマイク音声入力
 
-M5Stackchan K151 のアタマセンサ (Si12T 容量タッチ、cores3-main 0.8+) を tap →
+M5Stackchan K151 のLCD下部マイクボタンをtap →
 内蔵 PDM マイクで録音 → 無音 1.5 秒で自動停止 → faster-whisper STT (Silero VAD
 フィルタ ON) → xangi `POST /api/chat` 投入。xangi 応答 (turn.complete) は piper
 TTS で発話される (既存経路)。
@@ -229,19 +256,14 @@ TTS で発話される (既存経路)。
 
 ```bash
 uv run xangi-stackchan \
-  --voice-conversation \
+  --lcd-mic-voice \
   --xangi-url http://127.0.0.1:18888 \
   --device-profile cores3_k151 \
   --port /dev/ttyACM1 \
   --volume 30
 ```
 
-`--voice-app-session-id` と `--thread-id` を両方指定しなければ、起動時に xangi
-で stackchan 専用の新規 web session を作成して両方に自動セット。これで:
-
-- POST /api/chat は stackchan 専用 session に投入 (他 web セッションを汚さない)
-- SSE event は `thread_id` フィルタで stackchan 専用 thread のみ反応 (Discord/
-  Slack 等の他チャンネルからの message は届かない → Mic 録音中のシリアル衝突を回避)
+`--voice-app-session-id`を指定すると、音声入力を特定のweb sessionへ送信できる。
 
 ### 環境変数チューニング
 
@@ -264,18 +286,18 @@ uv run xangi-stackchan \
 
 ### 操作
 
-- アタマセンサ tap (Press) → 録音開始、Avatar が listening 顔 (doubt)
+- LCD下部のマイクボタンをtap → 録音開始、Avatar がlistening顔
 - 喋る (録音中は Speaker 切断、音声 feedback なし)
 - 1.5 秒無音 (RMS が `-40 dBFS` 未満が継続) で自動 MIC_STOP → STT → POST
-- 録音中の再 tap (Press) で toggle 即停止
+- 録音中の再tapで即停止
 - 15 秒で強制停止 (`--max-record-seconds` 相当の env で調整可)
 
 ### 設定 UI から確認・調整
 
 `http://127.0.0.1:7897/` の voice fieldset で以下を実行時に変更可能:
 
-- 音声対話モード ON/OFF (checkbox)
-- appSessionId (空のままなら起動時に自動作成された専用 web session を継続使用)
+- LCDマイク音声入力 ON/OFF (checkbox)
+- appSessionId
 - silence threshold (dBFS) / silence seconds / max record seconds の動的調整
 - 直近 10 件の発話履歴 (5 秒ごと自動更新、各 entry は `[時刻] rec=録音秒 stt=処理秒 →status_code "STT結果"`)
 
@@ -284,7 +306,7 @@ uv run xangi-stackchan \
 
 ### 制約
 
-- M5Stackchan K151 (Si12T 搭載) + シリアル backend (`--wifi` 不可) のみ
+- M5Stackchan K151 (Si12T 搭載) + USBシリアル backend
 - 録音中は WAV 再生不可 (I2S 共有のため)、ファーム側で Speaker を end → Mic
   へ切り替え
 - faster-whisper モデル初回 DL (small ≈ 462MB) は最初の transcribe で実行、
@@ -361,7 +383,7 @@ setsid -f bash -c 'cd /path/to/xangi-stackchan && exec uv run xangi-stackchan \
 ```json
 {"settings_ui": "http://127.0.0.1:7898/"}
 {"boot": true, "instance_id": "right", "serial_port": "/dev/stackchan-right",
- "wifi": false, "bound_config_port": 7898, "thread_id": "right", ...}
+ "tailnet": false, "bound_config_port": 7898, "thread_id": "right", ...}
 ```
 
 設定 UI は instance ごとに別 URL になるので、ブラウザのタブ 2 つで個別に編集できる。

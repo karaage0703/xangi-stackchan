@@ -47,7 +47,7 @@ def test_no_pcm_chunk_after_start_auto_stops():
         max_record_seconds=15.0,
         pcm_stall_seconds=0.3,  # chunk が来ないのですぐ stall 判定
     )
-    vc._on_head_touch({"gesture": "press"})
+    vc._on_mic_button({"action": "down"})
     assert vc._recording is True
 
     # PCM が来なくても watchdog が stall で stop する
@@ -71,7 +71,7 @@ def test_mic_start_failure_calls_on_stop():
         pcm_stall_seconds=0.3,
     )
 
-    vc._on_head_touch({"gesture": "press"})
+    vc._on_mic_button({"action": "down"})
 
     assert vc._recording is False
     backend.stop_mic_recording.assert_not_called()
@@ -100,11 +100,11 @@ def test_pcm_stream_stops_midway_auto_stops():
         max_record_seconds=15.0,
         pcm_stall_seconds=0.3,
     )
-    vc._on_head_touch({"gesture": "press"})
+    vc._on_mic_button({"action": "down"})
     assert vc._recording is True
 
     # 数 chunk 流す (有音 = silence では止まらない)
-    loud = (b"\xff\x7f" * 512)
+    loud = b"\xff\x7f" * 512
     for _ in range(3):
         vc._on_pcm_chunk(loud)
         time.sleep(0.02)

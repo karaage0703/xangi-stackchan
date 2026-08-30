@@ -10,7 +10,11 @@ from pathlib import Path
 from xangi_stackchan.app_types import BridgeConfig
 from xangi_stackchan.settings import RuntimeState, config_to_dict, merge_config
 from xangi_stackchan.settings_server import start_settings_server
-from xangi_stackchan.stackchan import StackchanConfig, StackchanSimulator, create_backend
+from xangi_stackchan.stackchan import (
+    StackchanConfig,
+    StackchanSimulator,
+    create_backend,
+)
 
 
 def _pick_free_port() -> int:
@@ -86,7 +90,22 @@ def test_simulator_config_is_persisted_through_settings():
 
     assert merged.stackchan.simulator is True
     assert config_to_dict(merged)["simulator"] is True
-    assert isinstance(create_backend(StackchanConfig(simulator=True)), StackchanSimulator)
+    assert isinstance(
+        create_backend(StackchanConfig(simulator=True)), StackchanSimulator
+    )
+
+
+def test_tailnet_config_is_persisted_through_settings():
+    base = _state(Path("/tmp")).snapshot()[0]
+    merged = merge_config(
+        base,
+        {"tailnet": "on", "tailnet_bind": "127.0.0.1", "tailnet_port": "19000"},
+    )
+
+    saved = config_to_dict(merged)
+    assert saved["tailnet"] is True
+    assert saved["tailnet_bind"] == "127.0.0.1"
+    assert saved["tailnet_port"] == 19000
 
 
 def test_settings_server_serves_simulator_page_and_state(tmp_path: Path):
@@ -95,9 +114,11 @@ def test_settings_server_serves_simulator_page_and_state(tmp_path: Path):
     port = _pick_free_port()
     server, bound = start_settings_server(state, "127.0.0.1", port, autoshift_tries=1)
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{bound}/simulator", timeout=3) as response:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{bound}/simulator", timeout=3
+        ) as response:
             html = response.read().decode("utf-8")
-        assert "xangi-stackchan simulator" in html
+        assert "xangi-stack-chan simulator" in html
         assert "enable audio" in html
 
         with urllib.request.urlopen(
@@ -140,7 +161,9 @@ def test_simulator_api_returns_503_without_simulator_runtime(tmp_path: Path):
     server, bound = start_settings_server(state, "127.0.0.1", port, autoshift_tries=1)
     try:
         try:
-            urllib.request.urlopen(f"http://127.0.0.1:{bound}/api/simulator/state", timeout=3)
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{bound}/api/simulator/state", timeout=3
+            )
         except urllib.error.HTTPError as exc:
             assert exc.code == 503
         else:

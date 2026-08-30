@@ -1,9 +1,80 @@
 import json
+import socket
+import threading
 import time
 from collections.abc import Iterator
 from urllib.parse import urlparse
 
 import requests
+
+
+class XangiEventStream:
+    """Interruptible SSE stream used to apply runtime config immediately."""
+
+    def __init__(self, url: str, timeout: int = 65):
+        self.url = url
+        self.timeout = timeout
+        self._lock = threading.Lock()
+        self._response = None
+        self._closed = threading.Event()
+
+    def close(self) -> None:
+        self._closed.set()
+        with self._lock:
+            response = self._response
+        if response is not None:
+            try:
+                raw_socket = response.raw._fp.fp.raw._sock
+                raw_socket.shutdown(socket.SHUT_RDWR)
+            except (AttributeError, OSError):
+                pass
+            response.close()
+
+    def __iter__(self) -> Iterator[dict]:
+        if self._closed.is_set():
+            return
+        with requests.get(
+            self.url,
+            stream=True,
+            headers={"Accept": "text/event-stream"},
+            timeout=(5, self.timeout),
+        ) as response:
+            with self._lock:
+                self._response = response
+            try:
+                if self._closed.is_set():
+                    return
+                response.raise_for_status()
+                event = "message"
+                data_lines: list[str] = []
+                try:
+                    for raw_line in response.iter_lines(decode_unicode=True):
+                        if self._closed.is_set():
+                            return
+                        if raw_line is None:
+                            continue
+                        line = raw_line.rstrip("\r")
+                        if line == "":
+                            if data_lines:
+                                payload = json.loads("\n".join(data_lines))
+                                payload["_sse_event"] = event
+                                yield payload
+                            event = "message"
+                            data_lines = []
+                            continue
+                        if line.startswith(":"):
+                            yield {"_sse_event": "heartbeat"}
+                        elif line.startswith("event:"):
+                            event = line[6:].strip() or "message"
+                        elif line.startswith("data:"):
+                            data_lines.append(line[5:].lstrip())
+                except Exception:
+                    if self._closed.is_set():
+                        return
+                    raise
+            finally:
+                with self._lock:
+                    self._response = None
 
 
 def normalize_xangi_stream_url(url: str) -> str:
@@ -41,6 +112,10 @@ def iter_sse_messages(url: str, timeout: int = 65) -> Iterator[dict[str, str]]:
                 data_lines = []
                 continue
             if line.startswith(":"):
+                # xangi sends periodic SSE comments as heartbeats.  Forward a
+                # synthetic event so the bridge loop can notice settings
+                # version changes even while no user turn is running.
+                yield {"event": "heartbeat", "data": "{}"}
                 continue
             if line.startswith("event:"):
                 event = line[6:].strip() or "message"
@@ -82,4 +157,3 @@ def reconnecting_xangi_events(
             }
             time.sleep(backoff)
             backoff = min(backoff * 2, max_backoff)
-

@@ -1,0 +1,17 @@
+diff --git a/components/microlink/components/wireguard_lwip/src/wireguardif.c b/components/microlink/components/wireguard_lwip/src/wireguardif.c
+--- a/components/microlink/components/wireguard_lwip/src/wireguardif.c
++++ b/components/microlink/components/wireguard_lwip/src/wireguardif.c
+@@ -551,9 +551,10 @@ static bool wireguardif_process_data_message(struct wireguard_device *device, st
+ 								if (dest_ok) {
+ 									// Send packet to be processed by LWIP
+ 									WG_DEBUG("[WG_RX_IP] Passing %u bytes to IP layer\n", (unsigned)pbuf->tot_len);
+-									ip_input(pbuf, device->netif);
+-									// pbuf is owned by IP layer now
+-									pbuf = NULL;
++									if (tcpip_inpkt(pbuf, device->netif, ip_input) == ERR_OK) {
++										// pbuf is owned by the TCP/IP thread now
++										pbuf = NULL;
++									}
+ 								} else {
+ 									WG_DEBUG("[WG_RX_IP] DROPPED: dest_ok=false\n");
+ 								}

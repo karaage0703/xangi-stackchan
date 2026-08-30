@@ -11,6 +11,7 @@ SerialException ("write failed: [Errno 5] Input/output error") になる。
 - 切断中の send_* は fail-fast でエラー dict を返す (ブロックしない)
 - close() で再接続 loop が止まる
 """
+
 from __future__ import annotations
 
 import threading
@@ -26,9 +27,7 @@ class _DeadWriteSerial:
     """write が常に SerialException (USB 切断相当) を投げる serial。"""
 
     def write(self, data):
-        raise pyserial.SerialException(
-            "write failed: [Errno 5] Input/output error"
-        )
+        raise pyserial.SerialException("write failed: [Errno 5] Input/output error")
 
     def flush(self):
         pass
@@ -133,7 +132,8 @@ class TestStackchanSerialReconnect:
         sc = self._make()
         sc.reconnect_interval = 10.0  # テスト中は再接続成功させない
         monkeypatch.setattr(
-            sc, "open",
+            sc,
+            "open",
             lambda: (_ for _ in ()).throw(pyserial.SerialException("no device")),
         )
         sc._on_serial_dead("read: gone")
@@ -150,7 +150,8 @@ class TestStackchanSerialReconnect:
         sc = self._make()
         sc.reconnect_interval = 10.0
         monkeypatch.setattr(
-            sc, "open",
+            sc,
+            "open",
             lambda: (_ for _ in ()).throw(pyserial.SerialException("no device")),
         )
         sc._on_serial_dead("first")
@@ -162,7 +163,8 @@ class TestStackchanSerialReconnect:
         sc = self._make()
         sc.reconnect_interval = 0.01
         monkeypatch.setattr(
-            sc, "open",
+            sc,
+            "open",
             lambda: (_ for _ in ()).throw(pyserial.SerialException("no device")),
         )
         sc._on_serial_dead("gone")
