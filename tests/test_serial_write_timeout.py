@@ -5,6 +5,7 @@ write_timeout 未設定だと、デバイスが受信を捌けない瞬間に se
 SerialTimeoutException を握り潰して False を返し、ロックを必ず解放し、out buffer を
 捨てて自己回復できることを担保する。
 """
+
 from __future__ import annotations
 
 import serial

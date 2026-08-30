@@ -7,6 +7,8 @@ camera plumbing is exercised manually with a real device, not here.
 from __future__ import annotations
 
 import socket
+import threading
+import urllib.request
 from contextlib import closing
 from pathlib import Path
 
@@ -14,7 +16,14 @@ import pytest
 
 from xangi_stackchan.app_types import BridgeConfig
 from xangi_stackchan.settings import RuntimeState
-from xangi_stackchan.settings_server import _execute_demo, start_settings_server
+from xangi_stackchan.settings_server import (
+    _execute_demo,
+    _execute_device_status,
+    _flatten_form,
+    _health_payload,
+    render_page,
+    start_settings_server,
+)
 from xangi_stackchan.stackchan import StackchanConfig
 
 
@@ -22,7 +31,7 @@ def _state(tmp_path: Path) -> RuntimeState:
     cfg = BridgeConfig(
         xangi_url="http://127.0.0.1:18888",
         thread_id=None,
-        stackchan=StackchanConfig(wifi=False, host="", port="/dev/null", baud=921600),
+        stackchan=StackchanConfig(port="/dev/null", baud=921600),
         volume=128,
         tts="none",
         piper_bin="",
@@ -64,7 +73,9 @@ class FakeBackend:
             return {"status": "ok"}
         return {"status": "ok", "command": command}
 
-    def send_wav(self, wav: bytes, chunk_size: int = 1024, chunk_delay: float = 0.005) -> dict:
+    def send_wav(
+        self, wav: bytes, chunk_size: int = 1024, chunk_delay: float = 0.005
+    ) -> dict:
         self.wav_calls.append(
             {"wav": wav, "chunk_size": chunk_size, "chunk_delay": chunk_delay}
         )
@@ -138,6 +149,96 @@ def test_binds_initial_port_when_free(tmp_path: Path):
         server.server_close()
 
 
+def test_speech_features_are_independent_form_switches():
+    data = _flatten_form(
+        b"completion_notifications=on&lcd_mic_voice=on&firmware_head_pet_sound=on"
+    )
+    assert data["speak_responses"] is False
+    assert data["completion_notifications"] is True
+    assert data["lcd_mic_voice"] is True
+    assert data["firmware_head_pet_sound"] is True
+
+
+def test_settings_page_uses_proxy_relative_actions(tmp_path: Path):
+    page = render_page(_state(tmp_path))
+
+    assert 'action="settings"' in page
+    assert 'action="demo"' in page
+    assert "fetch('api/camera/capture'" in page
+    assert 'src="api/camera/snapshot.jpg"' in page
+    assert 'href="/simulator"' not in page
+
+
+def test_settings_page_only_shows_firmware_head_pet_sound(tmp_path: Path):
+    page = render_page(_state(tmp_path))
+
+    assert 'name="firmware_head_pet_sound"' in page
+    assert "本体内蔵のなでなで音声" in page
+    assert 'name="head_pet_reaction"' not in page
+    assert "name='head_pet_phrases'" not in page
+    assert "name='head_pet_cooldown_seconds'" not in page
+
+
+def test_device_status_uses_shared_runtime(tmp_path: Path):
+    state = _state(tmp_path)
+    state.set_runtime(FakeBackend(), None)
+
+    assert _execute_device_status(state) == {"status": "ok"}
+
+
+class ConnectedBackend:
+    def __init__(self, connected: bool):
+        self.is_connected = connected
+
+
+def test_health_distinguishes_service_transport_and_usb_connection(tmp_path: Path):
+    state = _state(tmp_path)
+    state.set_runtime(ConnectedBackend(False), None)
+    health = _health_payload(state)
+    assert health["service"] == "xangi-stackchan"
+    assert health["service_running"] is True
+    assert health["transport"] == "usb"
+    assert health["device_connected"] is False
+    assert health["ready"] is False
+
+    state.set_runtime(ConnectedBackend(True), None)
+    assert _health_payload(state)["ready"] is True
+
+
+def test_health_reports_tailnet_and_simulator_connections(tmp_path: Path):
+    state = _state(tmp_path)
+    state.update({"tailnet": True})
+    state.set_runtime(ConnectedBackend(False), None)
+    assert _health_payload(state)["transport"] == "tailnet"
+    assert _health_payload(state)["ready"] is False
+
+    state.update({"tailnet": False, "simulator": True})
+    state.set_runtime(ConnectedBackend(True), None)
+    health = _health_payload(state)
+    assert health["transport"] == "simulator"
+    assert health["ready"] is True
+
+
+def test_config_post_notifies_runtime_before_response(tmp_path: Path):
+    state = _state(tmp_path)
+    notified = threading.Event()
+    state.set_config_notifier(notified.set)
+    server, port = start_settings_server(state, "127.0.0.1", 0)
+    try:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/config",
+            data=b'{"speak_responses":true}',
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request) as response:
+            assert response.status == 200
+            assert notified.is_set()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_execute_demo_pauses_sprite_animator(tmp_path: Path):
     state = _state(tmp_path)
     state.update({"tts": "piper", "face_mode": "sprite"})
@@ -148,7 +249,12 @@ def test_execute_demo_pauses_sprite_animator(tmp_path: Path):
     result = _execute_demo(state, {"text": "テストです", "preset": "chill"})
 
     assert result["status"] == "ok"
-    assert animator.events == [("face", "happy"), "pause", "resume", ("face", "neutral")]
+    assert animator.events == [
+        ("face", "happy"),
+        "pause",
+        "resume",
+        ("face", "neutral"),
+    ]
 
 
 def test_execute_demo_keeps_local_sprite_animation_running(tmp_path: Path):

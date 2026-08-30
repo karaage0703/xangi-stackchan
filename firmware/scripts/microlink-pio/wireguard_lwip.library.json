@@ -1,0 +1,21 @@
+{
+  "name": "wireguard_lwip",
+  "version": "0.1.0-pinned",
+  "build": {
+    "includeDir": "src",
+    "flags": [
+      "-DWIREGUARD_CRYPTO_REFC=1",
+      "-Wno-stringop-overread"
+    ],
+    "srcFilter": [
+      "+<crypto.c>",
+      "+<wireguard.c>",
+      "+<wireguardif.c>",
+      "+<wireguard-platform-esp32.c>",
+      "+<crypto/refc/blake2s.c>",
+      "+<crypto/refc/chacha20.c>",
+      "+<crypto/refc/chacha20poly1305.c>",
+      "+<crypto/refc/poly1305-donna.c>"
+    ]
+  }
+}

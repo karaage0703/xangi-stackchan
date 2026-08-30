@@ -1,0 +1,76 @@
+diff --git a/components/microlink/src/ml_tcp.c b/components/microlink/src/ml_tcp.c
+index e65d72d..6de4c6e 100644
+--- a/components/microlink/src/ml_tcp.c
++++ b/components/microlink/src/ml_tcp.c
+@@ -15,10 +15,53 @@
+ #include "esp_timer.h"
+ #include "lwip/sockets.h"
+ #include "lwip/netdb.h"
++#include <fcntl.h>
+ #include <string.h>
+ 
+ static const char *TAG = "ml_tcp";
+ 
++static int connect_with_timeout(int fd, const struct sockaddr *address,
++                                socklen_t address_len, uint32_t timeout_ms) {
++    int flags = fcntl(fd, F_GETFL, 0);
++    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
++        return -1;
++    }
++
++    int result = connect(fd, address, address_len);
++    if (result != 0 && errno == EINPROGRESS) {
++        fd_set write_fds;
++        FD_ZERO(&write_fds);
++        FD_SET(fd, &write_fds);
++        struct timeval timeout = {
++            .tv_sec = timeout_ms / 1000,
++            .tv_usec = (timeout_ms % 1000) * 1000,
++        };
++        result = select(fd + 1, NULL, &write_fds, NULL, &timeout);
++        if (result > 0) {
++            int socket_error = 0;
++            socklen_t error_len = sizeof(socket_error);
++            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &error_len) != 0) {
++                result = -1;
++            } else if (socket_error != 0) {
++                errno = socket_error;
++                result = -1;
++            } else {
++                result = 0;
++            }
++        } else if (result == 0) {
++            errno = ETIMEDOUT;
++            result = -1;
++        }
++    }
++
++    int saved_errno = errno;
++    if (fcntl(fd, F_SETFL, flags) != 0 && result == 0) {
++        return -1;
++    }
++    errno = saved_errno;
++    return result;
++}
++
+ /* ============================================================================
+  * Internal Types
+  * ========================================================================== */
+@@ -148,7 +191,7 @@ microlink_tcp_socket_t *microlink_tcp_connect(microlink_t *ml, uint32_t dest_ip,
+ 
+     int64_t t_start = esp_timer_get_time();
+ 
+-    if (connect(fd, (struct sockaddr *)&dest, sizeof(dest)) != 0) {
++    if (connect_with_timeout(fd, (struct sockaddr *)&dest, sizeof(dest), remaining) != 0) {
+         int err = errno;
+         ESP_LOGE(TAG, "connect() to %s:%u failed: errno=%d", ip_str, dest_port, err);
+ 
+@@ -178,7 +221,7 @@ microlink_tcp_socket_t *microlink_tcp_connect(microlink_t *ml, uint32_t dest_ip,
+             setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+             setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+ 
+-            if (connect(fd, (struct sockaddr *)&dest, sizeof(dest)) != 0) {
++            if (connect_with_timeout(fd, (struct sockaddr *)&dest, sizeof(dest), remaining) != 0) {
+                 ESP_LOGE(TAG, "Retry connect() failed: errno=%d", errno);
+                 close(fd);
+                 return NULL;

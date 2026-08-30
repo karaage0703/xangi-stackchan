@@ -4,18 +4,17 @@ import json
 import os
 import random
 import signal
-import threading
-from pathlib import Path
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from pathlib import Path
 from queue import Queue
 
-import requests
-
 from .app_types import BridgeConfig
-from .events import iter_xangi_events, normalize_xangi_stream_url
+from .completion import TurnTimerStore, completion_decision
+from .device_lock import DeviceLock
+from .events import XangiEventStream, normalize_xangi_stream_url
 from .settings import (
     DEFAULT_CONFIG_PATH,
     DEFAULT_INSTANCE_ID,
@@ -25,9 +24,14 @@ from .settings import (
 )
 from .settings_server import DEFAULT_SETTINGS_PORT, start_settings_server
 from .sprite_face import SPRITE_FPS, SpriteFaceRenderer
-from .stackchan import DEFAULT_BAUD, DEFAULT_WIFI_HOST, StackchanConfig, StackchanSerial, apply_profile_defaults, create_backend
-from .voice_conversation import VoiceConversation
-from .head_pet import HeadPetReaction
+from .stackchan import (
+    DEFAULT_BAUD,
+    StackchanConfig,
+    StackchanSerial,
+    StackchanTailnet,
+    apply_profile_defaults,
+    create_backend,
+)
 from .tts import (
     DEFAULT_PIPER_BIN,
     DEFAULT_PIPER_MODEL,
@@ -35,11 +39,11 @@ from .tts import (
     DEFAULT_VOICEVOX_SPEAKER,
     DEFAULT_VOICEVOX_URL,
     PiperProcess,
+    downsample_wav,
     split_text,
     voicevox_synthesize,
-    downsample_wav,
 )
-
+from .voice_conversation import VoiceConversation
 
 DEFAULT_XANGI_URL = "http://127.0.0.1:18888"
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -84,15 +88,17 @@ def detect_puzzle_light_support(backend, config: BridgeConfig) -> dict[str, bool
         command: bool(status.get(status_key))
         for command, status_key, _pattern_key in STATUS_LIGHTS
     }
-    log({
-        "status_lights": [
-            command for command, is_supported in supported.items() if is_supported
-        ],
-        "patterns": {
-            command: status.get(pattern_key)
-            for command, _status_key, pattern_key in STATUS_LIGHTS
-        },
-    })
+    log(
+        {
+            "status_lights": [
+                command for command, is_supported in supported.items() if is_supported
+            ],
+            "patterns": {
+                command: status.get(pattern_key)
+                for command, _status_key, pattern_key in STATUS_LIGHTS
+            },
+        }
+    )
     return supported
 
 
@@ -152,13 +158,15 @@ def _apply_head_touch_firmware_settings(
         )
     except Exception as exc:
         result["head_pet_sound_error"] = str(exc)
-    log({
-        "head_touch_firmware": {
-            "suppress_head_touch_avatar": suppress_head_touch_avatar,
-            "suppress_head_pet_sound": suppress_head_pet_sound,
-            "result": result,
+    log(
+        {
+            "head_touch_firmware": {
+                "suppress_head_touch_avatar": suppress_head_touch_avatar,
+                "suppress_head_pet_sound": suppress_head_pet_sound,
+                "result": result,
+            }
         }
-    })
+    )
     return result
 
 
@@ -184,7 +192,9 @@ def _sprite_available(config: BridgeConfig, backend) -> bool:
         return False
 
 
-def _get_sprite_renderer(config: BridgeConfig, sprite_renderer: list[SpriteFaceRenderer | None]) -> SpriteFaceRenderer:
+def _get_sprite_renderer(
+    config: BridgeConfig, sprite_renderer: list[SpriteFaceRenderer | None]
+) -> SpriteFaceRenderer:
     renderer = sprite_renderer[0]
     sheet_path = _resolve_repo_path(config.sprite_sheet)
     if (
@@ -219,16 +229,21 @@ def _send_sprite_frame(
         if not renderer.firmware_uploaded(key):
             image = renderer.render_expression_frame(expression, step)
             result = backend.cache_image_frame(
-                slot, image, chunk_size=config.serial_chunk, chunk_delay=config.serial_delay
+                slot,
+                image,
+                chunk_size=config.serial_chunk,
+                chunk_delay=config.serial_delay,
             )
-            log({
-                "face": expression,
-                "mode": "sprite_cache",
-                "step": step,
-                "slot": slot,
-                "bytes": len(image),
-                "result": result,
-            })
+            log(
+                {
+                    "face": expression,
+                    "mode": "sprite_cache",
+                    "step": step,
+                    "slot": slot,
+                    "bytes": len(image),
+                    "result": result,
+                }
+            )
             if result.get("status") != "ok":
                 renderer.clear_firmware_uploads()
                 return False
@@ -236,21 +251,33 @@ def _send_sprite_frame(
         result = backend.show_cached_image(slot)
         if result.get("raw") == "":
             result = backend.show_cached_image(slot)
-        log({
-            "face": expression,
-            "mode": "sprite_cached",
-            "step": step,
-            "slot": slot,
-            "result": result,
-        })
+        log(
+            {
+                "face": expression,
+                "mode": "sprite_cached",
+                "step": step,
+                "slot": slot,
+                "result": result,
+            }
+        )
         if result.get("status") == "ok":
             current_face[0] = key
             return True
         return False
 
     image = renderer.render_expression_frame(expression, step)
-    result = backend.send_image(image, chunk_size=config.serial_chunk, chunk_delay=config.serial_delay)
-    log({"face": expression, "mode": "sprite", "step": step, "bytes": len(image), "result": result})
+    result = backend.send_image(
+        image, chunk_size=config.serial_chunk, chunk_delay=config.serial_delay
+    )
+    log(
+        {
+            "face": expression,
+            "mode": "sprite",
+            "step": step,
+            "bytes": len(image),
+            "result": result,
+        }
+    )
     if result.get("status") == "ok":
         current_face[0] = key
         return True
@@ -275,16 +302,21 @@ def _ensure_sprite_animation_frames(
         if not renderer.firmware_uploaded(key):
             image = renderer.render_expression_frame(expression, step)
             result = backend.cache_image_frame(
-                slot, image, chunk_size=config.serial_chunk, chunk_delay=config.serial_delay
+                slot,
+                image,
+                chunk_size=config.serial_chunk,
+                chunk_delay=config.serial_delay,
             )
-            log({
-                "face": expression,
-                "mode": "sprite_cache",
-                "step": step,
-                "slot": slot,
-                "bytes": len(image),
-                "result": result,
-            })
+            log(
+                {
+                    "face": expression,
+                    "mode": "sprite_cache",
+                    "step": step,
+                    "slot": slot,
+                    "bytes": len(image),
+                    "result": result,
+                }
+            )
             if result.get("status") != "ok":
                 renderer.clear_firmware_uploads()
                 return None
@@ -294,7 +326,13 @@ def _ensure_sprite_animation_frames(
 
 
 class SpriteAnimationLoop:
-    def __init__(self, backend, config: BridgeConfig, current_face: list[str | None], sprite_renderer: list[SpriteFaceRenderer | None]):
+    def __init__(
+        self,
+        backend,
+        config: BridgeConfig,
+        current_face: list[str | None],
+        sprite_renderer: list[SpriteFaceRenderer | None],
+    ):
         self.backend = backend
         self.config = config
         self.current_face = current_face
@@ -308,10 +346,14 @@ class SpriteAnimationLoop:
         self._local_animation_expression: str | None = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="sprite-face-animation", daemon=True)
+        self._thread = threading.Thread(
+            target=self._run, name="sprite-face-animation", daemon=True
+        )
 
     def _backoff_seconds(self) -> float:
-        return max(float(getattr(self.backend, "reconnect_interval", 5.0) or 5.0) + 1.0, 5.0)
+        return max(
+            float(getattr(self.backend, "reconnect_interval", 5.0) or 5.0) + 1.0, 5.0
+        )
 
     def _pause_after_send_error(self) -> None:
         self._pause_until = time.time() + self._backoff_seconds()
@@ -335,6 +377,36 @@ class SpriteAnimationLoop:
         with self._lock:
             self._manual_pause = True
 
+    def pause_on_expression(self, expression: str):
+        """Pause animation after showing one immediate static expression.
+
+        Voice input cannot send IMAGE commands after MIC_START, so the listening
+        feedback must be committed before recording begins.  ``pause()`` followed
+        by ``set_expression()`` suppresses that send; keep this as one atomic
+        operation from the caller's point of view instead.
+        """
+        if not expression:
+            self.pause()
+            return
+        with self._lock:
+            self._manual_pause = True
+            self._expression = expression
+            self._step = 0
+        self._stop_local_animation()
+        try:
+            if not _send_sprite_frame(
+                self.backend,
+                self.config,
+                expression,
+                0,
+                self.current_face,
+                self.sprite_renderer,
+            ):
+                self._pause_after_send_error()
+        except Exception as exc:
+            self._pause_after_send_error()
+            log({"face": expression, "mode": "sprite_static", "error": str(exc)})
+
     def resume(self):
         with self._lock:
             self._manual_pause = False
@@ -357,14 +429,23 @@ class SpriteAnimationLoop:
         if self._try_start_local_animation(expression_now):
             return
         try:
-            if not _send_sprite_frame(self.backend, self.config, expression_now, step_now, self.current_face, self.sprite_renderer):
+            if not _send_sprite_frame(
+                self.backend,
+                self.config,
+                expression_now,
+                step_now,
+                self.current_face,
+                self.sprite_renderer,
+            ):
                 self._pause_after_send_error()
         except Exception as exc:
             self._pause_after_send_error()
             log({"face": expression_now, "mode": "sprite", "error": str(exc)})
 
     def _stop_local_animation(self) -> None:
-        if not self._local_animation_active or not hasattr(self.backend, "stop_cached_sprite_animation"):
+        if not self._local_animation_active or not hasattr(
+            self.backend, "stop_cached_sprite_animation"
+        ):
             return
         try:
             result = self.backend.stop_cached_sprite_animation()
@@ -386,33 +467,44 @@ class SpriteAnimationLoop:
         with self._lock:
             if self._manual_pause:
                 return True
-            if self._local_animation_active and self._local_animation_expression == expression:
+            if (
+                self._local_animation_active
+                and self._local_animation_expression == expression
+            ):
                 return True
 
-        slots = _ensure_sprite_animation_frames(self.backend, self.config, expression, self.sprite_renderer)
+        slots = _ensure_sprite_animation_frames(
+            self.backend, self.config, expression, self.sprite_renderer
+        )
         if not slots:
             return False
-        interval_ms = max(50, int(round(1000.0 / SPRITE_FPS))) if SPRITE_FPS > 0 else 1000
+        interval_ms = (
+            max(50, int(round(1000.0 / SPRITE_FPS))) if SPRITE_FPS > 0 else 1000
+        )
         try:
             result = self.backend.start_cached_sprite_animation(slots, interval_ms)
         except Exception as exc:
             self._local_animation_supported = False
             log({"face": expression, "mode": "sprite_anim", "error": str(exc)})
             return False
-        log({
-            "face": expression,
-            "mode": "sprite_anim",
-            "slots": slots,
-            "interval_ms": interval_ms,
-            "result": result,
-        })
+        log(
+            {
+                "face": expression,
+                "mode": "sprite_anim",
+                "slots": slots,
+                "interval_ms": interval_ms,
+                "result": result,
+            }
+        )
         if result.get("status") != "ok":
             self._local_animation_supported = False
             return False
         self._local_animation_supported = True
         self._local_animation_active = True
         self._local_animation_expression = expression
-        self.current_face[0] = f"sprite_anim:{expression}:{self.config.sprite_sheet}:{self.config.sprite_jpeg_quality}"
+        self.current_face[0] = (
+            f"sprite_anim:{expression}:{self.config.sprite_sheet}:{self.config.sprite_jpeg_quality}"
+        )
         return True
 
     def _run(self):
@@ -436,7 +528,14 @@ class SpriteAnimationLoop:
                 expression_now = self._expression
                 step_now = self._step
             try:
-                if not _send_sprite_frame(self.backend, self.config, expression_now, step_now, self.current_face, self.sprite_renderer):
+                if not _send_sprite_frame(
+                    self.backend,
+                    self.config,
+                    expression_now,
+                    step_now,
+                    self.current_face,
+                    self.sprite_renderer,
+                ):
                     self._pause_after_send_error()
             except Exception as exc:
                 self._pause_after_send_error()
@@ -460,13 +559,17 @@ def set_visual_face_if_needed(
         sprite_animator.set_expression(expression)
         return True
     try:
-        return _send_sprite_frame(backend, config, expression, 0, current_face, sprite_renderer)
+        return _send_sprite_frame(
+            backend, config, expression, 0, current_face, sprite_renderer
+        )
     except Exception as exc:
         log({"face": expression, "mode": "sprite", "error": str(exc)})
         return False
 
 
-def set_move_if_needed(backend, yaw: float, pitch: float, current_move: list[float | None]):
+def set_move_if_needed(
+    backend, yaw: float, pitch: float, current_move: list[float | None]
+):
     """Send MOVE:<yaw,pitch> only when target differs from last sent value.
 
     `current_move` carries the last sent [yaw, pitch] across calls so that
@@ -532,13 +635,17 @@ class TalkingSway:
             self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
-        set_move_if_needed(self._backend, self._base_yaw, self._base_pitch, self._current_move)
+        set_move_if_needed(
+            self._backend, self._base_yaw, self._base_pitch, self._current_move
+        )
 
     def _run(self):
         assert self._stop is not None
         while not self._stop.is_set():
             yaw = self._base_yaw + random.uniform(-self._sway_yaw, self._sway_yaw)
-            pitch = self._base_pitch + random.uniform(-self._sway_pitch, self._sway_pitch)
+            pitch = self._base_pitch + random.uniform(
+                -self._sway_pitch, self._sway_pitch
+            )
             set_move_if_needed(self._backend, yaw, pitch, self._current_move)
             if self._stop.wait(self._interval):
                 break
@@ -554,7 +661,9 @@ def set_volume(backend, volume: int):
     return True
 
 
-def synthesize_chunks(chunks: list[str], config: BridgeConfig, piper_process: PiperProcess | None):
+def synthesize_chunks(
+    chunks: list[str], config: BridgeConfig, piper_process: PiperProcess | None
+):
     if config.tts == "none":
         return
     if config.tts == "piper":
@@ -601,7 +710,7 @@ def speak_text(
 ):
     text = (text or "").strip()
     if not text or config.tts == "none":
-        return
+        return None
 
     chunks = split_text(text)
     log({"speaking_chunks": len(chunks)})
@@ -618,6 +727,7 @@ def speak_text(
 
     executor = ThreadPoolExecutor(max_workers=1)
     executor.submit(tts_worker)
+    last_error = None
 
     while True:
         item = wav_queue.get()
@@ -625,6 +735,7 @@ def speak_text(
             break
         if isinstance(item, dict) and "error" in item:
             log({"tts_error": item["error"]})
+            last_error = {"stage": "tts", "error": item["error"]}
             break
         idx, chunk, wav, tts_time = item
         # 送信前にダウンサンプルして USB シリアル転送量を削減 (会話レイテンシ対策)。
@@ -635,7 +746,9 @@ def speak_text(
         started = time.time()
         try:
             _call_if_present(before_wav_send)
-            result = backend.send_wav(wav, chunk_size=config.serial_chunk, chunk_delay=config.serial_delay)
+            result = backend.send_wav(
+                wav, chunk_size=config.serial_chunk, chunk_delay=config.serial_delay
+            )
         except Exception as exc:
             result = {"status": "error", "error": str(exc)}
         finally:
@@ -651,17 +764,35 @@ def speak_text(
                 "result": result,
             }
         )
+        if isinstance(result, dict) and result.get("status") == "error":
+            last_error = {
+                "stage": "device_send",
+                "error": str(result.get("error") or "device send failed"),
+            }
 
     executor.shutdown(wait=False)
+    return last_error
 
 
-def open_backend_with_retry(config: BridgeConfig):
+def _record_speech_error(state: RuntimeState, error) -> None:
+    if not error:
+        return
+    state.record_error(
+        stage=str(error.get("stage") or "speech"),
+        error=str(error.get("error") or "unknown error"),
+        at=time.time(),
+    )
+
+
+def open_backend_with_retry(
+    config: BridgeConfig, state: RuntimeState | None = None, version: int = -1
+):
     while True:
         apply_profile_defaults(config.stackchan)
         backend = create_backend(config.stackchan)
         try:
             backend.open()
-            log({"stackchan": "connected", "wifi": config.stackchan.wifi})
+            log({"stackchan": "connected", "tailnet": config.stackchan.tailnet})
             return backend
         except KeyboardInterrupt:
             raise
@@ -673,7 +804,12 @@ def open_backend_with_retry(config: BridgeConfig):
                     "retry_seconds": config.stackchan_retry_seconds,
                 }
             )
-            time.sleep(config.stackchan_retry_seconds)
+            if state is not None and state.wait_for_update(
+                version, config.stackchan_retry_seconds
+            ):
+                raise ConfigChanged
+            if state is None:
+                time.sleep(config.stackchan_retry_seconds)
 
 
 def should_handle_event(event: dict, config: BridgeConfig) -> bool:
@@ -712,20 +848,14 @@ def close_runtime(
                 state.set_voice_conversation(None)
             except Exception:
                 pass
-            try:
-                head_pet = state.get_head_pet_reaction()
-                if head_pet is not None:
-                    try:
-                        head_pet.stop()
-                    except Exception:
-                        pass
-                state.set_head_pet_reaction(None)
-            except Exception:
-                pass
         if backend:
             if current_puzzle is not None and puzzle_supported is not None:
                 set_puzzle_light_if_needed(
-                    backend, config, config.puzzle_idle, current_puzzle, puzzle_supported
+                    backend,
+                    config,
+                    config.puzzle_idle,
+                    current_puzzle,
+                    puzzle_supported,
                 )
             if (config.face_mode or "avatar").strip().lower() != "sprite":
                 set_face_if_needed(backend, config.face_idle, current_face)
@@ -741,6 +871,7 @@ def close_runtime(
 
 
 def run_bridge(state: RuntimeState):
+    device_lock = None
     backend = None
     piper_process = None
     voice_conv = None
@@ -752,115 +883,187 @@ def run_bridge(state: RuntimeState):
     sprite_renderer: list[SpriteFaceRenderer | None] = [None]
     active_version = -1
     active_turn = None
+    completed_turns: set[str] = set()
+    turn_timers = TurnTimerStore(
+        state.config_path.parent / f"turn-timers-{state.instance_id}.json"
+    )
 
     try:
         while True:
             config, version = state.snapshot()
             if version != active_version:
                 close_runtime(
-                    backend, piper_process, current_face, current_move, config,
-                    voice_conv, state, sprite_animator, current_puzzle, puzzle_supported
+                    backend,
+                    piper_process,
+                    current_face,
+                    current_move,
+                    config,
+                    voice_conv,
+                    state,
+                    sprite_animator,
+                    current_puzzle,
+                    puzzle_supported,
                 )
                 sprite_animator = None
                 state.set_runtime(None, None)
                 state.set_sprite_animator(None)
-                backend = open_backend_with_retry(config)
+                if device_lock is not None:
+                    device_lock.release()
+                    device_lock = None
+                if not config.stackchan.tailnet and not config.stackchan.simulator:
+                    device_lock = DeviceLock(
+                        config.stackchan.port or "auto-detect"
+                    ).acquire()
+                try:
+                    backend = open_backend_with_retry(config, state, version)
+                except ConfigChanged:
+                    if device_lock is not None:
+                        device_lock.release()
+                        device_lock = None
+                    continue
                 piper_process = None
                 if config.tts == "piper":
-                    piper_process = PiperProcess(config.piper_bin, config.piper_model, config.piper_speaker)
+                    piper_process = PiperProcess(
+                        config.piper_bin, config.piper_model, config.piper_speaker
+                    )
                 current_face = [None]
                 current_move = [None, None]
                 current_puzzle = [None]
                 puzzle_supported = [{}]
                 active_turn = None
+                # LCDマイクから送った発話だけは、通常応答の読み上げ設定とは独立して
+                # 返答を喋らせる。STT text と次の web turn.started を対応付ける。
+                pending_voice_text = [None]
+                voice_turn_ids: set[str] = set()
                 active_version = version
                 set_volume(backend, config.volume)
                 puzzle_supported[0] = detect_puzzle_light_support(backend, config)
                 if config.face_rotation is not None:
                     try:
-                        rot_result = backend.send_command(f"ROTATE:{config.face_rotation}")
-                        log({"face_rotation": config.face_rotation, "result": rot_result})
+                        rot_result = backend.send_command(
+                            f"ROTATE:{config.face_rotation}"
+                        )
+                        log(
+                            {
+                                "face_rotation": config.face_rotation,
+                                "result": rot_result,
+                            }
+                        )
                     except Exception as exc:
                         log({"face_rotation": config.face_rotation, "error": str(exc)})
-                sprite_requested = (config.face_mode or "avatar").strip().lower() == "sprite"
+                sprite_requested = (
+                    config.face_mode or "avatar"
+                ).strip().lower() == "sprite"
                 if _sprite_available(config, backend):
-                    sprite_animator = SpriteAnimationLoop(backend, config, current_face, sprite_renderer)
+                    sprite_animator = SpriteAnimationLoop(
+                        backend, config, current_face, sprite_renderer
+                    )
                     sprite_animator.start()
                 elif sprite_requested:
                     # sprite 指定だが使えない → avatar (スタックチャン顔) にフォールバック。
-                    log({
-                        "face_mode": "sprite->avatar fallback",
-                        "reason": "no send_image" if not hasattr(backend, "send_image")
-                        else "spritesheet not found",
-                        "sprite_sheet": config.sprite_sheet,
-                    })
+                    log(
+                        {
+                            "face_mode": "sprite->avatar fallback",
+                            "reason": "no send_image"
+                            if not hasattr(backend, "send_image")
+                            else "spritesheet not found",
+                            "sprite_sheet": config.sprite_sheet,
+                        }
+                    )
                 set_visual_face_if_needed(
-                    backend, config, config.face_idle, current_face, sprite_renderer, sprite_animator
+                    backend,
+                    config,
+                    config.face_idle,
+                    current_face,
+                    sprite_renderer,
+                    sprite_animator,
                 )
                 set_puzzle_light_if_needed(
-                    backend, config, config.puzzle_idle, current_puzzle, puzzle_supported
+                    backend,
+                    config,
+                    config.puzzle_idle,
+                    current_puzzle,
+                    puzzle_supported,
                 )
                 if config.move_enabled:
                     set_move_if_needed(
-                        backend, config.move_idle_yaw, config.move_idle_pitch, current_move
+                        backend,
+                        config.move_idle_yaw,
+                        config.move_idle_pitch,
+                        current_move,
                     )
                 state.set_runtime(backend, piper_process)
                 state.set_sprite_animator(sprite_animator)
                 log({"config_applied": version})
 
-                # 音声対話モード起動 (シリアル backend のみ、WiFi backend は未対応)。
-                # `backend.on_head_touch = self._on_head_touch` の bind が走り、以後
-                # アタマセンサ press で録音 → STT → xangi POST /api/chat が回る。
                 voice_conv = None
-                # 音声入力モード: アタマセンサ press (voice_conversation) か、LCD 下部の
-                # マイクボタン (lcd_mic_voice、cores3-main-0.17+) で録音→STT→xangi を起動。
-                # lcd_mic_voice はアタマセンサを「なで反応」に残せるのが利点 (トリガ分離)。
-                voice_enabled = config.voice_conversation or config.lcd_mic_voice
-                if voice_enabled and isinstance(backend, StackchanSerial):
-                    # アタマセンサを録音トリガに使う (voice_conversation) 場合のみ、
-                    # ファーム側のなでなで feedback (Avatar + 埋め込み音声) を抑制する。
-                    # press が録音開始と二重発火するのを避けるため。lcd_mic_voice では
-                    # アタマセンサはなで反応に残すので抑制しない。
-                    if config.voice_conversation:
-                        _apply_head_touch_firmware_settings(
-                            backend,
-                            suppress_head_touch_avatar=True,
-                            suppress_head_pet_sound=True,
-                        )
+                # LCD下部のマイクボタンだけで録音→STT→xangiを起動する。
+                if config.lcd_mic_voice and isinstance(
+                    backend, (StackchanSerial, StackchanTailnet)
+                ):
                     # ファームが voice 対応 (cores3-main-0.9+) かを起動時に確認。
                     # 未対応なら head_touch event も MIC_START も来ないので
                     # 「動かない」と分かるよう WARN を出す。
                     fw_status = backend.send_command("STATUS")
                     fw_ver = str(fw_status.get("version", "unknown"))
-                    if "mic_recording" not in fw_status or "head_touch" not in fw_status:
-                        log({
-                            "WARN": "firmware does not support voice_conversation",
-                            "version": fw_ver,
-                            "required": "cores3-main-0.9 or later",
-                            "missing_fields": [
-                                k for k in ("mic_recording", "head_touch")
-                                if k not in fw_status
-                            ],
-                        })
+                    if (
+                        "mic_recording" not in fw_status
+                        or "head_touch" not in fw_status
+                    ):
+                        log(
+                            {
+                                "WARN": "firmware does not support LCD mic voice input",
+                                "version": fw_ver,
+                                "required": "cores3-main-0.9 or later",
+                                "missing_fields": [
+                                    k
+                                    for k in ("mic_recording", "head_touch")
+                                    if k not in fw_status
+                                ],
+                            }
+                        )
+
                     def _vc_on_press(event):
-                        log({"voice_press": event.get("gesture"), "at": event.get("at")})
+                        log(
+                            {"voice_press": event.get("gesture"), "at": event.get("at")}
+                        )
                         if sprite_animator is not None:
-                            sprite_animator.pause()
-                        set_visual_face_if_needed(
-                            backend, config, "listening", current_face, sprite_renderer, sprite_animator
+                            sprite_animator.pause_on_expression("listening")
+                        else:
+                            set_visual_face_if_needed(
+                                backend,
+                                config,
+                                "listening",
+                                current_face,
+                                sprite_renderer,
+                                sprite_animator,
+                            )
+
+                    def _vc_on_busy(event):
+                        log(
+                            {"voice_press_ignored": "processing", "at": event.get("at")}
                         )
 
                     def _vc_on_stop(stop_result):
-                        log({"voice_stop": True,
-                             "duration": stop_result.get("duration_seconds"),
-                             "frames": stop_result.get("frames")})
+                        log(
+                            {
+                                "voice_stop": True,
+                                "duration": stop_result.get("duration_seconds"),
+                                "frames": stop_result.get("frames"),
+                            }
+                        )
                         # STT に進まない短すぎる録音 / MIC_START 失敗 / USB 切断復帰では
                         # on_transcribed が呼ばれない。press 時に pause した sprite を
                         # ここで必ず戻し、listening 表示に固まらないようにする。
                         if sprite_animator is not None:
                             sprite_animator.resume()
                         set_visual_face_if_needed(
-                            backend, config, config.face_idle, current_face, sprite_renderer, sprite_animator
+                            backend,
+                            config,
+                            config.face_idle,
+                            current_face,
+                            sprite_renderer,
+                            sprite_animator,
                         )
                         # デバッグ用 WAV 保存 (STACKCHAN_VC_SAVE_WAV=1 で有効化)。
                         # /tmp/voice_test_<ts>.wav に保存して aplay 等で実音確認できる。
@@ -876,13 +1079,25 @@ def run_bridge(state: RuntimeState):
                                     log({"voice_wav_save_failed": str(exc)})
 
                     def _vc_on_transcribed(text, r):
-                        log({"voice_stt": text, "language": r.get("language"),
-                             "elapsed": r.get("elapsed_seconds")})
+                        if text.strip():
+                            pending_voice_text[0] = text.strip()
+                        log(
+                            {
+                                "voice_stt": text,
+                                "language": r.get("language"),
+                                "elapsed": r.get("elapsed_seconds"),
+                            }
+                        )
                         if not text.strip():
                             if sprite_animator is not None:
                                 sprite_animator.resume()
                             set_visual_face_if_needed(
-                                backend, config, config.face_idle, current_face, sprite_renderer, sprite_animator
+                                backend,
+                                config,
+                                config.face_idle,
+                                current_face,
+                                sprite_renderer,
+                                sprite_animator,
                             )
 
                     voice_conv = VoiceConversation(
@@ -894,128 +1109,40 @@ def run_bridge(state: RuntimeState):
                         max_record_seconds=config.voice_max_seconds,
                         initial_grace_seconds=config.voice_initial_grace_seconds,
                         on_press=_vc_on_press,
+                        on_busy=_vc_on_busy,
                         on_stop=_vc_on_stop,
                         on_transcribed=_vc_on_transcribed,
                         on_sent=lambda text, info: log(
                             {"voice_sent": text[:80], "info": info}
                         ),
-                        # アタマセンサ press をトリガに使うのは voice_conversation の時だけ。
-                        # lcd_mic_voice では LCD ボタンのみをトリガにし、アタマセンサは
-                        # ファーム側のなで反応に残す。
-                        trigger_head_touch=config.voice_conversation,
                         trigger_mic_button=True,
                     )
                     voice_conv.start()
-                    log({
-                        "voice_started": True,
-                        "trigger_head_touch": config.voice_conversation,
-                        "trigger_mic_button": True,
-                        "mode": "voice_conversation" if config.voice_conversation else "lcd_mic_voice",
-                    })
+                    log(
+                        {
+                            "voice_started": True,
+                            "trigger_head_touch": False,
+                            "trigger_mic_button": True,
+                            "mode": "lcd_mic_voice",
+                        }
+                    )
                 state.set_voice_conversation(voice_conv)
 
-                # なでなで反応モード: head_touch press/swipe で即セリフを喋る。
-                # voice_conversation と同じ press を消費するので、voice 有効時は起動しない
-                # (voice 優先)。ファーム側 applyHeadTouchAvatar が即 Happy 顔 + 吹き出しを
-                # 出すので、HEADTOUCH_AVATAR は on のままにして「触った瞬間に顔 → 少し
-                # 遅れて喋る」にする。
-                head_pet = None
-                if (
-                    config.head_pet_reaction
-                    and voice_conv is None
-                    and isinstance(backend, StackchanSerial)
-                ):
-                    fw_status = backend.send_command("STATUS")
-                    if "head_touch" not in fw_status:
-                        log({
-                            "WARN": "firmware has no head_touch; --head-pet-reaction "
-                            "will not fire",
-                            "version": str(fw_status.get("version", "unknown")),
-                        })
-                    # ファーム側スタンドアローンなでなで音 (cores3-main-0.16+) は抑制。
-                    # host が TTS で多彩なセリフを喋らせるので、埋め込み音声と二重に
-                    # 鳴らさない。旧ファームは "unknown command" で無害。
+                if isinstance(backend, (StackchanSerial, StackchanTailnet)):
                     _apply_head_touch_firmware_settings(
                         backend,
                         suppress_head_touch_avatar=False,
-                        suppress_head_pet_sound=True,
+                        suppress_head_pet_sound=not config.firmware_head_pet_sound,
                     )
-
-                    def _pet_speak(text):
-                        # 発話前に talking 顔、終わったら idle に戻す。speak_text は
-                        # send_wav 完了までブロックする (専用 thread から呼ばれる)。
-                        before_wav_send, after_wav_send = _sprite_wav_hooks(sprite_animator)
-                        _call_if_present(before_wav_send)
-                        set_puzzle_light_if_needed(
-                            backend, config, config.puzzle_talking, current_puzzle, puzzle_supported
+                # USB/Tailnetの再接続後に、デバイス再起動で既定値へ戻った本体設定を
+                # host側の設定へ復元する。
+                if isinstance(backend, (StackchanSerial, StackchanTailnet)):
+                    if isinstance(backend, StackchanSerial):
+                        backend.reconnect_interval = max(
+                            config.stackchan_retry_seconds, 1.0
                         )
-                        set_visual_face_if_needed(
-                            backend, config, config.face_talking, current_face,
-                            sprite_renderer, sprite_animator,
-                        )
-                        try:
-                            speak_text(
-                                backend,
-                                text,
-                                config,
-                                piper_process,
-                                before_wav_send=before_wav_send,
-                                after_wav_send=after_wav_send,
-                            )
-                        finally:
-                            set_puzzle_light_if_needed(
-                                backend, config, config.puzzle_idle, current_puzzle, puzzle_supported
-                            )
-                            set_visual_face_if_needed(
-                                backend, config, config.face_idle, current_face,
-                                sprite_renderer, sprite_animator,
-                            )
-                            _call_if_present(after_wav_send)
-
-                    def _pet_on_react(phrase, event):
-                        log({
-                            "head_pet": phrase,
-                            "gesture": event.get("gesture"),
-                            "at": event.get("at"),
-                        })
-
-                    head_pet = HeadPetReaction(
-                        backend,
-                        speak=_pet_speak,
-                        on_react=_pet_on_react,
-                        phrases=config.head_pet_phrases or None,
-                        cooldown_seconds=config.head_pet_cooldown_seconds,
-                    )
-                    head_pet.start()
-                    log({
-                        "head_pet_reaction": "started",
-                        "phrases": len(head_pet.phrases),
-                        "cooldown": config.head_pet_cooldown_seconds,
-                    })
-                state.set_head_pet_reaction(head_pet)
-
-                if isinstance(backend, StackchanSerial):
-                    suppress_head_touch = bool(config.voice_conversation)
-                    suppress_head_pet_sound = bool(
-                        config.voice_conversation or head_pet is not None
-                    )
-                    _apply_head_touch_firmware_settings(
-                        backend,
-                        suppress_head_touch_avatar=suppress_head_touch,
-                        suppress_head_pet_sound=suppress_head_pet_sound,
-                    )
-
-                # 稼働中シリアル切断 (デバイス再起動 / USB 再列挙で ttyACMx が変わる)
-                # からの自動再接続後に、デバイス状態を再初期化する。デバイス側は
-                # 再起動して boot 状態 (デフォルト音量 / avatar 顔 / ファーム設定
-                # リセット) に戻っているので、host が把握している状態を送り直す。
-                # StackchanSerial._reconnect_loop の thread から呼ばれる。
-                if isinstance(backend, StackchanSerial):
-                    backend.reconnect_interval = max(config.stackchan_retry_seconds, 1.0)
-                    suppress_head_touch = bool(config.voice_conversation)
-                    suppress_head_pet_sound = bool(
-                        config.voice_conversation or head_pet is not None
-                    )
+                    suppress_head_touch = False
+                    suppress_head_pet_sound = not config.firmware_head_pet_sound
 
                     def _reinit_after_reconnect(
                         backend=backend,
@@ -1028,12 +1155,14 @@ def run_bridge(state: RuntimeState):
                         suppress_head_touch=suppress_head_touch,
                         suppress_head_pet_sound=suppress_head_pet_sound,
                     ):
-                        log({"serial": "reinit_after_reconnect"})
+                        log({"device": "reinit_after_reconnect"})
                         try:
                             set_volume(backend, config.volume)
                             if config.face_rotation is not None:
                                 backend.send_command(f"ROTATE:{config.face_rotation}")
-                            puzzle_supported[0] = detect_puzzle_light_support(backend, config)
+                            puzzle_supported[0] = detect_puzzle_light_support(
+                                backend, config
+                            )
                             _apply_head_touch_firmware_settings(
                                 backend,
                                 suppress_head_touch_avatar=suppress_head_touch,
@@ -1049,21 +1178,34 @@ def run_bridge(state: RuntimeState):
                             current_move[1] = None
                             current_puzzle[0] = None
                             set_visual_face_if_needed(
-                                backend, config, config.face_idle, current_face,
-                                sprite_renderer, sprite_animator,
+                                backend,
+                                config,
+                                config.face_idle,
+                                current_face,
+                                sprite_renderer,
+                                sprite_animator,
                             )
                             set_puzzle_light_if_needed(
-                                backend, config, config.puzzle_idle, current_puzzle, puzzle_supported
+                                backend,
+                                config,
+                                config.puzzle_idle,
+                                current_puzzle,
+                                puzzle_supported,
                             )
                             if config.move_enabled:
                                 set_move_if_needed(
-                                    backend, config.move_idle_yaw,
-                                    config.move_idle_pitch, current_move,
+                                    backend,
+                                    config.move_idle_yaw,
+                                    config.move_idle_pitch,
+                                    current_move,
                                 )
                         except Exception as exc:
-                            log({"serial": "reinit_error", "error": str(exc)})
+                            log({"device": "reinit_error", "error": str(exc)})
 
-                    backend.on_reconnected = _reinit_after_reconnect
+                    if isinstance(backend, StackchanSerial):
+                        backend.on_reconnected = _reinit_after_reconnect
+                    else:
+                        backend.on_connected = _reinit_after_reconnect
 
             stream_url = normalize_xangi_stream_url(config.xangi_url)
             backoff = max(config.retry_seconds, 1.0)
@@ -1076,49 +1218,85 @@ def run_bridge(state: RuntimeState):
                     break
                 try:
                     log({"_bridge_event": "connecting", "url": stream_url})
-                    for event in iter_xangi_events(stream_url, timeout=config.stream_timeout):
+                    event_stream = XangiEventStream(
+                        stream_url, timeout=config.stream_timeout
+                    )
+                    state.set_config_notifier(event_stream.close)
+                    for event in event_stream:
                         config, version = state.snapshot()
                         if version != active_version:
                             raise ConfigChanged
                         if event.get("_sse_event") == "ready":
                             log({"ready": event})
                             continue
-                        if not should_handle_event(event, config):
-                            continue
-
                         event_type = event.get("type")
                         if not event_type:
                             continue
+                        state.record_event(str(event_type), time.time())
+                        if not should_handle_event(event, config):
+                            continue
 
-                        # マイク録音中 (voice_conversation の MIC_START 〜 MIC_STOP の
+                        # マイク録音中 (LCDマイク入力の MIC_START 〜 MIC_STOP の
                         # 期間) は SSE event の actuator 反応 (FACE/MOVE/WAV) を全て
                         # skip。これで他チャンネル (Discord 等) からの message.delta
                         # / turn.complete がシリアルに同時アクセスして録音 PCM 破綻 +
                         # multi access on port 警告を起こすのを防ぐ。
                         # 自身の音声入力 → 応答経路は、stop_mic_recording (Speaker 復帰)
                         # 後に turn.started → turn.complete が来るので影響無し。
-                        if (
-                            isinstance(backend, StackchanSerial)
-                            and getattr(backend, "_mic_recording", False)
+                        if isinstance(backend, StackchanSerial) and getattr(
+                            backend, "_mic_recording", False
                         ):
-                            log({"_skip_event_during_mic": event_type, "turn_id": event.get("turn_id")})
+                            log(
+                                {
+                                    "_skip_event_during_mic": event_type,
+                                    "turn_id": event.get("turn_id"),
+                                }
+                            )
                             continue
 
                         log(event)
 
                         if event_type == "turn.started":
                             active_turn = event.get("turn_id")
+                            if active_turn:
+                                turn_timers.start(
+                                    str(active_turn),
+                                    float(event.get("ts") or time.time()),
+                                )
+                            if (
+                                active_turn
+                                and event.get("platform") == "web"
+                                and pending_voice_text[0]
+                                and event.get("user_text", "").strip()
+                                == pending_voice_text[0]
+                            ):
+                                voice_turn_ids.add(str(active_turn))
+                                pending_voice_text[0] = None
                             # ユーザがファーム LCD 長押しで前 turn を止めた状態
                             # (user_stopped=True) を新 turn 開始でリセット。これで
                             # 次の send_wav から通常動作復帰する。
                             if getattr(backend, "user_stopped", False):
                                 backend.user_stopped = False
-                                log({"user_stopped": "cleared", "reason": "turn.started"})
+                                log(
+                                    {
+                                        "user_stopped": "cleared",
+                                        "reason": "turn.started",
+                                    }
+                                )
                             set_visual_face_if_needed(
-                                backend, config, config.face_thinking, current_face, sprite_renderer, sprite_animator
+                                backend,
+                                config,
+                                config.face_thinking,
+                                current_face,
+                                sprite_renderer,
+                                sprite_animator,
                             )
                             set_puzzle_light_if_needed(
-                                backend, config, config.puzzle_thinking, current_puzzle, puzzle_supported
+                                backend,
+                                config,
+                                config.puzzle_thinking,
+                                current_puzzle,
+                                puzzle_supported,
                             )
                             if config.move_enabled:
                                 set_move_if_needed(
@@ -1130,21 +1308,75 @@ def run_bridge(state: RuntimeState):
                         elif event_type == "message.delta":
                             if active_turn == event.get("turn_id"):
                                 set_visual_face_if_needed(
-                                    backend, config, config.face_talking, current_face, sprite_renderer, sprite_animator
+                                    backend,
+                                    config,
+                                    config.face_talking,
+                                    current_face,
+                                    sprite_renderer,
+                                    sprite_animator,
                                 )
                                 set_puzzle_light_if_needed(
-                                    backend, config, config.puzzle_talking, current_puzzle, puzzle_supported
+                                    backend,
+                                    config,
+                                    config.puzzle_talking,
+                                    current_puzzle,
+                                    puzzle_supported,
                                 )
                         elif event_type == "turn.complete":
+                            completed_turn = str(event.get("turn_id") or "")
+                            duplicate = bool(
+                                completed_turn and completed_turn in completed_turns
+                            )
+                            if completed_turn:
+                                completed_turns.add(completed_turn)
+                                if len(completed_turns) > 1024:
+                                    completed_turns.clear()
+                                    completed_turns.add(completed_turn)
+                            voice_response = completed_turn in voice_turn_ids
+                            voice_turn_ids.discard(completed_turn)
+                            started_at = turn_timers.pop(completed_turn)
+                            elapsed = (
+                                float(event.get("ts") or time.time()) - started_at
+                                if started_at is not None
+                                else None
+                            )
+                            decision = completion_decision(
+                                event.get("text", ""),
+                                speak_responses=config.speak_responses,
+                                force_response=voice_response,
+                                completion_notifications=config.completion_notifications,
+                                elapsed_seconds=elapsed,
+                                after_seconds=config.completion_after_seconds,
+                                max_chars=config.completion_summary_chars,
+                                duplicate=duplicate,
+                            )
+                            spoken_text = decision["text"]
+                            state.record_completion(
+                                notified=bool(decision["notified"]),
+                                reason=str(decision["reason"]),
+                                at=time.time(),
+                            )
                             active_turn = None
-                            set_visual_face_if_needed(
-                                backend, config, config.face_talking, current_face, sprite_renderer, sprite_animator
-                            )
-                            set_puzzle_light_if_needed(
-                                backend, config, config.puzzle_talking, current_puzzle, puzzle_supported
-                            )
-                            if config.move_enabled:
-                                before_wav_send, after_wav_send = _sprite_wav_hooks(sprite_animator)
+                            if spoken_text:
+                                set_visual_face_if_needed(
+                                    backend,
+                                    config,
+                                    config.face_talking,
+                                    current_face,
+                                    sprite_renderer,
+                                    sprite_animator,
+                                )
+                                set_puzzle_light_if_needed(
+                                    backend,
+                                    config,
+                                    config.puzzle_talking,
+                                    current_puzzle,
+                                    puzzle_supported,
+                                )
+                            if spoken_text and config.move_enabled:
+                                before_wav_send, after_wav_send = _sprite_wav_hooks(
+                                    sprite_animator
+                                )
                                 with TalkingSway(
                                     backend,
                                     config.move_idle_yaw,
@@ -1154,29 +1386,46 @@ def run_bridge(state: RuntimeState):
                                     config.move_talking_sway_interval,
                                     current_move,
                                 ):
+                                    _record_speech_error(
+                                        state,
+                                        speak_text(
+                                            backend,
+                                            spoken_text,
+                                            config,
+                                            piper_process,
+                                            before_wav_send=before_wav_send,
+                                            after_wav_send=after_wav_send,
+                                        ),
+                                    )
+                            elif spoken_text:
+                                before_wav_send, after_wav_send = _sprite_wav_hooks(
+                                    sprite_animator
+                                )
+                                _record_speech_error(
+                                    state,
                                     speak_text(
                                         backend,
-                                        event.get("text", ""),
+                                        spoken_text,
                                         config,
                                         piper_process,
                                         before_wav_send=before_wav_send,
                                         after_wav_send=after_wav_send,
-                                    )
-                            else:
-                                before_wav_send, after_wav_send = _sprite_wav_hooks(sprite_animator)
-                                speak_text(
-                                    backend,
-                                    event.get("text", ""),
-                                    config,
-                                    piper_process,
-                                    before_wav_send=before_wav_send,
-                                    after_wav_send=after_wav_send,
+                                    ),
                                 )
                             set_visual_face_if_needed(
-                                backend, config, config.face_idle, current_face, sprite_renderer, sprite_animator
+                                backend,
+                                config,
+                                config.face_idle,
+                                current_face,
+                                sprite_renderer,
+                                sprite_animator,
                             )
                             set_puzzle_light_if_needed(
-                                backend, config, config.puzzle_idle, current_puzzle, puzzle_supported
+                                backend,
+                                config,
+                                config.puzzle_idle,
+                                current_puzzle,
+                                puzzle_supported,
                             )
                             if config.move_enabled:
                                 set_move_if_needed(
@@ -1186,12 +1435,24 @@ def run_bridge(state: RuntimeState):
                                     current_move,
                                 )
                         elif event_type == "turn.aborted":
+                            aborted_turn = str(event.get("turn_id") or "")
+                            turn_timers.pop(aborted_turn)
+                            voice_turn_ids.discard(aborted_turn)
                             active_turn = None
                             set_visual_face_if_needed(
-                                backend, config, config.face_idle, current_face, sprite_renderer, sprite_animator
+                                backend,
+                                config,
+                                config.face_idle,
+                                current_face,
+                                sprite_renderer,
+                                sprite_animator,
                             )
                             set_puzzle_light_if_needed(
-                                backend, config, config.puzzle_idle, current_puzzle, puzzle_supported
+                                backend,
+                                config,
+                                config.puzzle_idle,
+                                current_puzzle,
+                                puzzle_supported,
                             )
                             if config.move_enabled:
                                 set_move_if_needed(
@@ -1203,10 +1464,19 @@ def run_bridge(state: RuntimeState):
                         elif event_type == "agent.error":
                             active_turn = None
                             set_visual_face_if_needed(
-                                backend, config, config.face_error, current_face, sprite_renderer, sprite_animator
+                                backend,
+                                config,
+                                config.face_error,
+                                current_face,
+                                sprite_renderer,
+                                sprite_animator,
                             )
                             set_puzzle_light_if_needed(
-                                backend, config, config.puzzle_error, current_puzzle, puzzle_supported
+                                backend,
+                                config,
+                                config.puzzle_error,
+                                current_puzzle,
+                                puzzle_supported,
                             )
                             if config.move_enabled:
                                 set_move_if_needed(
@@ -1222,7 +1492,17 @@ def run_bridge(state: RuntimeState):
                 except KeyboardInterrupt:
                     raise
                 except Exception as exc:
-                    log({"_bridge_event": "stream_error", "error": str(exc), "retry_seconds": backoff})
+                    config, version = state.snapshot()
+                    if version != active_version:
+                        log({"config_changed": version})
+                        break
+                    log(
+                        {
+                            "_bridge_event": "stream_error",
+                            "error": str(exc),
+                            "retry_seconds": backoff,
+                        }
+                    )
                     time.sleep(backoff)
                     backoff = min(backoff * 2, max_backoff)
     except KeyboardInterrupt:
@@ -1231,50 +1511,81 @@ def run_bridge(state: RuntimeState):
         config, _ = state.snapshot()
         state.set_runtime(None, None)
         close_runtime(
-            backend, piper_process, current_face, current_move, config,
-            voice_conv, state, sprite_animator, current_puzzle, puzzle_supported
+            backend,
+            piper_process,
+            current_face,
+            current_move,
+            config,
+            voice_conv,
+            state,
+            sprite_animator,
+            current_puzzle,
+            puzzle_supported,
         )
+        if device_lock:
+            device_lock.release()
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Physical xangi pet bridge for stackchan family devices (K151 / stackchan-atama)")
+    parser = argparse.ArgumentParser(
+        description="Physical xangi pet bridge for stackchan family devices (K151 / stackchan-atama)"
+    )
     parser.add_argument("--xangi-url", default=DEFAULT_XANGI_URL)
     parser.add_argument("--thread-id", default=None)
     parser.add_argument("--stream-timeout", type=int, default=65)
     parser.add_argument("--retry-seconds", type=float, default=1.0)
     parser.add_argument("--max-retry-seconds", type=float, default=30.0)
 
-    parser.add_argument("--wifi", action="store_true")
+    parser.add_argument(
+        "--tailnet",
+        action="store_true",
+        help="CoreS3からのMicroLink reverse TCP接続を待ち受ける",
+    )
+    parser.add_argument("--tailnet-bind", default="0.0.0.0")
+    parser.add_argument("--tailnet-port", type=int, default=18765)
     parser.add_argument(
         "--simulator",
         action="store_true",
         help="USB/WiFi デバイスに接続せず、ブラウザ /simulator 用の in-memory "
         "バックエンドを使う。実機なしで FACE/MOVE/WAV/PUZZLE の流れを確認する。",
     )
-    parser.add_argument("--host", default=DEFAULT_WIFI_HOST)
     parser.add_argument("--port", default="")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD)
-    parser.add_argument("--device-profile", default="",
-                        help="プリセット選択 (cores3_k151 / cores3_standalone / atoms3r / rt_beta)。"
-                             "指定すると baud / max_wav_bytes の既定値が埋まる")
-    parser.add_argument("--max-wav-bytes", type=int, default=0,
-                        help="WAV サイズ上限 (byte)。0 = 無制限 (ファーム側に任せる)。"
-                             "rt_beta profile は 96KB、atoms3r は 256KB が既定")
-    parser.add_argument("--skip-move-during-wav", action="store_true",
-                        help="WAV 再生中の MOVE 送信をスキップ (rt_beta 既定 ON)。"
-                             "M5Stack Basic + アールティ PCB のように USB 給電と"
-                             "サーボ電源を共有する構成で電流ラッシュ → USB 切断を回避")
+    parser.add_argument(
+        "--device-profile",
+        default="",
+        help="プリセット選択 (cores3_k151 / cores3_standalone / atoms3r / rt_beta)。"
+        "指定すると baud / max_wav_bytes の既定値が埋まる",
+    )
+    parser.add_argument(
+        "--max-wav-bytes",
+        type=int,
+        default=0,
+        help="WAV サイズ上限 (byte)。0 = 無制限 (ファーム側に任せる)。"
+        "rt_beta profile は 96KB、atoms3r は 256KB が既定",
+    )
+    parser.add_argument(
+        "--skip-move-during-wav",
+        action="store_true",
+        help="WAV 再生中の MOVE 送信をスキップ (rt_beta 既定 ON)。"
+        "M5Stack Basic + アールティ PCB のように USB 給電と"
+        "サーボ電源を共有する構成で電流ラッシュ → USB 切断を回避",
+    )
     parser.add_argument("--volume", type=int, default=255)
     parser.add_argument("--serial-chunk", type=int, default=1024)
     parser.add_argument("--serial-delay", type=float, default=0.005)
     parser.add_argument("--stackchan-retry-seconds", type=float, default=3.0)
 
-    parser.add_argument("--tts", choices=["piper", "voicevox", "none"], default=DEFAULT_TTS)
+    parser.add_argument(
+        "--tts", choices=["piper", "voicevox", "none"], default=DEFAULT_TTS
+    )
     parser.add_argument("--piper-bin", default=DEFAULT_PIPER_BIN)
     parser.add_argument("--piper-model", default=DEFAULT_PIPER_MODEL)
     parser.add_argument("--piper-speaker", type=int, default=0)
     parser.add_argument("--voicevox-url", default=DEFAULT_VOICEVOX_URL)
-    parser.add_argument("--voicevox-speaker", type=int, default=DEFAULT_VOICEVOX_SPEAKER)
+    parser.add_argument(
+        "--voicevox-speaker", type=int, default=DEFAULT_VOICEVOX_SPEAKER
+    )
 
     parser.add_argument(
         "--face-rotation",
@@ -1317,7 +1628,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    parser.add_argument("--move-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--move-enabled", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--move-idle-yaw", type=float, default=0.0)
     parser.add_argument("--move-idle-pitch", type=float, default=5.0)
     parser.add_argument("--move-thinking-yaw", type=float, default=-8.0)
@@ -1340,16 +1653,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--puzzle-error", default="error")
 
     parser.add_argument(
-        "--voice-conversation",
-        action="store_true",
-        help="アタマ touch (Si12T) → 録音 → STT (faster-whisper) → xangi /api/chat "
-        "投入の音声対話モードを有効化。M5Stackchan K151 + シリアル backend 前提。"
-        "応答 TTS と発話は既存の SSE 経路で自動処理される。",
-    )
-    parser.add_argument(
         "--voice-app-session-id",
         default="",
-        help="--voice-conversation 時に xangi に投げる appSessionId。空なら xangi "
+        help="LCDマイク音声入力を xangi に投げる appSessionId。空なら xangi "
         "側で最新 web session が選ばれる。複数 xangi インスタンスを使い分ける時のみ指定。",
     )
     parser.add_argument(
@@ -1374,7 +1680,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--voice-initial-grace-seconds",
         type=float,
         default=5.0,
-        help="なでてから最初の発話までの猶予秒数 (既定 5)。この間の無音では止めない。",
+        help="録音開始から最初の発話までの猶予秒数 (既定 5)。この間の無音では止めない。",
     )
 
     parser.add_argument(
@@ -1384,34 +1690,28 @@ def build_parser() -> argparse.ArgumentParser:
         "接続先 xangi が Discord 等も捌いている時、音声入力 (web) の応答だけ喋らせたい等で使う。",
     )
     parser.add_argument(
+        "--speak-responses", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument(
+        "--completion-notifications",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--completion-after-seconds", type=float, default=30.0)
+    parser.add_argument("--completion-summary-chars", type=int, default=100)
+    parser.add_argument(
         "--lcd-mic-voice",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="LCD 下部のマイクボタン (短くタップ) で音声入力 (録音→STT→xangi) を起動する。"
-        "アタマセンサは使わないので、--head-pet-reaction やファームのなで反応と同居できる。"
+        "アタマセンサは使わず、ファームのなで反応と同居できる。"
         "cores3-main-0.17+ 前提。既定で有効。無効化は --no-lcd-mic-voice。",
     )
     parser.add_argument(
-        "--head-pet-reaction",
+        "--firmware-head-pet-sound",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="なでなで反応モード。アタマ touch (head_touch) を触った瞬間にランダムな "
-        "セリフを喋る。話しかけ不要で「とにかく反応する」デモ向け。シリアル backend + "
-        "head_touch 対応ファーム前提。--voice-conversation とは排他 (voice 優先)。"
-        "既定で有効。無効化は --no-head-pet-reaction。",
-    )
-    parser.add_argument(
-        "--head-pet-phrases",
-        default="",
-        help="なでなで反応のセリフ候補をカンマ区切りで指定。空ならモジュール既定を使う。"
-        '例: "なでなでありがとう,えへへ,もっとなでて"',
-    )
-    parser.add_argument(
-        "--head-pet-cooldown-seconds",
-        type=float,
-        default=2.0,
-        help="なでなで反応の発話完了後クールダウン秒数 (既定 2.0)。連打/なで続けで "
-        "反応が積み上がらないようにする。",
+        help="firmware内蔵のなでなで音声を切り替える。",
     )
 
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
@@ -1444,14 +1744,15 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
         xangi_url=args.xangi_url,
         thread_id=args.thread_id,
         stackchan=StackchanConfig(
-            wifi=args.wifi,
+            tailnet=args.tailnet,
             simulator=args.simulator,
-            host=args.host,
             port=args.port,
             baud=args.baud,
             device_profile=args.device_profile,
             max_wav_bytes=args.max_wav_bytes,
             skip_move_during_wav=args.skip_move_during_wav,
+            tailnet_bind=args.tailnet_bind,
+            tailnet_port=args.tailnet_port,
         ),
         volume=max(0, min(255, args.volume)),
         tts=args.tts,
@@ -1489,7 +1790,6 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
         puzzle_thinking=args.puzzle_thinking,
         puzzle_talking=args.puzzle_talking,
         puzzle_error=args.puzzle_error,
-        voice_conversation=args.voice_conversation,
         voice_app_session_id=args.voice_app_session_id,
         voice_silence_dbfs=args.voice_silence_dbfs,
         voice_silence_seconds=args.voice_silence_seconds,
@@ -1499,91 +1799,12 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
         speak_platforms=[
             p.strip() for p in args.speak_platforms.split(",") if p.strip()
         ],
-        head_pet_reaction=args.head_pet_reaction,
-        head_pet_phrases=[
-            p.strip() for p in args.head_pet_phrases.split(",") if p.strip()
-        ],
-        head_pet_cooldown_seconds=args.head_pet_cooldown_seconds,
+        speak_responses=args.speak_responses,
+        completion_notifications=args.completion_notifications,
+        completion_after_seconds=max(0.0, args.completion_after_seconds),
+        completion_summary_chars=max(20, args.completion_summary_chars),
+        firmware_head_pet_sound=args.firmware_head_pet_sound,
     )
-
-
-def _ensure_voice_session(args: argparse.Namespace) -> None:
-    """voice_conversation 起動時に xangi に専用 web session を作って、
-    args.voice_app_session_id と args.thread_id を自動セットする。
-
-    既に voice_app_session_id 指定があるか、--thread-id 指定があれば skip。
-    新規 session を作ることで:
-      - POST /api/chat は stackchan 専用 session に投入される (他 web セッションを汚さない)
-      - SSE event の thread_id が `web:<sid>` で固定 → 他チャンネル
-        (Discord 等) の noise が `should_handle_event` で skip されて、
-        Mic 録音中のシリアル衝突を回避できる
-    """
-    if not args.voice_conversation:
-        return
-    if args.voice_app_session_id and args.thread_id:
-        return  # 既に両方指定ある
-
-    try:
-        r = requests.post(
-            f"{args.xangi_url.rstrip('/')}/api/sessions",
-            json={},
-            timeout=10,
-        )
-        if not r.ok:
-            log({"voice_session_create_failed": r.status_code, "body": r.text[:200]})
-            return
-        data = r.json()
-        sid = data.get("sessionId") or data.get("id") or ""
-        if not sid:
-            log({"voice_session_create_failed": "no sessionId in response", "body": data})
-            return
-        log({"voice_session_created": sid})
-        if not args.voice_app_session_id:
-            args.voice_app_session_id = sid
-        if not args.thread_id:
-            args.thread_id = f"web:{sid}"
-    except Exception as exc:
-        log({"voice_session_create_failed": str(exc)})
-
-
-def _align_voice_thread(config: BridgeConfig) -> BridgeConfig:
-    """Route voice conversation replies back to the Stack-chan bridge.
-
-    Persisted settings can contain a Discord thread filter from a previous
-    bridge run plus a web appSessionId for voice input. In that split-brain
-    state, voice POSTs go to `web:<session>` while the bridge only accepts
-    `discord:<channel>` events, so it discards its own reply.
-    """
-    if not config.voice_conversation or not config.voice_app_session_id:
-        return config
-    voice_thread_id = f"web:{config.voice_app_session_id}"
-    if config.thread_id == voice_thread_id:
-        return config
-    log({
-        "voice_thread_aligned": voice_thread_id,
-        "previous_thread_id": config.thread_id,
-    })
-    return replace(config, thread_id=voice_thread_id)
-
-
-def _clear_stale_voice_thread_filter(config: BridgeConfig) -> BridgeConfig:
-    """Drop an auto-created voice session thread filter outside voice mode.
-
-    `--voice-conversation` creates a dedicated web session and stores both
-    voice_app_session_id and thread_id.  When the same config namespace is later
-    used for the normal LCD mic mode, that thread filter would make the bridge
-    ignore browser input from any other web session.  Keep explicit thread
-    filters intact; only clear the exact auto-created voice thread.
-    """
-    if config.voice_conversation or not config.voice_app_session_id:
-        return config
-    voice_thread_id = f"web:{config.voice_app_session_id}"
-    if config.thread_id != voice_thread_id:
-        return config
-    log({
-        "stale_voice_thread_cleared": voice_thread_id,
-    })
-    return replace(config, thread_id=None)
 
 
 def _install_faulthandler() -> None:
@@ -1604,35 +1825,16 @@ def main(argv: list[str] | None = None):
     _install_faulthandler()
     parser = build_parser()
     args = parser.parse_args(argv)
-    _ensure_voice_session(args)
-    ensured_voice_app_session_id = args.voice_app_session_id
-    if args.voice_conversation and not args.voice_app_session_id:
-        # _ensure_voice_session が失敗 (xangi が起動してない / /api/sessions 未実装)
-        # した状態。このまま起動すると POST /api/chat が「最新 web session」を選んで
-        # 意図しない既存 session を汚染する。明示警告 + 起動継続。
-        print(
-            "[xangi-stackchan] WARNING: voice_conversation enabled but no dedicated "
-            "web session created (xangi /api/sessions failed). POST /api/chat will "
-            "fall back to the latest web session — verify --xangi-url is reachable "
-            "or pass --voice-app-session-id <id> manually.",
-            file=sys.stderr,
-        )
     config_path = Path(args.config).expanduser()
     instance_id = args.instance_id.strip() or DEFAULT_INSTANCE_ID
     config = merge_config(
         config_from_args(args), load_instance_dict(config_path, instance_id)
     )
-    if args.voice_conversation and ensured_voice_app_session_id:
-        config = replace(config, voice_app_session_id=ensured_voice_app_session_id)
-    config = _align_voice_thread(config)
-    config = _clear_stale_voice_thread_filter(config)
     if config.tts == "piper" and not config.piper_model:
         parser.error("--piper-model is required when using --tts piper")
     state = RuntimeState(config, config_path, instance_id=instance_id)
 
-    serial_target = (
-        config.stackchan.host if config.stackchan.wifi else (config.stackchan.port or "")
-    )
+    serial_target = "" if config.stackchan.tailnet else (config.stackchan.port or "")
     bound_config_port: int | None = None
     if not args.no_settings_ui:
         autoshift = 1 if args.no_port_autoshift else max(1, args.port_autoshift_tries)
@@ -1649,7 +1851,7 @@ def main(argv: list[str] | None = None):
             "boot": True,
             "instance_id": instance_id,
             "serial_port": serial_target,
-            "wifi": config.stackchan.wifi,
+            "tailnet": config.stackchan.tailnet,
             "bound_config_port": bound_config_port,
             "thread_id": config.thread_id,
             "xangi_url": config.xangi_url,

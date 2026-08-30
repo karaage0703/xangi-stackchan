@@ -1,23 +1,25 @@
 import glob
 import io
+import ipaddress
 import json
 import os
 import platform
+import socket
 import struct
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from queue import Empty, Queue
 
-import requests
 import serial
 import serial.tools.list_ports
 
 from .serial_actor import SerialActor
 
-
 DEFAULT_BAUD = 921600
-DEFAULT_WIFI_HOST = os.environ.get("STACKCHAN_IP", "192.168.1.100")
+DEFAULT_TAILNET_PORT = 18765
+TAILNET_IPV4 = ipaddress.ip_network("100.64.0.0/10")
 
 
 # デバイスごとの既定値プリセット。CLI --device-profile / 設定 UI で選択する。
@@ -143,20 +145,21 @@ def _ack_predicate_for(cmd: str) -> Callable[[str], bool]:
 
     if signature is None:
         # 不明コマンド: generic JSON line (event を除く)
-        def pred_generic(l: str) -> bool:
-            return l.startswith("{") and '"event"' not in l
+        def pred_generic(line: str) -> bool:
+            return line.startswith("{") and '"event"' not in line
+
         return pred_generic
 
     sig = signature
 
-    def pred_specific(l: str) -> bool:
-        if not l.startswith("{") or '"event"' in l:
+    def pred_specific(line: str) -> bool:
+        if not line.startswith("{") or '"event"' in line:
             return False
-        if sig in l:
+        if sig in line:
             return True
         # error ack は signature 持たないので別経路で通す (例: "queue full",
         # "not recording", "mic recording active" 等)
-        if '"error"' in l:
+        if '"error"' in line:
             return True
         return False
 
@@ -280,7 +283,7 @@ class StackchanSerial:
         try:
             self.actor.write(b"MIC_STOP\n")
             self.actor.expect_line(
-                lambda l: l.startswith("{") and "event" not in l, timeout=2.0
+                lambda line: line.startswith("{") and "event" not in line, timeout=2.0
             )
         except Exception:
             pass
@@ -398,7 +401,9 @@ class StackchanSerial:
                 continue
             self._disconnected.clear()
             print(
-                json.dumps({"serial": "reconnected", "port": self.port, "attempt": attempt}),
+                json.dumps(
+                    {"serial": "reconnected", "port": self.port, "attempt": attempt}
+                ),
                 flush=True,
             )
             cb = self.on_reconnected
@@ -407,7 +412,9 @@ class StackchanSerial:
                     cb()
                 except Exception as exc:
                     print(
-                        json.dumps({"serial": "reconnect_callback_error", "error": str(exc)}),
+                        json.dumps(
+                            {"serial": "reconnect_callback_error", "error": str(exc)}
+                        ),
                         flush=True,
                     )
             return
@@ -513,7 +520,8 @@ class StackchanSerial:
             try:
                 self.actor.write(b"MIC_START\n")
                 ack_line = self.actor.expect_line(
-                    lambda l: l.startswith("{") and "event" not in l, timeout=2.0
+                    lambda line: line.startswith("{") and "event" not in line,
+                    timeout=2.0,
                 )
             finally:
                 self.actor.end_transaction()
@@ -562,7 +570,8 @@ class StackchanSerial:
             try:
                 self.actor.write(b"MIC_STOP\n")
                 ack_line = self.actor.expect_line(
-                    lambda l: l.startswith("{") and "event" not in l, timeout=3.0
+                    lambda line: line.startswith("{") and "event" not in line,
+                    timeout=3.0,
                 )
             finally:
                 self.actor.end_transaction()
@@ -579,15 +588,17 @@ class StackchanSerial:
         pcm_bytes = bytes(self._mic_pcm_buffer)
         wav_bytes = pcm_to_wav(pcm_bytes, sample_rate=16000, bits=16, channels=1)
         result = dict(ack) if ack else {"status": "error", "error": "no ack"}
-        result.update({
-            "pcm": pcm_bytes,
-            "wav": wav_bytes,
-            "sample_rate": 16000,
-            "bits": 16,
-            "channels": 1,
-            "frames": len(pcm_bytes) // 2,
-            "duration_seconds": (len(pcm_bytes) // 2) / 16000.0,
-        })
+        result.update(
+            {
+                "pcm": pcm_bytes,
+                "wav": wav_bytes,
+                "sample_rate": 16000,
+                "bits": 16,
+                "channels": 1,
+                "frames": len(pcm_bytes) // 2,
+                "duration_seconds": (len(pcm_bytes) // 2) / 16000.0,
+            }
+        )
         return result
 
     def _is_disconnected(self) -> bool:
@@ -627,7 +638,9 @@ class StackchanSerial:
             except json.JSONDecodeError:
                 return {"raw": ack_line}
 
-    def send_wav(self, wav_data: bytes, chunk_size: int = 1024, chunk_delay: float = 0.005) -> dict:
+    def send_wav(
+        self, wav_data: bytes, chunk_size: int = 1024, chunk_delay: float = 0.005
+    ) -> dict:
         if not wav_data:
             return {"status": "error", "error": "empty WAV"}
         if self._is_disconnected():
@@ -637,7 +650,11 @@ class StackchanSerial:
         # 次の turn.started が来るまでホスト側でこのフラグを True に保持して、
         # 後続 chunk の WAV 送信を全てスキップする (黙る挙動)。
         if self.user_stopped:
-            return {"status": "skipped", "reason": "user_stopped", "size": len(wav_data)}
+            return {
+                "status": "skipped",
+                "reason": "user_stopped",
+                "size": len(wav_data),
+            }
 
         # マイク録音中はファームが Speaker.end() 状態 + シリアルに MIC_PCM stream を
         # 流している。この間に WAV 送信を試みるとシリアル binary 衝突 + Speaker
@@ -645,7 +662,11 @@ class StackchanSerial:
         # voice_conversation モードでは MIC_STOP 後 (Speaker 復帰後) に送るのが
         # 正しい挙動なので、ここでは skip 応答を返して呼び出し側に判断を委ねる。
         if self._mic_recording:
-            return {"status": "skipped", "reason": "mic_recording", "size": len(wav_data)}
+            return {
+                "status": "skipped",
+                "reason": "mic_recording",
+                "size": len(wav_data),
+            }
 
         # device_profile (rt_beta / atoms3r 等) で渡された WAV サイズ上限の早期
         # チェック。例: basic-main (M5Stack Basic) は内部 DRAM 96KB 制約。超過時は
@@ -678,7 +699,10 @@ class StackchanSerial:
             for attempt in range(8):
                 with self._lock:
                     result = self._send_wav_locked(wav_data, chunk_size, chunk_delay)
-                if result.get("status") == "error" and result.get("error") == "queue full":
+                if (
+                    result.get("status") == "error"
+                    and result.get("error") == "queue full"
+                ):
                     time.sleep(0.5)
                     continue
                 return result
@@ -691,7 +715,9 @@ class StackchanSerial:
             # _begin_wav_active 内で cancel されて新タイマーに置き換わる。
             pass
 
-    def send_image(self, image_jpeg: bytes, chunk_size: int = 1024, chunk_delay: float = 0.005) -> dict:
+    def send_image(
+        self, image_jpeg: bytes, chunk_size: int = 1024, chunk_delay: float = 0.005
+    ) -> dict:
         """Send a JPEG face image to firmware via IMAGE:<size>."""
         if not image_jpeg:
             return {"status": "error", "error": "empty image"}
@@ -702,11 +728,13 @@ class StackchanSerial:
             try:
                 self.actor.write(f"IMAGE:{len(image_jpeg)}\n".encode())
                 ready_or_err = self.actor.expect_line(
-                    lambda l: l == "READY"
-                    or (
-                        l.startswith("{")
-                        and ('"image"' in l or '"error"' in l)
-                        and '"event"' not in l
+                    lambda line: (
+                        line == "READY"
+                        or (
+                            line.startswith("{")
+                            and ('"image"' in line or '"error"' in line)
+                            and '"event"' not in line
+                        )
                     ),
                     timeout=3.0,
                 )
@@ -721,7 +749,11 @@ class StackchanSerial:
                     try:
                         return json.loads(ready_or_err)
                     except json.JSONDecodeError:
-                        return {"status": "error", "error": "invalid early ack", "raw": ready_or_err}
+                        return {
+                            "status": "error",
+                            "error": "invalid early ack",
+                            "raw": ready_or_err,
+                        }
 
                 sent = 0
                 while sent < len(image_jpeg):
@@ -732,9 +764,11 @@ class StackchanSerial:
                         time.sleep(chunk_delay)
 
                 ack_line = self.actor.expect_line(
-                    lambda l: l.startswith("{")
-                    and ('"image"' in l or '"error"' in l)
-                    and '"event"' not in l,
+                    lambda line: (
+                        line.startswith("{")
+                        and ('"image"' in line or '"error"' in line)
+                        and '"event"' not in line
+                    ),
                     timeout=5.0,
                 )
                 if ack_line is None:
@@ -742,7 +776,11 @@ class StackchanSerial:
                 try:
                     return json.loads(ack_line)
                 except json.JSONDecodeError:
-                    return {"status": "error", "error": "invalid image ack json", "raw": ack_line}
+                    return {
+                        "status": "error",
+                        "error": "invalid image ack json",
+                        "raw": ack_line,
+                    }
             finally:
                 self.actor.end_transaction()
 
@@ -765,11 +803,13 @@ class StackchanSerial:
             try:
                 self.actor.write(f"SIMG:{slot},{len(image_jpeg)}\n".encode())
                 ready_or_err = self.actor.expect_line(
-                    lambda l: l == "READY"
-                    or (
-                        l.startswith("{")
-                        and ('"sprite_image"' in l or '"error"' in l)
-                        and '"event"' not in l
+                    lambda line: (
+                        line == "READY"
+                        or (
+                            line.startswith("{")
+                            and ('"sprite_image"' in line or '"error"' in line)
+                            and '"event"' not in line
+                        )
                     ),
                     timeout=3.0,
                 )
@@ -780,7 +820,11 @@ class StackchanSerial:
                     try:
                         return json.loads(ready_or_err)
                     except json.JSONDecodeError:
-                        return {"status": "error", "error": "invalid early ack", "raw": ready_or_err}
+                        return {
+                            "status": "error",
+                            "error": "invalid early ack",
+                            "raw": ready_or_err,
+                        }
 
                 sent = 0
                 while sent < len(image_jpeg):
@@ -791,9 +835,11 @@ class StackchanSerial:
                         time.sleep(chunk_delay)
 
                 ack_line = self.actor.expect_line(
-                    lambda l: l.startswith("{")
-                    and ('"sprite_image"' in l or '"error"' in l)
-                    and '"event"' not in l,
+                    lambda line: (
+                        line.startswith("{")
+                        and ('"sprite_image"' in line or '"error"' in line)
+                        and '"event"' not in line
+                    ),
                     timeout=5.0,
                 )
                 if ack_line is None:
@@ -801,7 +847,11 @@ class StackchanSerial:
                 try:
                     return json.loads(ack_line)
                 except json.JSONDecodeError:
-                    return {"status": "error", "error": "invalid sprite image ack json", "raw": ack_line}
+                    return {
+                        "status": "error",
+                        "error": "invalid sprite image ack json",
+                        "raw": ack_line,
+                    }
             finally:
                 self.actor.end_transaction()
 
@@ -841,20 +891,29 @@ class StackchanSerial:
             return {"status": "error", "error": "empty rect"}
         expected = width * height * 2
         if len(rgb565) != expected:
-            return {"status": "error", "error": "rect size mismatch", "size": len(rgb565), "expected": expected}
+            return {
+                "status": "error",
+                "error": "rect size mismatch",
+                "size": len(rgb565),
+                "expected": expected,
+            }
         if self._is_disconnected():
             return self._disconnected_error()
 
         with self._lock:
             self.actor.start_transaction()
             try:
-                self.actor.write(f"RECT:{x},{y},{width},{height},{len(rgb565)}\n".encode())
+                self.actor.write(
+                    f"RECT:{x},{y},{width},{height},{len(rgb565)}\n".encode()
+                )
                 ready_or_err = self.actor.expect_line(
-                    lambda l: l == "READY"
-                    or (
-                        l.startswith("{")
-                        and ('"rect"' in l or '"error"' in l)
-                        and '"event"' not in l
+                    lambda line: (
+                        line == "READY"
+                        or (
+                            line.startswith("{")
+                            and ('"rect"' in line or '"error"' in line)
+                            and '"event"' not in line
+                        )
                     ),
                     timeout=3.0,
                 )
@@ -864,7 +923,11 @@ class StackchanSerial:
                     try:
                         return json.loads(ready_or_err)
                     except json.JSONDecodeError:
-                        return {"status": "error", "error": "invalid early ack", "raw": ready_or_err}
+                        return {
+                            "status": "error",
+                            "error": "invalid early ack",
+                            "raw": ready_or_err,
+                        }
 
                 sent = 0
                 while sent < len(rgb565):
@@ -875,9 +938,11 @@ class StackchanSerial:
                         time.sleep(chunk_delay)
 
                 ack_line = self.actor.expect_line(
-                    lambda l: l.startswith("{")
-                    and ('"rect"' in l or '"error"' in l)
-                    and '"event"' not in l,
+                    lambda line: (
+                        line.startswith("{")
+                        and ('"rect"' in line or '"error"' in line)
+                        and '"event"' not in line
+                    ),
                     timeout=5.0,
                 )
                 if ack_line is None:
@@ -885,7 +950,11 @@ class StackchanSerial:
                 try:
                     return json.loads(ack_line)
                 except json.JSONDecodeError:
-                    return {"status": "error", "error": "invalid rect ack json", "raw": ack_line}
+                    return {
+                        "status": "error",
+                        "error": "invalid rect ack json",
+                        "raw": ack_line,
+                    }
             finally:
                 self.actor.end_transaction()
 
@@ -899,7 +968,9 @@ class StackchanSerial:
             self._wav_active = True
             if self._wav_end_timer is not None:
                 self._wav_end_timer.cancel()
-            self._wav_end_timer = threading.Timer(max(0.1, duration_seconds), self._end_wav_active)
+            self._wav_end_timer = threading.Timer(
+                max(0.1, duration_seconds), self._end_wav_active
+            )
             self._wav_end_timer.daemon = True
             self._wav_end_timer.start()
 
@@ -908,7 +979,9 @@ class StackchanSerial:
             self._wav_active = False
             self._wav_end_timer = None
 
-    def _send_wav_locked(self, wav_data: bytes, chunk_size: int, chunk_delay: float) -> dict:
+    def _send_wav_locked(
+        self, wav_data: bytes, chunk_size: int, chunk_delay: float
+    ) -> dict:
         # SerialActor 経由: WAV transaction を 1 つの start_transaction 内で完結。
         # 1. WAV:<size>\n を書く
         # 2. READY 行 / JSON ack エラー どちらか早い方を expect_line で待つ
@@ -922,11 +995,13 @@ class StackchanSerial:
         try:
             actor.write(f"WAV:{len(wav_data)}\n".encode())
             ready_or_err = actor.expect_line(
-                lambda l: l == "READY"
-                or (
-                    l.startswith("{")
-                    and ('"size"' in l or '"error"' in l)
-                    and '"event"' not in l
+                lambda line: (
+                    line == "READY"
+                    or (
+                        line.startswith("{")
+                        and ('"size"' in line or '"error"' in line)
+                        and '"event"' not in line
+                    )
                 ),
                 timeout=3.0,
             )
@@ -937,7 +1012,11 @@ class StackchanSerial:
                 try:
                     return json.loads(ready_or_err)
                 except json.JSONDecodeError:
-                    return {"status": "error", "error": "invalid early ack", "raw": ready_or_err}
+                    return {
+                        "status": "error",
+                        "error": "invalid early ack",
+                        "raw": ready_or_err,
+                    }
 
             # binary 送信
             sent = 0
@@ -952,17 +1031,28 @@ class StackchanSerial:
             # MOVE/FACE ack のはぐれ (size を持たない) は actor 側 expect_line の
             # predicate で弾く。error ack も通す。
             ack_line = actor.expect_line(
-                lambda l: l.startswith("{")
-                and ('"size"' in l or '"error"' in l)
-                and '"event"' not in l,
+                lambda line: (
+                    line.startswith("{")
+                    and ('"size"' in line or '"error"' in line)
+                    and '"event"' not in line
+                ),
                 timeout=10.0,
             )
             if ack_line is None:
-                return {"status": "ok", "size": len(wav_data), "note": "no confirmation received"}
+                return {
+                    "status": "ok",
+                    "size": len(wav_data),
+                    "note": "no confirmation received",
+                }
             try:
                 return json.loads(ack_line)
             except json.JSONDecodeError:
-                return {"status": "ok", "size": len(wav_data), "note": "invalid ack json", "raw": ack_line}
+                return {
+                    "status": "ok",
+                    "size": len(wav_data),
+                    "note": "invalid ack json",
+                    "raw": ack_line,
+                }
         finally:
             actor.end_transaction()
 
@@ -1004,7 +1094,7 @@ class StackchanSerial:
             # line listener には出ない (size のサニティチェックも内部)。
             # → ack JSON を待ち、その時点で pop_img_data が body を持っていれば成功。
             ack_line = self.actor.expect_line(
-                lambda l: l.startswith("{") and '"event"' not in l,
+                lambda line: line.startswith("{") and '"event"' not in line,
                 timeout=max(timeout, 5.0),
             )
             if ack_line is None:
@@ -1012,7 +1102,11 @@ class StackchanSerial:
             try:
                 ack = json.loads(ack_line)
             except json.JSONDecodeError:
-                return {"status": "error", "error": "invalid capture ack json", "raw": ack_line}
+                return {
+                    "status": "error",
+                    "error": "invalid capture ack json",
+                    "raw": ack_line,
+                }
 
             if ack.get("status") == "error":
                 return ack
@@ -1032,51 +1126,461 @@ class StackchanSerial:
             self.actor.end_transaction()
 
 
-class StackchanWifi:
-    """WiFi HTTP API backend for stackchan family devices (K151 / stackchan-atama)."""
+class StackchanTailnet:
+    """Reverse TCP backend for a MicroLink-enabled CoreS3.
 
-    def __init__(self, host: str = DEFAULT_WIFI_HOST):
-        self.base_url = f"http://{host}"
+    The CoreS3 initiates the connection over its Tailnet, so the Stackchan can
+    sit behind Wi-Fi NAT without a MacBook USB bridge. The first protocol slice
+    carries newline-delimited STATUS / VOLUME / FACE / MOVE commands. Binary
+    WAV playback and microphone PCM share the same reverse connection. Image
+    images, sprite caches, dirty rectangles, and camera JPEGs use the same
+    framed binary exchange as WAV and microphone PCM.
+    """
+
+    def __init__(self, bind: str = "0.0.0.0", port: int = DEFAULT_TAILNET_PORT):
+        self.bind = bind
+        self.port = port
+        self.device: dict = {}
+        self._server: socket.socket | None = None
+        self._client: socket.socket | None = None
+        self._client_file = None
+        self._accept_thread: threading.Thread | None = None
+        self._condition = threading.Condition()
+        self._transaction_lock = threading.Lock()
+        self._write_lock = threading.Lock()
+        self._response_queue: Queue[str] = Queue()
+        self._capture_image_queue: Queue[bytes] = Queue()
+        self._reader_thread: threading.Thread | None = None
+        self._closing = False
+        self.on_head_touch: Callable[[dict], None] | None = None
+        self.on_mic_button: Callable[[dict], None] | None = None
+        self.on_connected: Callable[[], None] | None = None
+        self.user_stopped = False
+        self._mic_recording = False
+        self._mic_pcm_buffer = bytearray()
+        self._mic_on_pcm_chunk: Callable[[bytes], None] | None = None
 
     def open(self):
-        return None
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((self.bind, self.port))
+        server.listen(2)
+        server.settimeout(0.5)
+        self._server = server
+        self.port = int(server.getsockname()[1])
+        self._closing = False
+        self._accept_thread = threading.Thread(
+            target=self._accept_loop, name="stackchan-tailnet-accept", daemon=True
+        )
+        self._accept_thread.start()
+
+    @property
+    def is_connected(self) -> bool:
+        with self._condition:
+            return self._client is not None and not self._closing
+
+    def _accept_loop(self) -> None:
+        while not self._closing:
+            try:
+                client, address = (
+                    self._server.accept() if self._server else (None, None)
+                )
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+            if client is None:
+                continue
+            remote_ip = ipaddress.ip_address(address[0])
+            if not (remote_ip in TAILNET_IPV4 or remote_ip.is_loopback):
+                client.close()
+                continue
+            client.settimeout(5.0)
+            client_file = client.makefile("rb")
+            try:
+                hello_line = client_file.readline(2048)
+                hello = json.loads(hello_line.decode("utf-8"))
+                if hello.get("event") != "stackchan_connected":
+                    raise ValueError("missing stackchan_connected hello")
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                client_file.close()
+                client.close()
+                continue
+            client.settimeout(None)
+            with self._condition:
+                old_file = self._client_file
+                old_client = self._client
+                self._client = client
+                self._client_file = client_file
+                self.device = hello
+                self._clear_responses()
+                self._condition.notify_all()
+            self._reader_thread = threading.Thread(
+                target=self._read_loop,
+                args=(client, client_file),
+                name="stackchan-tailnet-reader",
+                daemon=True,
+            )
+            self._reader_thread.start()
+            if self.on_connected is not None:
+                try:
+                    self.on_connected()
+                except Exception:
+                    pass
+            if old_file is not None:
+                old_file.close()
+            if old_client is not None:
+                old_client.close()
+
+    def _wait_for_client(self, timeout: float = 10.0):
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while self._client is None and not self._closing:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._condition.wait(remaining)
+            return self._client, self._client_file
+
+    def _disconnect(self, client) -> None:
+        with self._condition:
+            if self._client is not client:
+                return
+            client_file = self._client_file
+            self._client = None
+            self._client_file = None
+        if client_file is not None:
+            client_file.close()
+        if client is not None:
+            client.close()
+
+    def _read_loop(self, client, client_file) -> None:
+        try:
+            while not self._closing:
+                raw = client_file.readline(65536)
+                if not raw:
+                    break
+                line = raw.decode("utf-8").strip()
+                if line.startswith("MIC_PCM:"):
+                    try:
+                        size = int(line.split(":", 1)[1])
+                    except ValueError:
+                        continue
+                    if size < 0 or size > 65536:
+                        continue
+                    body = client_file.read(size)
+                    if len(body) != size:
+                        break
+                    if self._mic_recording:
+                        self._mic_pcm_buffer.extend(body)
+                        callback = self._mic_on_pcm_chunk
+                        if callback is not None:
+                            try:
+                                callback(body)
+                            except Exception:
+                                pass
+                    continue
+                if line.startswith("IMG:"):
+                    try:
+                        size = int(line.split(":", 1)[1])
+                    except ValueError:
+                        continue
+                    if size <= 0 or size > 512 * 1024:
+                        continue
+                    body = client_file.read(size)
+                    if len(body) != size:
+                        break
+                    self._capture_image_queue.put(body)
+                    continue
+                if self._dispatch_event(line):
+                    continue
+                self._response_queue.put(line)
+        except (OSError, UnicodeDecodeError):
+            pass
+        finally:
+            self._disconnect(client)
+
+    def _dispatch_event(self, line: str) -> bool:
+        if '"event"' not in line:
+            return False
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return True
+        name = event.get("event")
+        if name == "audio_stopped":
+            self.user_stopped = True
+        elif name == "head_touch" and self.on_head_touch is not None:
+            threading.Thread(
+                target=self._run_event_callback,
+                args=(self.on_head_touch, event),
+                name="stackchan-tailnet-head-touch",
+                daemon=True,
+            ).start()
+        elif name == "mic_button" and self.on_mic_button is not None:
+            threading.Thread(
+                target=self._run_event_callback,
+                args=(self.on_mic_button, event),
+                name="stackchan-tailnet-mic-button",
+                daemon=True,
+            ).start()
+        return True
+
+    @staticmethod
+    def _run_event_callback(callback: Callable[[dict], None], event: dict) -> None:
+        try:
+            callback(event)
+        except Exception:
+            pass
+
+    def _write(self, client, data: bytes) -> None:
+        with self._write_lock:
+            client.sendall(data)
+
+    def _clear_responses(self) -> None:
+        while True:
+            try:
+                self._response_queue.get_nowait()
+            except Empty:
+                return
+
+    def _next_response(self, timeout: float = 10.0) -> dict:
+        try:
+            line = self._response_queue.get(timeout=timeout)
+        except Empty:
+            return {"status": "error", "error": "Tailnet response timeout"}
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            return {"status": "error", "error": "invalid response", "raw": line}
 
     def close(self):
-        return None
+        self._closing = True
+        with self._condition:
+            self._condition.notify_all()
+        server = self._server
+        self._server = None
+        if server is not None:
+            server.close()
+        self._disconnect(self._client)
+        if self._accept_thread is not None:
+            self._accept_thread.join(timeout=1.0)
+            self._accept_thread = None
 
     def send_command(self, cmd: str) -> dict:
-        if cmd == "STATUS":
-            response = requests.get(f"{self.base_url}/status", timeout=5)
-        elif cmd.startswith("FACE:"):
-            expression = cmd.split(":", 1)[1]
-            response = requests.get(f"{self.base_url}/face", params={"expression": expression}, timeout=5)
-        elif cmd.startswith("VOLUME:"):
-            level = cmd.split(":", 1)[1]
-            response = requests.get(f"{self.base_url}/setting", params={"volume": level}, timeout=5)
-        else:
-            return {"status": "error", "error": f"unsupported WiFi command: {cmd}"}
-        response.raise_for_status()
-        return response.json()
+        if "\n" in cmd or "\r" in cmd:
+            return {"status": "error", "error": "command contains newline"}
+        with self._transaction_lock:
+            client, _ = self._wait_for_client()
+            if client is None:
+                return {"status": "error", "error": "Tailnet Stackchan not connected"}
+            try:
+                self._clear_responses()
+                self._write(client, cmd.encode("utf-8") + b"\n")
+                return self._next_response()
+            except OSError as exc:
+                self._disconnect(client)
+                return {"status": "error", "error": f"Tailnet command failed: {exc}"}
 
-    def send_wav(self, wav_data: bytes, chunk_size: int = 1024, chunk_delay: float = 0.005) -> dict:
+    def send_wav(
+        self, wav_data: bytes, chunk_size: int = 1024, chunk_delay: float = 0.005
+    ) -> dict:
         if not wav_data:
             return {"status": "error", "error": "empty WAV"}
-        response = requests.post(
-            f"{self.base_url}/play",
-            data=wav_data,
-            headers={"Content-Type": "application/octet-stream"},
-            timeout=30,
-        )
-        response.raise_for_status()
-        return response.json()
+        if self.user_stopped:
+            return {
+                "status": "skipped",
+                "reason": "user_stopped",
+                "size": len(wav_data),
+            }
+        if self._mic_recording:
+            return {
+                "status": "skipped",
+                "reason": "mic_recording",
+                "size": len(wav_data),
+            }
+        with self._transaction_lock:
+            client, _ = self._wait_for_client()
+            if client is None:
+                return {"status": "error", "error": "Tailnet Stackchan not connected"}
+            try:
+                self._clear_responses()
+                self._write(client, f"WAV:{len(wav_data)}\n".encode())
+                ready = self._next_response()
+                if ready.get("status") != "ready":
+                    return ready
+                for offset in range(0, len(wav_data), chunk_size):
+                    self._write(client, wav_data[offset : offset + chunk_size])
+                    if chunk_delay:
+                        time.sleep(chunk_delay)
+                return self._next_response()
+            except OSError as exc:
+                self._disconnect(client)
+                return {"status": "error", "error": f"Tailnet WAV failed: {exc}"}
 
-    def send_image(self, image_jpeg: bytes, chunk_size: int = 1024, chunk_delay: float = 0.005) -> dict:
-        return {"status": "error", "error": "WiFi IMAGE not implemented"}
+    def start_mic_recording(
+        self, on_pcm_chunk: Callable[[bytes], None] | None = None
+    ) -> dict:
+        if self._mic_recording:
+            return {"status": "error", "error": "already recording"}
+        self._mic_pcm_buffer = bytearray()
+        self._mic_on_pcm_chunk = on_pcm_chunk
+        self._mic_recording = True
+        ack = self.send_command("MIC_START")
+        if ack.get("status") != "ok":
+            self._mic_recording = False
+        return ack
+
+    def stop_mic_recording(self) -> dict:
+        if not self._mic_recording:
+            return {"status": "error", "error": "not recording"}
+        ack = self.send_command("MIC_STOP")
+        self._mic_recording = False
+        self._mic_on_pcm_chunk = None
+        pcm_bytes = bytes(self._mic_pcm_buffer)
+        result = dict(ack)
+        result.update(
+            {
+                "pcm": pcm_bytes,
+                "wav": pcm_to_wav(pcm_bytes, sample_rate=16000, bits=16, channels=1),
+                "sample_rate": 16000,
+                "bits": 16,
+                "channels": 1,
+                "frames": len(pcm_bytes) // 2,
+                "duration_seconds": (len(pcm_bytes) // 2) / 16000.0,
+            }
+        )
+        return result
+
+    def send_image(
+        self, image_jpeg: bytes, chunk_size: int = 1024, chunk_delay: float = 0.005
+    ) -> dict:
+        return self._send_binary_command(
+            f"IMAGE:{len(image_jpeg)}", image_jpeg, chunk_size, chunk_delay
+        )
+
+    def _send_binary_command(
+        self,
+        command: str,
+        payload: bytes,
+        chunk_size: int,
+        chunk_delay: float,
+    ) -> dict:
+        if not payload:
+            return {"status": "error", "error": "empty binary payload"}
+        if self._mic_recording:
+            return {"status": "error", "error": "mic recording active"}
+        with self._transaction_lock:
+            client, _ = self._wait_for_client()
+            if client is None:
+                return {"status": "error", "error": "Tailnet Stackchan not connected"}
+            try:
+                self._clear_responses()
+                self._write(client, command.encode("utf-8") + b"\n")
+                ready = self._next_response()
+                if ready.get("status") != "ready":
+                    return ready
+                for offset in range(0, len(payload), chunk_size):
+                    self._write(client, payload[offset : offset + chunk_size])
+                    if chunk_delay:
+                        time.sleep(chunk_delay)
+                return self._next_response()
+            except OSError as exc:
+                self._disconnect(client)
+                return {"status": "error", "error": f"Tailnet binary failed: {exc}"}
+
+    def cache_image_frame(
+        self,
+        slot: int,
+        image_jpeg: bytes,
+        chunk_size: int = 1024,
+        chunk_delay: float = 0.005,
+    ) -> dict:
+        if slot < 0 or slot >= 64:
+            return {"status": "error", "error": "slot out of range"}
+        return self._send_binary_command(
+            f"SIMG:{slot},{len(image_jpeg)}",
+            image_jpeg,
+            chunk_size,
+            chunk_delay,
+        )
+
+    def show_cached_image(self, slot: int) -> dict:
+        if slot < 0 or slot >= 64:
+            return {"status": "error", "error": "slot out of range"}
+        return self.send_command(f"SFRAME:{slot}")
+
+    def start_cached_sprite_animation(self, slots: list[int], interval_ms: int) -> dict:
+        clean_slots = [int(slot) for slot in slots if 0 <= int(slot) < 64]
+        if not clean_slots:
+            return {"status": "error", "error": "empty sprite animation"}
+        interval_ms = max(50, min(5000, int(interval_ms)))
+        slot_csv = ",".join(str(slot) for slot in clean_slots[:16])
+        return self.send_command(f"SANIM:{interval_ms},{slot_csv}")
+
+    def stop_cached_sprite_animation(self) -> dict:
+        return self.send_command("SANIM:0")
+
+    def send_rect(
+        self,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        rgb565: bytes,
+        chunk_size: int = 4096,
+        chunk_delay: float = 0.0,
+    ) -> dict:
+        expected = width * height * 2
+        if width <= 0 or height <= 0:
+            return {"status": "skipped", "reason": "empty rect"}
+        if len(rgb565) != expected:
+            return {
+                "status": "error",
+                "error": "rect size mismatch",
+                "size": len(rgb565),
+                "expected": expected,
+            }
+        return self._send_binary_command(
+            f"RECT:{x},{y},{width},{height},{len(rgb565)}",
+            rgb565,
+            chunk_size,
+            chunk_delay,
+        )
 
     def capture(self, timeout: float = 5.0) -> dict:
-        # WiFi 経由のカメラ取得は Phase 2 (WiFi MJPEG ストリーム) で実装予定。
-        # Phase 1A は USB シリアル経由のみ。
-        return {"status": "error", "error": "WiFi capture not implemented (Phase 2)"}
+        host_capture_start = time.time()
+        with self._transaction_lock:
+            client, _ = self._wait_for_client()
+            if client is None:
+                return {"status": "error", "error": "Tailnet Stackchan not connected"}
+            try:
+                self._clear_responses()
+                while True:
+                    try:
+                        self._capture_image_queue.get_nowait()
+                    except Empty:
+                        break
+                self._write(client, b"CAPTURE\n")
+                ack = self._next_response(timeout=max(timeout, 5.0))
+                if ack.get("status") != "ok":
+                    return ack
+                try:
+                    jpeg = self._capture_image_queue.get(timeout=1.0)
+                except Empty:
+                    return {
+                        "status": "error",
+                        "error": "ack received but no image body",
+                    }
+                device_ms = ack.pop("captured_at", None)
+                if isinstance(device_ms, (int, float)):
+                    ack["captured_at_device_ms"] = int(device_ms)
+                ack["image_jpeg"] = jpeg
+                ack["captured_at"] = host_capture_start
+                return ack
+            except OSError as exc:
+                self._disconnect(client)
+                return {"status": "error", "error": f"Tailnet capture failed: {exc}"}
 
 
 class StackchanSimulator:
@@ -1110,6 +1614,10 @@ class StackchanSimulator:
 
     def open(self):
         return None
+
+    @property
+    def is_connected(self) -> bool:
+        return True
 
     def close(self):
         with self._lock:
@@ -1214,7 +1722,10 @@ class StackchanSimulator:
                 except ValueError:
                     return {"status": "error", "error": "SANIM parse error"}
                 if len(parts) < 2:
-                    return {"status": "error", "error": "SANIM syntax: interval,slots..."}
+                    return {
+                        "status": "error",
+                        "error": "SANIM syntax: interval,slots...",
+                    }
                 interval_ms = max(50, min(5000, parts[0]))
                 slots = [max(0, min(63, slot)) for slot in parts[1:17]]
                 self._state["face"] = "sprite"
@@ -1239,7 +1750,9 @@ class StackchanSimulator:
                 return {"status": "ok", "simulator": True}
             return {"status": "error", "error": f"unsupported simulator command: {cmd}"}
 
-    def send_wav(self, wav_data: bytes, chunk_size: int = 1024, chunk_delay: float = 0.005) -> dict:
+    def send_wav(
+        self, wav_data: bytes, chunk_size: int = 1024, chunk_delay: float = 0.005
+    ) -> dict:
         with self._lock:
             if not wav_data:
                 return {"status": "error", "error": "empty WAV"}
@@ -1248,11 +1761,20 @@ class StackchanSimulator:
             self._state["wav_id"] += 1
             self._state["wav_bytes"] = len(wav_data)
             self._last_wav = bytes(wav_data)
-            duration = estimate_wav_duration_seconds(wav_data) or min(3.0, max(0.4, len(wav_data) / 32000.0))
+            duration = estimate_wav_duration_seconds(wav_data) or min(
+                3.0, max(0.4, len(wav_data) / 32000.0)
+            )
             self._set_ready_later(duration)
-            return {"status": "ok", "size": len(wav_data), "duration_seconds": duration, "simulator": True}
+            return {
+                "status": "ok",
+                "size": len(wav_data),
+                "duration_seconds": duration,
+                "simulator": True,
+            }
 
-    def send_image(self, image_jpeg: bytes, chunk_size: int = 1024, chunk_delay: float = 0.005) -> dict:
+    def send_image(
+        self, image_jpeg: bytes, chunk_size: int = 1024, chunk_delay: float = 0.005
+    ) -> dict:
         with self._lock:
             self._touch(f"IMAGE:{len(image_jpeg)}")
             self._state["face"] = "sprite"
@@ -1272,7 +1794,12 @@ class StackchanSimulator:
             slot = max(0, min(63, int(slot)))
             self._touch(f"SIMG:{slot},{len(image_jpeg)}")
             self._state.setdefault("sprite_cache", {})[slot] = len(image_jpeg)
-            return {"status": "ok", "sprite_image": slot, "size": len(image_jpeg), "simulator": True}
+            return {
+                "status": "ok",
+                "sprite_image": slot,
+                "size": len(image_jpeg),
+                "simulator": True,
+            }
 
     def show_cached_image(self, slot: int) -> dict:
         return self.send_command(f"SFRAME:{int(slot)}")
@@ -1282,7 +1809,9 @@ class StackchanSimulator:
         if not clean_slots:
             return {"status": "error", "error": "empty sprite animation"}
         interval_ms = max(50, min(5000, int(interval_ms)))
-        return self.send_command(f"SANIM:{interval_ms}," + ",".join(str(slot) for slot in clean_slots[:16]))
+        return self.send_command(
+            f"SANIM:{interval_ms}," + ",".join(str(slot) for slot in clean_slots[:16])
+        )
 
     def stop_cached_sprite_animation(self) -> dict:
         return self.send_command("SANIM:0")
@@ -1297,11 +1826,13 @@ class StackchanSimulator:
             image = Image.new("RGB", (320, 240), (235, 241, 244))
             draw = ImageDraw.Draw(image)
             draw.rectangle((0, 160, 320, 240), fill=(214, 225, 219))
-            draw.ellipse((92, 45, 228, 181), fill=(248, 248, 243), outline=(45, 50, 55), width=4)
+            draw.ellipse(
+                (92, 45, 228, 181), fill=(248, 248, 243), outline=(45, 50, 55), width=4
+            )
             draw.ellipse((128, 96, 144, 112), fill=(30, 35, 38))
             draw.ellipse((176, 96, 192, 112), fill=(30, 35, 38))
             draw.arc((130, 104, 190, 146), 15, 165, fill=(30, 35, 38), width=3)
-            draw.text((10, 12), "xangi-stackchan simulator", fill=(45, 50, 55))
+            draw.text((10, 12), "xangi-stack-chan simulator", fill=(45, 50, 55))
             buf = io.BytesIO()
             image.save(buf, format="JPEG", quality=85)
             jpeg = buf.getvalue()
@@ -1320,14 +1851,15 @@ class StackchanSimulator:
 
 @dataclass
 class StackchanConfig:
-    wifi: bool = False
+    tailnet: bool = False
     simulator: bool = False
-    host: str = DEFAULT_WIFI_HOST
     port: str = ""
     baud: int = DEFAULT_BAUD
     device_profile: str = ""
     max_wav_bytes: int = 0  # 0 = 無制限 (ファーム側に任せる)
     skip_move_during_wav: bool = False  # rt_beta 等の電源マージン制約用
+    tailnet_bind: str = "0.0.0.0"
+    tailnet_port: int = DEFAULT_TAILNET_PORT
 
 
 def apply_profile_defaults(config: StackchanConfig) -> StackchanConfig:
@@ -1352,8 +1884,8 @@ def apply_profile_defaults(config: StackchanConfig) -> StackchanConfig:
 def create_backend(config: StackchanConfig):
     if config.simulator:
         return StackchanSimulator()
-    if config.wifi:
-        return StackchanWifi(config.host)
+    if config.tailnet:
+        return StackchanTailnet(config.tailnet_bind, config.tailnet_port)
     backend = StackchanSerial(config.port or detect_serial_port(), config.baud)
     backend.max_wav_bytes = config.max_wav_bytes
     backend.skip_move_during_wav = config.skip_move_during_wav

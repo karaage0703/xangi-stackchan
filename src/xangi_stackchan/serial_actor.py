@@ -28,7 +28,6 @@ import time
 from collections import deque
 from collections.abc import Callable
 from queue import Empty, Queue
-from typing import Optional
 
 import serial
 
@@ -171,9 +170,7 @@ class SerialActor:
                 self.ser.flush()
                 return True
             except serial.SerialTimeoutException as exc:
-                sys.stderr.write(
-                    f"[actor] write timeout ({len(data)} bytes): {exc}\n"
-                )
+                sys.stderr.write(f"[actor] write timeout ({len(data)} bytes): {exc}\n")
                 # partial 送信でファーム側 parser がずれるのを最小化。
                 try:
                     self.ser.reset_output_buffer()
@@ -330,10 +327,7 @@ class SerialActor:
             i += 1
             if byte == 0x0A:  # '\n'
                 if self._line_buf:
-                    line = (
-                        self._line_buf.decode("utf-8", errors="replace")
-                        .strip()
-                    )
+                    line = self._line_buf.decode("utf-8", errors="replace").strip()
                     self._line_buf.clear()
                     if line:
                         self._dispatch_line(line)

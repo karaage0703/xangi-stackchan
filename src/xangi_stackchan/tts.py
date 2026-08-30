@@ -9,12 +9,13 @@ from pathlib import Path
 
 import requests
 
-
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_LOCAL_PIPER_BIN = "tools/piper"
 DEFAULT_LOCAL_MODEL = "models/tsukuyomi-chan-6lang-fp16.onnx"
 LOCAL_MODELS = sorted(
-    p.relative_to(ROOT) for p in (ROOT / "models").glob("*.onnx") if ".cpu.opt" not in p.name
+    p.relative_to(ROOT)
+    for p in (ROOT / "models").glob("*.onnx")
+    if ".cpu.opt" not in p.name
 )
 
 DEFAULT_TTS = os.environ.get("STACKCHAN_TTS", "piper")
@@ -186,20 +187,26 @@ class PiperProcess:
             bufsize=1,
         )
 
-    def synthesize_many(self, texts: list[str], timeout: float | None = None) -> list[bytes]:
+    def synthesize_many(
+        self, texts: list[str], timeout: float | None = None
+    ) -> list[bytes]:
         texts = [text for text in texts if text.strip()]
         if not texts:
             return []
         timeout = timeout or max(30, 10 * len(texts))
         with self.lock:
             if self.process.poll() is not None:
-                raise RuntimeError(f"piper process exited with code {self.process.returncode}")
+                raise RuntimeError(
+                    f"piper process exited with code {self.process.returncode}"
+                )
             filenames: list[str] = []
             for text in texts:
                 self.counter += 1
                 filename = f"live_{self.counter:06}.wav"
                 filenames.append(filename)
-                line = json.dumps({"text": text, "output_file": filename}, ensure_ascii=False)
+                line = json.dumps(
+                    {"text": text, "output_file": filename}, ensure_ascii=False
+                )
                 self.process.stdin.write(line + "\n")
             self.process.stdin.flush()
 
@@ -209,10 +216,14 @@ class PiperProcess:
                 path = Path(self.tmpdir.name) / filename
                 while not path.exists() and time.time() <= deadline:
                     if self.process.poll() is not None:
-                        raise RuntimeError(f"piper process exited with code {self.process.returncode}")
+                        raise RuntimeError(
+                            f"piper process exited with code {self.process.returncode}"
+                        )
                     time.sleep(0.01)
                 if self.process.poll() is not None:
-                    raise RuntimeError(f"piper process exited with code {self.process.returncode}")
+                    raise RuntimeError(
+                        f"piper process exited with code {self.process.returncode}"
+                    )
                 wavs.append(wait_for_complete_file(path, deadline))
                 try:
                     path.unlink()

@@ -82,7 +82,9 @@ def test_rt_beta_has_skip_move_during_wav():
 def test_other_profiles_do_not_skip_move():
     for name in ("cores3_k151", "cores3_standalone", "atoms3r"):
         p = resolve_profile(name)
-        assert p.get("skip_move_during_wav", False) is False, f"{name} should not skip move"
+        assert p.get("skip_move_during_wav", False) is False, (
+            f"{name} should not skip move"
+        )
 
 
 def test_apply_profile_rt_beta_sets_skip_move_flag():
@@ -93,6 +95,7 @@ def test_apply_profile_rt_beta_sets_skip_move_flag():
 
 def test_estimate_wav_duration_16khz_mono_16bit():
     import struct
+
     from xangi_stackchan.stackchan import estimate_wav_duration_seconds
 
     sample_rate = 16000
@@ -147,7 +150,10 @@ def test_detect_async_event_audio_stopped_sets_flag():
 
     s = StackchanSerial.__new__(StackchanSerial)
     s.user_stopped = False
-    assert s._detect_async_event('{"event":"audio_stopped","reason":"touch","at":12345}') is True
+    assert (
+        s._detect_async_event('{"event":"audio_stopped","reason":"touch","at":12345}')
+        is True
+    )
     assert s.user_stopped is True
 
 
@@ -244,19 +250,19 @@ def test_pcm_to_wav_aligns_odd_length_input():
         assert w.readframes(1) == bytes([0x01, 0x02])
 
 
-def test_voice_conversation_start_binds_callback():
-    """VoiceConversation.start() で backend.on_head_touch が設定される。"""
+def test_voice_conversation_start_binds_mic_button_callback():
+    """VoiceConversation.start() で backend.on_mic_button が設定される。"""
     from xangi_stackchan.stackchan import StackchanSerial
     from xangi_stackchan.voice_conversation import VoiceConversation
 
     backend = StackchanSerial.__new__(StackchanSerial)
     backend.on_head_touch = None
+    backend.on_mic_button = None
     vc = VoiceConversation(backend, xangi_base_url="http://localhost:18888")
     assert backend.on_head_touch is None
     vc.start()
-    assert backend.on_head_touch is not None
-    assert backend.on_head_touch.__func__ is VoiceConversation._on_head_touch
-    assert backend.on_head_touch.__self__ is vc
+    assert backend.on_head_touch is None
+    assert backend.on_mic_button is not None
 
 
 def test_voice_conversation_history_is_initially_empty():
@@ -287,28 +293,6 @@ def test_voice_conversation_history_caps_at_max():
     # 最新側が残ってる (古い側が押し出される)
     texts = [e["text"] for e in vc.history]
     assert texts[-1] == f"t{HISTORY_MAX + 19}"
-
-
-def test_voice_conversation_ignores_release_and_swipe():
-    """release / swipe_forward / swipe_backward は _on_head_touch で無視される。"""
-    from xangi_stackchan.stackchan import StackchanSerial
-    from xangi_stackchan.voice_conversation import VoiceConversation
-
-    backend = StackchanSerial.__new__(StackchanSerial)
-    backend.on_head_touch = None
-    started = []
-
-    def fake_start(*args, **kwargs):
-        started.append(kwargs)
-        return {"status": "ok"}
-
-    backend.start_mic_recording = fake_start
-    vc = VoiceConversation(backend, xangi_base_url="http://localhost:18888")
-    vc.start()
-    backend.on_head_touch({"gesture": "release", "at": 1})
-    backend.on_head_touch({"gesture": "swipe_forward", "at": 2})
-    backend.on_head_touch({"gesture": "swipe_backward", "at": 3})
-    assert started == []  # 録音開始されない
 
 
 def test_chunk_dbfs_silence_returns_neginf():
@@ -383,9 +367,7 @@ def test_detect_async_event_head_touch_listener_exception_swallowed():
         raise RuntimeError("listener error")
 
     s.on_head_touch = boom
-    handled = s._detect_async_event(
-        '{"event":"head_touch","gesture":"press","at":1}'
-    )
+    handled = s._detect_async_event('{"event":"head_touch","gesture":"press","at":1}')
     assert handled is True
 
 

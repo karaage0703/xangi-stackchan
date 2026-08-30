@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 2,
+  "id": "xangi-stackchan",
+  "displayName": "xangi-stack-chan",
+  "version": "0.1.0",
+  "description": "xangiの状態と完了通知をスタックチャンで表現します",
+  "permissions": [
+    "USBシリアルまたはローカルネットワーク上のスタックチャンへ接続",
+    "ローカルTTSと音声デバイスを使用",
+    "xangiのローカルイベントストリームを購読",
+    "ユーザー設定を~/.xangi/xangi-stackchanへ保存"
+  ],
+  "entrypoint": ".venv/bin/xangi-stackchan-extension",
+  "runtime": {
+    "kind": "managed-http"
+  },
+  "setup": {
+    "instructions": "XANGI_SETUP.md"
+  },
+  "ui": {
+    "label": "xangi-stack-chan",
+    "capability": "device.stackchan",
+    "path": "/"
+  },
+  "capabilities": [
+    {
+      "id": "device.stackchan",
+      "protocol": "http",
+      "healthPath": "/api/health"
+    }
+  ]
+}

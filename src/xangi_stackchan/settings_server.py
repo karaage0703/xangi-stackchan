@@ -5,9 +5,9 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from .dance import PRESETS as DANCE_PRESETS, run_demo as run_dance_demo
+from .dance import PRESETS as DANCE_PRESETS
+from .dance import run_demo as run_dance_demo
 from .settings import RuntimeState
-
 
 DEFAULT_SETTINGS_PORT = 7897
 
@@ -49,24 +49,28 @@ def _select(name: str, label: str, value: str, options: list[str]) -> str:
     items = []
     for option in options:
         selected = " selected" if option == value else ""
-        items.append(f"<option value='{html.escape(option)}'{selected}>{html.escape(option)}</option>")
+        items.append(
+            f"<option value='{html.escape(option)}'{selected}>{html.escape(option)}</option>"
+        )
     return f"<label><span>{html.escape(label)}</span><select name='{html.escape(name)}'>{''.join(items)}</select></label>"
 
 
 def render_page(state: RuntimeState) -> str:
     cfg = state.snapshot_dict()
-    checked = " checked" if cfg.get("wifi") else ""
+    tailnet_checked = " checked" if cfg.get("tailnet") else ""
     simulator_checked = " checked" if cfg.get("simulator") else ""
     move_checked = " checked" if cfg.get("move_enabled") else ""
     puzzle_checked = " checked" if cfg.get("puzzle_light_enabled") else ""
-    voice_checked = " checked" if cfg.get("voice_conversation") else ""
-    head_pet_checked = " checked" if cfg.get("head_pet_reaction") else ""
+    speak_responses_checked = " checked" if cfg.get("speak_responses") else ""
+    completion_checked = " checked" if cfg.get("completion_notifications") else ""
+    lcd_mic_checked = " checked" if cfg.get("lcd_mic_voice") else ""
+    firmware_pet_checked = " checked" if cfg.get("firmware_head_pet_sound") else ""
     return f"""<!doctype html>
 <html lang="ja">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>xangi-stackchan settings</title>
+  <title>xangi-stack-chan settings</title>
   <style>
     body {{ font-family: ui-sans-serif, system-ui, sans-serif; max-width: 880px; margin: 32px auto; padding: 0 16px; background: #f7f4ed; color: #222; }}
     h1 {{ font-size: 28px; margin-bottom: 8px; }}
@@ -85,23 +89,28 @@ def render_page(state: RuntimeState) -> str:
   </style>
 </head>
 <body>
-  <h1>xangi-stackchan settings</h1>
+  <h1>xangi-stack-chan settings</h1>
   <p class="hint">保存すると実行中デーモンに反映され、設定は <code>{html.escape(cfg["config_path"])}</code> に保存されます。</p>
   <div class="top-actions">
-    <a href="/simulator">simulator</a>
-    <a href="/api/config">config JSON</a>
+    <a href="simulator">simulator</a>
+    <a href="api/config">config JSON</a>
   </div>
-  <form method="post" action="/settings">
+  <form method="post" action="settings">
     <fieldset>
       <legend>xangi</legend>
       {_field("xangi_url", "xangi URL", cfg["xangi_url"])}
       {_field("thread_id", "thread filter", cfg["thread_id"])}
+      <label class="checkbox"><input name="speak_responses" type="checkbox"{speak_responses_checked}> 通常応答を読み上げる</label>
+      <label class="checkbox"><input name="completion_notifications" type="checkbox"{completion_checked}> 長時間作業の完了要約を通知する</label>
+      {_field("completion_after_seconds", "通知する最短作業時間 (秒)", cfg["completion_after_seconds"], "number")}
+      {_field("completion_summary_chars", "完了要約の最大文字数", cfg["completion_summary_chars"], "number")}
     </fieldset>
     <fieldset>
       <legend>device</legend>
-      <label class="checkbox"><input name="wifi" type="checkbox"{checked}> WiFi HTTP API を使う</label>
+      <label class="checkbox"><input name="tailnet" type="checkbox"{tailnet_checked}> WiFi / Tailnetで接続する（通知・音声入力対応）</label>
       <label class="checkbox"><input name="simulator" type="checkbox"{simulator_checked}> ブラウザシミュレータを使う (USB/WiFi に接続しない)</label>
-      {_field("host", "WiFi host", cfg["host"])}
+      {_field("tailnet_bind", "Tailnet listen address", cfg["tailnet_bind"])}
+      {_field("tailnet_port", "Tailnet listen port", cfg["tailnet_port"], "number")}
       {_field("port", "USB port", cfg["port"])}
       {_field("baud", "baud", cfg["baud"], "number")}
       {_field("volume", "volume (0-255)", cfg["volume"], "number")}
@@ -148,9 +157,9 @@ def render_page(state: RuntimeState) -> str:
       {_field("puzzle_error", "error pattern", cfg["puzzle_error"])}
     </fieldset>
     <fieldset>
-      <legend>voice conversation (M5Stackchan K151 のアタマセンサ + 内蔵 PDM マイク経由)</legend>
-      <p class="hint">tap で録音開始 → 無音 1.5 秒で自動停止 → faster-whisper STT → xangi <code>POST /api/chat</code> 投入。応答 TTS は既存経路で発話される。詳細 <code>docs/usage.md</code> の「音声対話モード」。</p>
-      <label class="checkbox"><input name="voice_conversation" type="checkbox"{voice_checked}> 音声対話モードを有効化</label>
+      <legend>LCDマイク音声入力</legend>
+      <p class="hint">LCD下部のマイクボタンで録音開始 → 無音 1.5 秒で自動停止 → faster-whisper STT → xangi <code>POST /api/chat</code> 投入。アタマセンサは録音に使用しません。</p>
+      <label class="checkbox"><input name="lcd_mic_voice" type="checkbox"{lcd_mic_checked}> LCDマイクボタンで音声入力する</label>
       {_field("voice_app_session_id", "appSessionId (空ならアプリ起動時に専用 web session 自動作成)", cfg["voice_app_session_id"])}
       {_field("voice_silence_dbfs", "silence threshold (dBFS、静か:-50 / 騒:-30)", cfg["voice_silence_dbfs"], "number")}
       {_field("voice_silence_seconds", "silence seconds (自動停止までの無音秒数)", cfg["voice_silence_seconds"], "number")}
@@ -161,15 +170,13 @@ def render_page(state: RuntimeState) -> str:
       </div>
     </fieldset>
     <fieldset>
-      <legend>なでなで反応 (アタマを触った瞬間にランダムなセリフを喋る / デモ向け)</legend>
-      <p class="hint">話しかけ不要。アタマ (head_touch) を press / swipe すると即セリフ。voice conversation が有効な時はそちらが優先 (同じ press を消費するため反応しない)。</p>
-      <label class="checkbox"><input name="head_pet_reaction" type="checkbox"{head_pet_checked}> なでなで反応モードを有効化</label>
-      {_field("head_pet_phrases", "セリフ候補 (カンマ区切り、空ならデフォルト)", ",".join(cfg.get("head_pet_phrases") or []))}
-      {_field("head_pet_cooldown_seconds", "クールダウン秒数 (発話完了後、次の反応まで)", cfg["head_pet_cooldown_seconds"], "number")}
+      <legend>なでなで音声</legend>
+      <p class="hint">アタマセンサに触れたとき、スタックチャン本体に内蔵された音声を再生します。</p>
+      <label class="checkbox"><input name="firmware_head_pet_sound" type="checkbox"{firmware_pet_checked}> 本体内蔵のなでなで音声を有効化</label>
     </fieldset>
     <button type="submit">保存して反映</button>
   </form>
-  <form method="post" action="/demo" style="margin-top: 32px;">
+  <form method="post" action="demo" style="margin-top: 32px;">
     <fieldset>
       <legend>dance demo (現在の TTS + デバイスに直接喋らせて踊らせる)</legend>
       <label><span>text</span><input name="text" type="text" placeholder="踊るぞ、よろしくね！" required></label>
@@ -179,10 +186,16 @@ def render_page(state: RuntimeState) -> str:
     <button type="submit">ダンスデモを実行</button>
   </form>
   <fieldset style="margin-top: 32px;">
+    <legend>hardware diagnostics</legend>
+    <p class="hint">firmware の STATUS を取得し、version・camera・head_touch・servo などの対応状況を確認する。</p>
+    <button type="button" id="device-status-refresh">STATUSを更新</button>
+    <pre id="device-status" style="background:#eee4d2; padding:8px; border-radius:8px; white-space:pre-wrap;">(not checked)</pre>
+  </fieldset>
+  <fieldset style="margin-top: 32px;">
     <legend>camera (Phase 1A: snapshot + monitor)</legend>
     <p class="hint">CoreS3 内蔵 GC0308 カメラから JPEG 1 枚取得して表示する。撮影中はデバイスのアバターに「capturing」が出る。</p>
     <div style="display:flex; gap:16px; align-items:flex-start;">
-      <img id="camera-preview" src="/api/camera/snapshot.jpg" alt="snapshot"
+      <img id="camera-preview" src="api/camera/snapshot.jpg" alt="snapshot"
            style="max-width:320px; border:1px solid #c9c0b0; border-radius:10px; background:#000;"
            onerror="this.alt='no snapshot yet';">
       <div>
@@ -193,7 +206,7 @@ def render_page(state: RuntimeState) -> str:
   </fieldset>
   <script>
     (function() {{
-      // 発話履歴 polling (voice_conversation 有効時のみ意味あり)。
+      // LCDマイク音声入力の発話履歴 polling。
       const vcHistory = document.getElementById('vc-history');
       if (vcHistory) {{
         const fmt = (ts) => {{
@@ -217,7 +230,7 @@ def render_page(state: RuntimeState) -> str:
         }};
         const fetchHistory = async () => {{
           try {{
-            const r = await fetch('/api/voice/history');
+            const r = await fetch('api/voice/history');
             if (r.ok) render(await r.json());
           }} catch (e) {{}}
         }};
@@ -228,16 +241,32 @@ def render_page(state: RuntimeState) -> str:
       const shutter = document.getElementById('camera-shutter');
       const preview = document.getElementById('camera-preview');
       const status = document.getElementById('camera-status');
+      const deviceStatus = document.getElementById('device-status');
+      const statusRefresh = document.getElementById('device-status-refresh');
+      const refreshDeviceStatus = async () => {{
+        if (!deviceStatus || !statusRefresh) return;
+        statusRefresh.disabled = true;
+        try {{
+          const resp = await fetch('api/device/status');
+          deviceStatus.textContent = JSON.stringify(await resp.json(), null, 2);
+        }} catch (e) {{
+          deviceStatus.textContent = 'fetch error: ' + e;
+        }} finally {{
+          statusRefresh.disabled = false;
+        }}
+      }};
+      if (statusRefresh) statusRefresh.addEventListener('click', refreshDeviceStatus);
+      refreshDeviceStatus();
       if (!shutter) return;
       shutter.addEventListener('click', async () => {{
         shutter.disabled = true;
         const t0 = Date.now();
         try {{
-          const resp = await fetch('/api/camera/capture', {{ method: 'POST' }});
+          const resp = await fetch('api/camera/capture', {{ method: 'POST' }});
           const meta = await resp.json();
           status.textContent = JSON.stringify(meta, null, 2) + '\\n(client elapsed: ' + (Date.now() - t0) + 'ms)';
           if (meta.status === 'ok') {{
-            preview.src = '/api/camera/snapshot.jpg?_=' + Date.now();
+            preview.src = 'api/camera/snapshot.jpg?_=' + Date.now();
           }}
         }} catch (e) {{
           status.textContent = 'fetch error: ' + e;
@@ -257,7 +286,7 @@ def render_simulator_page() -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>xangi-stackchan simulator</title>
+  <title>xangi-stack-chan simulator</title>
   <style>
     :root { color-scheme: light; --ink:#20252b; --muted:#62707d; --line:#d6dde3; --panel:#ffffff; --bg:#eef3f6; --accent:#2b6f9f; --warm:#f0b44d; --ok:#38a169; --err:#d45b5b; }
     * { box-sizing: border-box; }
@@ -313,10 +342,10 @@ def render_simulator_page() -> str:
   <main>
     <header>
       <div>
-        <h1>xangi-stackchan simulator</h1>
+        <h1>xangi-stack-chan simulator</h1>
         <div id="connection" style="color:var(--muted); margin-top:6px;">connecting</div>
       </div>
-      <a href="/">settings</a>
+      <a href="./">settings</a>
     </header>
     <section class="stage">
       <div class="robot-wrap">
@@ -415,7 +444,7 @@ def render_simulator_page() -> str:
       const id = Number(state.wav_id || 0);
       if (!audioEnabled || !id || (!force && id === lastAudioId) || !state.has_audio) return;
       try {
-        const audio = new Audio(`/api/simulator/audio/latest.wav?wid=${id}`);
+        const audio = new Audio(`api/simulator/audio/latest.wav?wid=${id}`);
         audio.volume = Math.max(0, Math.min(1, Number(state.volume || 255) / 255));
         currentAudio = audio;
         await audio.play();
@@ -436,7 +465,7 @@ def render_simulator_page() -> str:
     };
     const poll = async () => {
       try {
-        const r = await fetch('/api/simulator/state');
+        const r = await fetch('api/simulator/state');
         const data = await r.json();
         if (!r.ok) throw new Error(data.error || r.statusText);
         conn.textContent = data.simulator ? 'simulator backend active' : 'runtime is not simulator';
@@ -447,7 +476,7 @@ def render_simulator_page() -> str:
       }
     };
     const sendCommand = async (command) => {
-      const r = await fetch('/api/simulator/command', {
+      const r = await fetch('api/simulator/command', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({command})
@@ -489,12 +518,14 @@ def render_simulator_page() -> str:
 def _flatten_form(raw: bytes) -> dict[str, object]:
     parsed = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
     data = {key: values[-1] for key, values in parsed.items()}
-    data["wifi"] = "wifi" in parsed
+    data["tailnet"] = "tailnet" in parsed
     data["simulator"] = "simulator" in parsed
     data["move_enabled"] = "move_enabled" in parsed
     data["puzzle_light_enabled"] = "puzzle_light_enabled" in parsed
-    data["voice_conversation"] = "voice_conversation" in parsed
-    data["head_pet_reaction"] = "head_pet_reaction" in parsed
+    data["lcd_mic_voice"] = "lcd_mic_voice" in parsed
+    data["speak_responses"] = "speak_responses" in parsed
+    data["completion_notifications"] = "completion_notifications" in parsed
+    data["firmware_head_pet_sound"] = "firmware_head_pet_sound" in parsed
     return data
 
 
@@ -514,10 +545,30 @@ def _execute_capture(state: RuntimeState) -> dict[str, object]:
     except Exception as exc:
         return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
 
-    if result.get("status") == "ok" and isinstance(result.get("image_jpeg"), (bytes, bytearray)):
+    if result.get("status") == "ok" and isinstance(
+        result.get("image_jpeg"), (bytes, bytearray)
+    ):
         # キャッシュ用に dict をコピー (image_jpeg は重いのでそのまま渡す = 同一参照)
         state.set_last_capture(dict(result))
     return result
+
+
+def _execute_device_status(state: RuntimeState) -> dict[str, object]:
+    """Return the firmware STATUS payload through the managed API."""
+    backend, _ = state.get_runtime()
+    if backend is None:
+        return {"status": "error", "error": "runtime not ready"}
+    if not hasattr(backend, "send_command"):
+        return {"status": "error", "error": "backend does not support STATUS"}
+    try:
+        result = backend.send_command("STATUS")
+    except Exception as exc:
+        return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+    return (
+        result
+        if isinstance(result, dict)
+        else {"status": "error", "error": "invalid STATUS"}
+    )
 
 
 def _execute_demo(state: RuntimeState, payload: dict[str, object]) -> dict[str, object]:
@@ -584,7 +635,31 @@ def _get_simulator_backend(state: RuntimeState):
     return backend
 
 
-def make_handler(state: RuntimeState):
+def _health_payload(state: RuntimeState) -> dict[str, object]:
+    config, version = state.snapshot()
+    backend, _ = state.get_runtime()
+    transport = (
+        "simulator"
+        if config.stackchan.simulator
+        else ("tailnet" if config.stackchan.tailnet else "usb")
+    )
+    connected = False
+    if backend is not None:
+        connected_value = getattr(backend, "is_connected", True)
+        connected = connected_value if isinstance(connected_value, bool) else True
+    return {
+        # Preserve the managed Extension health contract.
+        "ready": backend is not None and connected,
+        "service": "xangi-stackchan",
+        "service_running": True,
+        "transport": transport,
+        "device_connected": connected,
+        "config_version": version,
+        "diagnostics": state.diagnostics(),
+    }
+
+
+def make_handler(state: RuntimeState, auth_token: str | None = None):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
             return
@@ -596,17 +671,46 @@ def make_handler(state: RuntimeState):
             self.end_headers()
             self.wfile.write(body)
 
+        def _authorized(self) -> bool:
+            if not auth_token:
+                return True
+            if self.headers.get("Authorization") == f"Bearer {auth_token}":
+                return True
+            self._send(401, b"unauthorized", "text/plain; charset=utf-8")
+            return False
+
         def do_GET(self):
+            if not self._authorized():
+                return
             path = urlsplit(self.path).path
+            if path == "/api/health":
+                payload = _health_payload(state)
+                self._send(200, json.dumps(payload).encode(), "application/json")
+                return
+            if path == "/api/diagnostics":
+                payload = _health_payload(state)
+                self._send(200, json.dumps(payload).encode(), "application/json")
+                return
             if path == "/api/config":
                 body = json.dumps(state.snapshot_dict(), ensure_ascii=False).encode()
                 self._send(200, body, "application/json; charset=utf-8")
+                return
+            if path == "/api/device/status":
+                payload = _execute_device_status(state)
+                status = 200 if payload.get("status") != "error" else 503
+                self._send(
+                    status,
+                    json.dumps(payload, ensure_ascii=False).encode(),
+                    "application/json; charset=utf-8",
+                )
                 return
             if path in {"/", "/settings"}:
                 self._send(200, render_page(state).encode(), "text/html; charset=utf-8")
                 return
             if path == "/simulator":
-                self._send(200, render_simulator_page().encode(), "text/html; charset=utf-8")
+                self._send(
+                    200, render_simulator_page().encode(), "text/html; charset=utf-8"
+                )
                 return
             if path == "/api/simulator/state":
                 backend = _get_simulator_backend(state)
@@ -647,7 +751,10 @@ def make_handler(state: RuntimeState):
                     ):
                         body = json.dumps(result, ensure_ascii=False).encode()
                         self._send(
-                            503 if result.get("error") in {"runtime not ready", "camera not ready"} else 502,
+                            503
+                            if result.get("error")
+                            in {"runtime not ready", "camera not ready"}
+                            else 502,
                             body,
                             "application/json; charset=utf-8",
                         )
@@ -656,8 +763,8 @@ def make_handler(state: RuntimeState):
                 self._send(200, bytes(cached["image_jpeg"]), "image/jpeg")
                 return
             if path == "/api/voice/history":
-                # voice_conversation.history (直近 N 件の STT + POST 結果) を返す。
-                # 設定 UI の polling 表示 + デバッグ用。voice_conversation 無効起動時
+                # VoiceConversation.history (直近 N 件の STT + POST 結果) を返す。
+                # 設定 UI の polling 表示 + デバッグ用。LCDマイク入力無効時
                 # や VoiceConversation 未生成 (WiFi backend 等) は status=ok + 空配列。
                 vc = state.get_voice_conversation()
                 history = []
@@ -676,15 +783,22 @@ def make_handler(state: RuntimeState):
                     payload = {"status": "ok", "last_capture": None}
                 else:
                     import time as _t
+
                     meta = {k: v for k, v in cached.items() if k != "image_jpeg"}
                     if isinstance(cached.get("captured_at"), (int, float)):
                         meta["age_ms"] = int((_t.time() - cached["captured_at"]) * 1000)
                     payload = {"status": "ok", "last_capture": meta}
-                self._send(200, json.dumps(payload, ensure_ascii=False).encode(), "application/json; charset=utf-8")
+                self._send(
+                    200,
+                    json.dumps(payload, ensure_ascii=False).encode(),
+                    "application/json; charset=utf-8",
+                )
                 return
             self._send(404, b"not found", "text/plain; charset=utf-8")
 
         def do_POST(self):
+            if not self._authorized():
+                return
             path = urlsplit(self.path).path
             length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(length)
@@ -715,8 +829,15 @@ def make_handler(state: RuntimeState):
                 meta = {k: v for k, v in result.items() if k != "image_jpeg"}
                 if "size" in meta:
                     meta["has_image"] = True
-                status = 200 if result.get("status") == "ok" else (
-                    503 if result.get("error") in {"runtime not ready", "camera not ready"} else 502
+                status = (
+                    200
+                    if result.get("status") == "ok"
+                    else (
+                        503
+                        if result.get("error")
+                        in {"runtime not ready", "camera not ready"}
+                        else 502
+                    )
                 )
                 body = json.dumps(meta, ensure_ascii=False).encode()
                 self._send(status, body, "application/json; charset=utf-8")
@@ -725,8 +846,10 @@ def make_handler(state: RuntimeState):
                 # CLI / 自動化向け: 同期実行して結果 JSON を返す。
                 payload = json.loads(raw.decode("utf-8") or "{}")
                 result = _execute_demo(state, payload)
-                status = 200 if result.get("status") == "ok" else (
-                    503 if result.get("error") == "runtime not ready" else 400
+                status = (
+                    200
+                    if result.get("status") == "ok"
+                    else (503 if result.get("error") == "runtime not ready" else 400)
                 )
                 body = json.dumps(result, ensure_ascii=False).encode()
                 self._send(status, body, "application/json; charset=utf-8")
@@ -743,12 +866,19 @@ def make_handler(state: RuntimeState):
                 payload = json.loads(raw.decode("utf-8") or "{}")
                 command = str(payload.get("command") or "").strip()
                 if not command:
-                    self._send(400, b'{"status":"error","error":"command required"}', "application/json; charset=utf-8")
+                    self._send(
+                        400,
+                        b'{"status":"error","error":"command required"}',
+                        "application/json; charset=utf-8",
+                    )
                     return
                 try:
                     result = backend.send_command(command)
                 except Exception as exc:
-                    result = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+                    result = {
+                        "status": "error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
                 status = 200 if result.get("status") != "error" else 400
                 body = json.dumps(result, ensure_ascii=False).encode()
                 self._send(status, body, "application/json; charset=utf-8")
@@ -776,6 +906,7 @@ def start_settings_server(
     bind: str,
     port: int,
     autoshift_tries: int = 1,
+    auth_token: str | None = None,
 ) -> tuple[ThreadingHTTPServer, int]:
     """Start the settings UI HTTP server, auto-shifting the port on conflict.
 
@@ -792,7 +923,9 @@ def start_settings_server(
     for offset in range(tries):
         candidate = port + offset
         try:
-            server = ThreadingHTTPServer((bind, candidate), make_handler(state))
+            server = ThreadingHTTPServer(
+                (bind, candidate), make_handler(state, auth_token=auth_token)
+            )
         except OSError as exc:
             if exc.errno in {errno.EADDRINUSE, errno.EACCES}:
                 last_error = exc
@@ -800,7 +933,7 @@ def start_settings_server(
             raise
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        return server, candidate
+        return server, int(server.server_port)
     raise OSError(
         f"settings UI port {port}..{port + tries - 1} all busy"
     ) from last_error

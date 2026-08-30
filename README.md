@@ -1,4 +1,4 @@
-# xangi-stackchan
+# xangi-stack-chan
 
 ![xangi-stackchan](docs/images/cover.jpg)
 
@@ -16,7 +16,7 @@
 - **状態表示LED**: CoreS3 Grove PORT.B の Puzzle Unit WS2812E と、M5Stack 公式 StackChan K151 / K151-R の本体 12 RGB LED を自動検出し、思考中 (`thinking`) / 発話中 (`talking`) / エラー (`error`) に合わせて点灯する。未接続・旧ファームでは自動で無効化
 - **カメラスナップショット**: 内蔵 GC0308 カメラで JPEG 撮影 → 設定 UI / API で表示。LLM 連携は将来別 PR で対応
 - **アタマセンサ なでなで**: M5Stack 公式 StackChan K151 内蔵の Si12T 容量タッチ (3 ch) で Press / Release / Swipe を検出。Press で `nade nade!` Avatar 顔 + host へ `head_touch` event 通知
-- **音声対話モード (`--voice-conversation`)**: K151 のアタマセンサ tap で内蔵 PDM マイク録音 → 無音検出で自動停止 → faster-whisper STT (Silero VAD) → xangi `POST /api/chat` 投入。xangi 応答が piper-plus / VOICEVOX で発話される end-to-end ループ。詳細 `docs/usage.md` の「音声対話モード」
+- **LCDマイク音声入力 (`--lcd-mic-voice`)**: K151 のLCD下部マイクボタンで内蔵 PDM マイク録音 → 無音検出で自動停止 → faster-whisper STT → xangi `POST /api/chat` 投入
 
 表示 UI は持たず、デバイスの表情変更と音声再生に集中する。サーボの有無は起動時に自動判定され、サーボ無しの CoreS3 単体機では MOVE のみ unavailable 応答 (WAV/FACE/CAPTURE は通常動作) する graceful degradation 設計。
 
@@ -63,6 +63,21 @@ uv run xangi-stackchan \
 
 起動すると設定 UI が `http://127.0.0.1:7897/` で立ち上がる。xangi URL / 接続先 / 音量 / TTS / 表情をブラウザから変更でき、保存すると `~/.xangi/xangi-stackchan/config.json` に永続化される。
 
+### CoreS3からTailnet経由で接続（実験機能）
+
+DGX Spark側でreverse TCP listenerを起動する。CoreS3側から接続するため、MacBookへのUSB接続は不要。
+
+```bash
+uv run xangi-stackchan \
+  --xangi-url http://127.0.0.1:18888 \
+  --tailnet \
+  --tailnet-bind 0.0.0.0 \
+  --tailnet-port 18765 \
+  --tts none
+```
+
+ファームの準備・認証情報の置き方は `firmware/README.md` を参照。無線transport protocol v3はUSB版と同じコマンド面を提供し、`STATUS / VOLUME / FACE / MOVE`、完了通知などのWAV再生、LCDマイクのイベント・PCM転送、画像顔・スプライトキャッシュ・差分矩形、カメラJPEG取得に対応する。画像assetはリポジトリへ含めず、gitignore対象の `assets/pets/<name>/spritesheet.webp` から接続後に転送する。
+
 スプライト顔を使う場合は、起動前にローカルのスプライトシートをリポジトリ直下の `assets/pets/borot/spritesheet.webp` に置く。`assets/pets/**/*.webp` は `.gitignore` 対象なので、画像本体は git 管理されない。別キャラクターを使う場合は `assets/pets/<name>/spritesheet.webp` に置き、`--sprite-sheet assets/pets/<name>/spritesheet.webp` を指定する。
 
 ### 実機なしでブラウザシミュレータを開く
@@ -78,6 +93,10 @@ uv run xangi-stackchan \
 ```
 
 シミュレータ画面のボタンや `POST /api/simulator/command` から `FACE:happy` / `MOVE:20,8` / `PUZZLE:thinking` などのプロトコルコマンドを手動送信できる。`/api/simulator/state` は現在状態を JSON で返すので、UI 開発やデモの確認にも使える。xangi Web UI の入力に反応させたい場合は `--thread-id` を付けず、`--speak-platforms web` で Discord 等のイベントだけを除外する。音声をブラウザで鳴らすには `--tts piper` / `--tts voicevox` で起動し、シミュレータ画面の `enable audio` を一度押す。
+
+通常応答、長時間作業の完了通知、マイク会話、host側のなで反応、firmware内蔵のなで音声は設定画面で個別にON/OFFできる。完了通知は `--completion-notifications --completion-after-seconds 30` でも有効化でき、Markdown等を除いた短い要約を読み上げる。managed起動時は通常応答と各対話機能をOFF、完了通知だけONにするが、設定画面から自由に組み替えられる。
+
+xangi managed Extensionとして使う場合は、`uv sync` 後にこのディレクトリをExtensionsへ登録する。xangiから渡されたイベントURL・インスタンスID・認証トークンを使用し、設定UIもxangiの認証付きプロキシ経由で開く。詳細は `XANGI_SETUP.md` を参照。
 
 ## 複数台で動かす
 
@@ -102,7 +121,7 @@ uv run xangi-stackchan --instance-id right --port /dev/stackchan-right --thread-
 
 ## AI エージェント連携
 
-[`SKILL.md`](./SKILL.md) を参照。Claude Code 等の AI エージェントから本ブリッジを起動・操作してスタックチャンを動かすための手順を集約してある。
+[`skills/xs-xangi-stackchan/SKILL.md`](./skills/xs-xangi-stackchan/SKILL.md) を参照。AIエージェントからManaged Extensionを設定・診断・操作する手順を集約してある。
 
 ## ドキュメント
 

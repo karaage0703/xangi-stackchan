@@ -1,12 +1,10 @@
 import json
 from dataclasses import replace
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock
 from typing import Any
 
 from .app_types import BridgeConfig
-from .stackchan import StackchanConfig
-
 
 DEFAULT_CONFIG_PATH = Path.home() / ".xangi" / "xangi-stackchan" / "config.json"
 DEFAULT_INSTANCE_ID = "default"
@@ -83,14 +81,15 @@ def config_to_dict(config: BridgeConfig) -> dict[str, Any]:
     return {
         "xangi_url": config.xangi_url,
         "thread_id": config.thread_id or "",
-        "wifi": config.stackchan.wifi,
+        "tailnet": config.stackchan.tailnet,
         "simulator": config.stackchan.simulator,
-        "host": config.stackchan.host,
         "port": config.stackchan.port,
         "baud": config.stackchan.baud,
         "device_profile": config.stackchan.device_profile,
         "max_wav_bytes": config.stackchan.max_wav_bytes,
         "skip_move_during_wav": config.stackchan.skip_move_during_wav,
+        "tailnet_bind": config.stackchan.tailnet_bind,
+        "tailnet_port": config.stackchan.tailnet_port,
         "volume": config.volume,
         "tts": config.tts,
         "piper_bin": config.piper_bin,
@@ -126,7 +125,6 @@ def config_to_dict(config: BridgeConfig) -> dict[str, Any]:
         "puzzle_thinking": config.puzzle_thinking,
         "puzzle_talking": config.puzzle_talking,
         "puzzle_error": config.puzzle_error,
-        "voice_conversation": config.voice_conversation,
         "voice_app_session_id": config.voice_app_session_id,
         "voice_silence_dbfs": config.voice_silence_dbfs,
         "voice_silence_seconds": config.voice_silence_seconds,
@@ -134,9 +132,11 @@ def config_to_dict(config: BridgeConfig) -> dict[str, Any]:
         "voice_initial_grace_seconds": config.voice_initial_grace_seconds,
         "lcd_mic_voice": config.lcd_mic_voice,
         "speak_platforms": list(config.speak_platforms),
-        "head_pet_reaction": config.head_pet_reaction,
-        "head_pet_phrases": list(config.head_pet_phrases),
-        "head_pet_cooldown_seconds": config.head_pet_cooldown_seconds,
+        "speak_responses": config.speak_responses,
+        "completion_notifications": config.completion_notifications,
+        "completion_after_seconds": config.completion_after_seconds,
+        "completion_summary_chars": config.completion_summary_chars,
+        "firmware_head_pet_sound": config.firmware_head_pet_sound,
     }
 
 
@@ -182,14 +182,17 @@ def _phrase_list(value: Any, fallback: list[str]) -> list[str]:
 def merge_config(base: BridgeConfig, data: dict[str, Any]) -> BridgeConfig:
     stackchan = replace(
         base.stackchan,
-        wifi=_bool(data.get("wifi", base.stackchan.wifi)),
+        tailnet=_bool(data.get("tailnet", base.stackchan.tailnet)),
         simulator=_bool(data.get("simulator", base.stackchan.simulator)),
-        host=str(data.get("host", base.stackchan.host)),
         port=str(data.get("port", base.stackchan.port)),
         baud=_int_or(data.get("baud"), base.stackchan.baud),
         device_profile=str(data.get("device_profile", base.stackchan.device_profile)),
         max_wav_bytes=_int_or(data.get("max_wav_bytes"), base.stackchan.max_wav_bytes),
-        skip_move_during_wav=_bool(data.get("skip_move_during_wav", base.stackchan.skip_move_during_wav)),
+        skip_move_during_wav=_bool(
+            data.get("skip_move_during_wav", base.stackchan.skip_move_during_wav)
+        ),
+        tailnet_bind=str(data.get("tailnet_bind", base.stackchan.tailnet_bind)),
+        tailnet_port=_int_or(data.get("tailnet_port"), base.stackchan.tailnet_port),
     )
     return replace(
         base,
@@ -219,12 +222,18 @@ def merge_config(base: BridgeConfig, data: dict[str, Any]) -> BridgeConfig:
         ),
         stream_timeout=_int_or(data.get("stream_timeout"), base.stream_timeout),
         retry_seconds=_float_or(data.get("retry_seconds"), base.retry_seconds),
-        max_retry_seconds=_float_or(data.get("max_retry_seconds"), base.max_retry_seconds),
+        max_retry_seconds=_float_or(
+            data.get("max_retry_seconds"), base.max_retry_seconds
+        ),
         move_enabled=_bool(data.get("move_enabled", base.move_enabled)),
         move_idle_yaw=_float_or(data.get("move_idle_yaw"), base.move_idle_yaw),
         move_idle_pitch=_float_or(data.get("move_idle_pitch"), base.move_idle_pitch),
-        move_thinking_yaw=_float_or(data.get("move_thinking_yaw"), base.move_thinking_yaw),
-        move_thinking_pitch=_float_or(data.get("move_thinking_pitch"), base.move_thinking_pitch),
+        move_thinking_yaw=_float_or(
+            data.get("move_thinking_yaw"), base.move_thinking_yaw
+        ),
+        move_thinking_pitch=_float_or(
+            data.get("move_thinking_pitch"), base.move_thinking_pitch
+        ),
         move_error_yaw=_float_or(data.get("move_error_yaw"), base.move_error_yaw),
         move_error_pitch=_float_or(data.get("move_error_pitch"), base.move_error_pitch),
         move_talking_sway_yaw=_float_or(
@@ -243,7 +252,6 @@ def merge_config(base: BridgeConfig, data: dict[str, Any]) -> BridgeConfig:
         puzzle_thinking=str(data.get("puzzle_thinking", base.puzzle_thinking)),
         puzzle_talking=str(data.get("puzzle_talking", base.puzzle_talking)),
         puzzle_error=str(data.get("puzzle_error", base.puzzle_error)),
-        voice_conversation=_bool(data.get("voice_conversation", base.voice_conversation)),
         voice_app_session_id=str(
             data.get("voice_app_session_id", base.voice_app_session_id)
         ),
@@ -260,17 +268,26 @@ def merge_config(base: BridgeConfig, data: dict[str, Any]) -> BridgeConfig:
             data.get("voice_initial_grace_seconds"), base.voice_initial_grace_seconds
         ),
         lcd_mic_voice=_bool(data.get("lcd_mic_voice", base.lcd_mic_voice)),
-        speak_platforms=_phrase_list(
-            data.get("speak_platforms"), base.speak_platforms
+        speak_platforms=_phrase_list(data.get("speak_platforms"), base.speak_platforms),
+        speak_responses=_bool(data.get("speak_responses", base.speak_responses)),
+        completion_notifications=_bool(
+            data.get("completion_notifications", base.completion_notifications)
         ),
-        head_pet_reaction=_bool(
-            data.get("head_pet_reaction", base.head_pet_reaction)
+        completion_after_seconds=max(
+            0.0,
+            _float_or(
+                data.get("completion_after_seconds"),
+                base.completion_after_seconds,
+            ),
         ),
-        head_pet_phrases=_phrase_list(
-            data.get("head_pet_phrases"), base.head_pet_phrases
+        completion_summary_chars=max(
+            20,
+            _int_or(
+                data.get("completion_summary_chars"), base.completion_summary_chars
+            ),
         ),
-        head_pet_cooldown_seconds=_float_or(
-            data.get("head_pet_cooldown_seconds"), base.head_pet_cooldown_seconds
+        firmware_head_pet_sound=_bool(
+            data.get("firmware_head_pet_sound", base.firmware_head_pet_sound)
         ),
     )
 
@@ -299,17 +316,20 @@ class RuntimeState:
         #        "width": W, "height": H, "size": N, "error": Optional[str],
         #        "captured_at_device_ms": Optional[int]}
         self._last_capture: dict[str, Any] | None = None
-        # Phase 2: 音声対話モードの coordinator (VoiceConversation インスタンス)。
-        # run_bridge が config.voice_conversation=True + StackchanSerial backend のとき
+        # LCDマイク音声入力の coordinator (VoiceConversation インスタンス)。
+        # run_bridge が config.lcd_mic_voice=True + StackchanSerial backend のとき
         # set_voice_conversation で登録。`/api/voice/history` から history が読める。
         self._voice_conv: object | None = None
-        # なでなで反応モードの coordinator (HeadPetReaction インスタンス)。
-        # run_bridge が config.head_pet_reaction=True + StackchanSerial backend +
-        # voice 無効のとき set_head_pet_reaction で登録。
-        self._head_pet: object | None = None
         # sprite face animation coordinator. settings_server の `/api/demo` は
         # 発話中に IMAGE tick がシリアル/LCDを奪い合わないよう一時停止する。
         self._sprite_animator: object | None = None
+        self._config_notifier = None
+        self._updated = Event()
+        self._diagnostics: dict[str, Any] = {
+            "last_event": None,
+            "last_completion": None,
+            "last_error": None,
+        }
 
     def snapshot(self) -> tuple[BridgeConfig, int]:
         with self._lock:
@@ -348,13 +368,45 @@ class RuntimeState:
         with self._lock:
             return self._voice_conv
 
-    def set_head_pet_reaction(self, head_pet: object | None) -> None:
+    def set_config_notifier(self, notifier) -> None:
         with self._lock:
-            self._head_pet = head_pet
+            self._config_notifier = notifier
 
-    def get_head_pet_reaction(self) -> object | None:
+    def record_event(self, event_type: str, received_at: float) -> None:
         with self._lock:
-            return self._head_pet
+            self._diagnostics["last_event"] = {
+                "type": event_type,
+                "received_at": received_at,
+            }
+
+    def record_completion(self, *, notified: bool, reason: str, at: float) -> None:
+        with self._lock:
+            self._diagnostics["last_completion"] = {
+                "notified": notified,
+                "reason": reason,
+                "at": at,
+            }
+
+    def record_error(self, *, stage: str, error: str, at: float) -> None:
+        with self._lock:
+            self._diagnostics["last_error"] = {
+                "stage": stage,
+                "error": error,
+                "at": at,
+            }
+
+    def diagnostics(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._diagnostics)
+
+    def wait_for_update(self, version: int, timeout: float) -> bool:
+        with self._lock:
+            if self._version != version:
+                return True
+            self._updated.clear()
+        self._updated.wait(timeout)
+        with self._lock:
+            return self._version != version
 
     def snapshot_dict(self) -> dict[str, Any]:
         with self._lock:
@@ -373,7 +425,11 @@ class RuntimeState:
             saved["version"] = self._version
             saved["config_path"] = str(self.config_path)
             saved["instance_id"] = self.instance_id
-            return saved
+            notifier = self._config_notifier
+            self._updated.set()
+        if notifier is not None:
+            notifier()
+        return saved
 
 
 # --- legacy compat aliases -----------------------------------------------

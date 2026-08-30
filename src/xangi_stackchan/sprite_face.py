@@ -5,7 +5,6 @@ from pathlib import Path
 
 from PIL import Image, ImageChops, ImageDraw
 
-
 CELL_W = 192
 CELL_H = 208
 COLS = 8
@@ -87,13 +86,17 @@ class SpriteFaceRenderer:
         label = "LISTENING" if expr == "listening" else None
         return self.render_cell(row=row, col=col, label=label)
 
-    def render_expression_frame_rect(self, expression: str, step: int) -> tuple[int, int, int, int, bytes] | None:
+    def render_expression_frame_rect(
+        self, expression: str, step: int
+    ) -> tuple[int, int, int, int, bytes] | None:
         """Return the changed RGB565 rect against the last committed frame.
 
         The first frame is full-screen. Later frames are cropped to the dirty
         bbox so the device can update only changed pixels with pushImage().
         """
-        row = EXPRESSION_TO_ROW.get((expression or "").strip().lower(), EXPRESSION_TO_ROW["neutral"])
+        row = EXPRESSION_TO_ROW.get(
+            (expression or "").strip().lower(), EXPRESSION_TO_ROW["neutral"]
+        )
         cols = self.frame_columns_for_expression(expression)
         col = cols[step % len(cols)] if cols else 0
         frame = self.render_cell_image(row=row, col=col)
@@ -129,7 +132,9 @@ class SpriteFaceRenderer:
         self._pending_frame = None
 
     def frame_columns_for_expression(self, expression: str) -> list[int]:
-        row = EXPRESSION_TO_ROW.get((expression or "").strip().lower(), EXPRESSION_TO_ROW["neutral"])
+        row = EXPRESSION_TO_ROW.get(
+            (expression or "").strip().lower(), EXPRESSION_TO_ROW["neutral"]
+        )
         return self._detect_filled_frames()[row]
 
     def render_cell(
@@ -140,7 +145,9 @@ class SpriteFaceRenderer:
         crop_head: bool = False,
         label: str | None = None,
     ) -> bytes:
-        canvas = self.render_cell_image(row=row, col=col, crop_head=crop_head, label=label)
+        canvas = self.render_cell_image(
+            row=row, col=col, crop_head=crop_head, label=label
+        )
         key = f"{self.sheet_path}:{self._sheet_mtime}:{row}:{col}:{crop_head}:{label}:{self.show_mic_button}:{self.quality}:jpeg"
         cached = self._cache.get(key)
         if cached is not None:
@@ -164,7 +171,9 @@ class SpriteFaceRenderer:
         row = max(0, min(row, (sheet.height // CELL_H) - 1))
         col = max(0, min(col, COLS - 1))
 
-        cell = sheet.crop((col * CELL_W, row * CELL_H, (col + 1) * CELL_W, (row + 1) * CELL_H))
+        cell = sheet.crop(
+            (col * CELL_W, row * CELL_H, (col + 1) * CELL_W, (row + 1) * CELL_H)
+        )
         if cell.mode != "RGBA":
             cell = cell.convert("RGBA")
         if crop_head:
@@ -181,17 +190,31 @@ class SpriteFaceRenderer:
             draw = ImageDraw.Draw(canvas)
             if label:
                 # 録音中などの状態ラベルは下部に表示。
-                draw.rounded_rectangle((88, 206, 232, 232), radius=6, fill=(0, 0, 0), outline=(255, 255, 255), width=2)
+                draw.rounded_rectangle(
+                    (88, 206, 232, 232),
+                    radius=6,
+                    fill=(0, 0, 0),
+                    outline=(255, 255, 255),
+                    width=2,
+                )
                 draw.text((111, 214), label, fill=(255, 255, 255))
             if self.show_mic_button:
                 # 左上にマイクボタン (firmware の inMicButton 領域 x<92,y<60 に合わせる)。
                 # 録音中 (listening label) は赤くして「押下中」を示す。
                 recording = label == "LISTENING"
                 fill = (210, 40, 40) if recording else (30, 90, 200)
-                draw.rounded_rectangle((6, 6, 86, 52), radius=8, fill=fill, outline=(255, 255, 255), width=2)
+                draw.rounded_rectangle(
+                    (6, 6, 86, 52),
+                    radius=8,
+                    fill=fill,
+                    outline=(255, 255, 255),
+                    width=2,
+                )
                 # マイクアイコン: カプセル本体 + アーチ + スタンド。
                 draw.rounded_rectangle((26, 13, 40, 33), radius=7, fill=(255, 255, 255))
-                draw.arc((22, 20, 44, 40), start=0, end=180, fill=(255, 255, 255), width=2)
+                draw.arc(
+                    (22, 20, 44, 40), start=0, end=180, fill=(255, 255, 255), width=2
+                )
                 draw.line((33, 40, 33, 46), fill=(255, 255, 255), width=2)
                 draw.line((26, 46, 40, 46), fill=(255, 255, 255), width=2)
                 draw.text((48, 22), "talk", fill=(255, 255, 255))
@@ -239,8 +262,14 @@ class SpriteFaceRenderer:
         for row in range(min(ROWS, sheet.height // CELL_H)):
             filled: list[int] = []
             for col in range(min(COLS, sheet.width // CELL_W)):
-                cell = sheet.crop((col * CELL_W, row * CELL_H, (col + 1) * CELL_W, (row + 1) * CELL_H))
-                alpha = cell.getchannel("A") if cell.mode == "RGBA" else cell.convert("RGBA").getchannel("A")
+                cell = sheet.crop(
+                    (col * CELL_W, row * CELL_H, (col + 1) * CELL_W, (row + 1) * CELL_H)
+                )
+                alpha = (
+                    cell.getchannel("A")
+                    if cell.mode == "RGBA"
+                    else cell.convert("RGBA").getchannel("A")
+                )
                 if alpha.getbbox() is not None:
                     filled.append(col)
             frames.append(filled or [0])

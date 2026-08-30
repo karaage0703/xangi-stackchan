@@ -4,7 +4,7 @@ import io
 import wave
 
 from xangi_stackchan.app_types import BridgeConfig
-from xangi_stackchan.dance import DanceLoop, PRESETS, run_demo, synthesize_text
+from xangi_stackchan.dance import PRESETS, DanceLoop, run_demo, synthesize_text
 from xangi_stackchan.stackchan import StackchanConfig
 
 
@@ -19,7 +19,9 @@ class FakeBackend:
             return {"status": "ok"}
         return {"status": "ok", "command": command}
 
-    def send_wav(self, wav: bytes, chunk_size: int = 1024, chunk_delay: float = 0.005) -> dict:
+    def send_wav(
+        self, wav: bytes, chunk_size: int = 1024, chunk_delay: float = 0.005
+    ) -> dict:
         self.wav_calls.append(
             {"wav": wav, "chunk_size": chunk_size, "chunk_delay": chunk_delay}
         )
@@ -53,7 +55,7 @@ def _config() -> BridgeConfig:
     return BridgeConfig(
         xangi_url="http://127.0.0.1:18888",
         thread_id=None,
-        stackchan=StackchanConfig(wifi=False, host="", port="/dev/null", baud=115200),
+        stackchan=StackchanConfig(port="/dev/null", baud=115200),
         volume=128,
         tts="piper",
         piper_bin="",

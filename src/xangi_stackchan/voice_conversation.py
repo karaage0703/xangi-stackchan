@@ -34,20 +34,24 @@ if TYPE_CHECKING:
     pass
 
 
-DEFAULT_SILENCE_DBFS    = float(os.environ.get("STACKCHAN_VC_SILENCE_DBFS", "-40.0"))
+DEFAULT_SILENCE_DBFS = float(os.environ.get("STACKCHAN_VC_SILENCE_DBFS", "-40.0"))
 DEFAULT_SILENCE_SECONDS = float(os.environ.get("STACKCHAN_VC_SILENCE_SECONDS", "1.5"))
-DEFAULT_MAX_SECONDS     = float(os.environ.get("STACKCHAN_VC_MAX_SECONDS", "15.0"))
+DEFAULT_MAX_SECONDS = float(os.environ.get("STACKCHAN_VC_MAX_SECONDS", "15.0"))
 # なでてから最初の発話までの猶予 (秒)。この間の無音では止めない (考える時間)。
 # 猶予内に一度も発話が無ければ誤タップとみなして stop。発話開始後は silence_seconds
 # の通常無音判定に切り替わる。
-DEFAULT_INITIAL_GRACE_SECONDS = float(os.environ.get("STACKCHAN_VC_INITIAL_GRACE_SECONDS", "5.0"))
-DEFAULT_MIN_PCM_BYTES   = int(os.environ.get("STACKCHAN_VC_MIN_PCM_BYTES", "8192"))
-HISTORY_MAX             = int(os.environ.get("STACKCHAN_VC_HISTORY_MAX", "10"))
+DEFAULT_INITIAL_GRACE_SECONDS = float(
+    os.environ.get("STACKCHAN_VC_INITIAL_GRACE_SECONDS", "5.0")
+)
+DEFAULT_MIN_PCM_BYTES = int(os.environ.get("STACKCHAN_VC_MIN_PCM_BYTES", "8192"))
+HISTORY_MAX = int(os.environ.get("STACKCHAN_VC_HISTORY_MAX", "10"))
 # PCM stream が止まってから強制 stop するまでの猶予 (秒)。無音判定は「chunk が
 # 流れ続けること」前提なので、ファームが MIC mode に入れず PCM を吐かない / 途中で
 # stream が死ぬと chunk-based 停止が一切走らず録音状態に固まる。これを壁時計
 # watchdog で救う安全網。連続なで / 発話直後なで でも固まらなくなる (2026-05-30)。
-DEFAULT_PCM_STALL_SECONDS = float(os.environ.get("STACKCHAN_VC_PCM_STALL_SECONDS", "3.0"))
+DEFAULT_PCM_STALL_SECONDS = float(
+    os.environ.get("STACKCHAN_VC_PCM_STALL_SECONDS", "3.0")
+)
 # watchdog thread のポーリング間隔 (秒)。
 WATCHDOG_POLL_SECONDS = 0.25
 
@@ -71,12 +75,11 @@ def chunk_dbfs(chunk: bytes) -> float:
 
 
 class VoiceConversation:
-    """head_touch press でユーザ発話セッションを駆動する coordinator。
+    """LCDマイクボタンでユーザ発話セッションを駆動する coordinator。
 
     使い方:
         vc = VoiceConversation(backend, xangi_base_url="http://localhost:5174")
-        vc.start()  # backend.on_head_touch にバインド
-        # 以後、アタマ tap で録音 → STT → xangi 投入が自動進行
+        vc.start()  # backend.on_mic_button にバインド
     """
 
     def __init__(
@@ -95,14 +98,10 @@ class VoiceConversation:
         on_sent: callable = None,
         on_stop: callable = None,
         on_press: callable = None,
-        trigger_head_touch: bool = True,
+        on_busy: callable = None,
         trigger_mic_button: bool = True,
     ):
         self.backend = backend
-        # 録音トリガの選択。アタマセンサ press / LCD マイクボタン tap のどちらで録音を
-        # 開始するか。LCD ボタン運用ではアタマセンサを「なで反応」に残すため
-        # trigger_head_touch=False にする。
-        self.trigger_head_touch = trigger_head_touch
         self.trigger_mic_button = trigger_mic_button
         self.xangi_base_url = xangi_base_url.rstrip("/")
         self.app_session_id = app_session_id
@@ -114,13 +113,15 @@ class VoiceConversation:
         self.min_pcm_bytes = min_pcm_bytes
         self.language = language
         self.on_transcribed = on_transcribed  # callback(text: str, stt_result: dict)
-        self.on_sent = on_sent                # callback(text: str, response: dict)
+        self.on_sent = on_sent  # callback(text: str, response: dict)
         # callback(stop_result: dict)。stop_mic_recording の戻り値 (pcm/wav/frames/
         # duration_seconds) を STT 前に受け取る。テストスクリプトで WAV 保存に使う。
         self.on_stop = on_stop
         # callback(event: dict)。head_touch press 受信時 (録音開始時) に呼ばれる。
         # app.py で「press → 表情変更 + 録音開始ログ出力」に使う想定。
         self.on_press = on_press
+        # callback(event: dict)。STT / xangi送信処理中の再トリガを利用者へ記録する。
+        self.on_busy = on_busy
         # 直近の STT 履歴 (最大 HISTORY_MAX 件)。設定 UI / デバッグ用に保持。
         # 各 entry は {ts, text, language, elapsed_seconds, stt_status, sent_status}。
         # 録音 PCM やフルセグメントは含まない (メモリ節約)。
@@ -132,10 +133,16 @@ class VoiceConversation:
         # 停止をスキップし、ボタンを離す (mic_button up) まで録音を続ける。
         self._push_to_talk = False
         self._record_start_time = 0.0
-        self._last_chunk_time = 0.0  # 直近 PCM chunk 受信時刻 (0 = まだ 1 つも来ていない)
+        self._last_chunk_time = (
+            0.0  # 直近 PCM chunk 受信時刻 (0 = まだ 1 つも来ていない)
+        )
         self._speech_started = False  # 録音開始後に一度でも有音を検知したか
         self._silence_since = 0.0  # 0 = 無音じゃない、>0 = この時刻から無音
-        self._stopping = False     # _stop_and_process 多重発火防止
+        self._stopping = False  # _stop_and_process 多重発火防止
+        # MIC_STOP後もSTTとxangi POSTが終わるまでは同じ入力turnの処理中。
+        # この間の再タップを許すと、前turnの応答中に次のMIC_STARTが走り、SSE応答が
+        # mic guardで破棄される。
+        self._processing = False
         self._stop_thread: threading.Thread | None = None
         # PCM chunk に依存しない壁時計監視 thread。録音開始ごとに起動し、
         # _recording が False になったら抜ける。
@@ -148,7 +155,7 @@ class VoiceConversation:
         self._prev_sigterm = None
 
     def start(self) -> None:
-        """backend.on_head_touch に bind。録音 stream の callback 経路も
+        """backend.on_mic_button に bind。録音 stream の callback 経路も
         backend.start_mic_recording 内で on_pcm_chunk として渡す。
 
         atexit に cleanup を登録して、録音中のプロセス終了 (Ctrl-C / kill SIGTERM
@@ -156,8 +163,6 @@ class VoiceConversation:
         が MIC モードのまま PCM stream を吐き続け、次回起動時のシリアルが汚染される
         (2026-05-27 実機検証で確認済の既知パターン)。
         """
-        if self.trigger_head_touch:
-            self.backend.on_head_touch = self._on_head_touch
         # LCD マイクボタン (cores3-main-0.17+) を別トリガとして bind。アタマセンサと
         # 別経路なので、ボタン運用時はアタマセンサをなで反応に残せる。
         if self.trigger_mic_button:
@@ -169,7 +174,9 @@ class VoiceConversation:
         # thread でしか登録できないので main 以外から start された場合は skip。
         if threading.current_thread() is threading.main_thread():
             try:
-                self._prev_sigterm = signal.signal(signal.SIGTERM, self._signal_cleanup_handler)
+                self._prev_sigterm = signal.signal(
+                    signal.SIGTERM, self._signal_cleanup_handler
+                )
             except (ValueError, OSError):
                 self._prev_sigterm = None
         # SerialActor 移行後 (Phase 2.x) は event poll thread 不要。actor が常時
@@ -178,7 +185,6 @@ class VoiceConversation:
 
     def stop(self) -> None:
         """bind 解除。録音中なら停止。"""
-        self.backend.on_head_touch = None
         self.backend.on_mic_button = None
         self._watchdog_stop.set()  # watchdog thread を畳む
         if self._recording:
@@ -207,12 +213,6 @@ class VoiceConversation:
         except Exception:
             pass
 
-    def _on_head_touch(self, event: dict) -> None:
-        gesture = event.get("gesture")
-        if gesture != "press":
-            return  # release / swipe は無視
-        self._toggle_recording(event)
-
     def _on_mic_button(self, event: dict) -> None:
         # LCD マイクボタン。tap-to-talk: 押した瞬間 (down) に録音開始、喋り終わり (無音
         # silence_seconds) で VAD 自動停止。離し (up) は無視する。録音中の再タップは停止。
@@ -228,10 +228,20 @@ class VoiceConversation:
 
     def _toggle_recording(self, event: dict) -> None:
         with self._state_lock:
-            if self._recording:
-                # 録音中の再トリガ = toggle stop
-                self._schedule_stop()
-                return
+            recording = self._recording
+            processing = self._processing
+        if recording:
+            # _schedule_stop() も _state_lock を取る。lock保持中に呼ぶと
+            # 非再入Lockを二重取得して再タップ時にdeadlockする。
+            self._schedule_stop()
+            return
+        if processing:
+            if self.on_busy is not None:
+                try:
+                    self.on_busy(event)
+                except Exception:
+                    pass
+            return
         self._begin_recording(event, push_to_talk=False)
 
     def _begin_recording(self, event: dict, push_to_talk: bool = False) -> None:
@@ -261,13 +271,15 @@ class VoiceConversation:
                 self._recording = False
             if self.on_stop is not None:
                 try:
-                    self.on_stop({
-                        **ack,
-                        "pcm": b"",
-                        "wav": b"",
-                        "frames": 0,
-                        "duration_seconds": 0.0,
-                    })
+                    self.on_stop(
+                        {
+                            **ack,
+                            "pcm": b"",
+                            "wav": b"",
+                            "frames": 0,
+                            "duration_seconds": 0.0,
+                        }
+                    )
                 except Exception:
                     pass
             return
@@ -351,6 +363,7 @@ class VoiceConversation:
             if self._stopping:
                 return
             self._stopping = True
+            self._processing = True
         self._stop_thread = threading.Thread(
             target=self._stop_and_process, daemon=True, name="stackchan-vc-stop"
         )
@@ -358,79 +371,87 @@ class VoiceConversation:
 
     def _stop_and_process(self) -> None:
         try:
-            result = self.backend.stop_mic_recording()
+            try:
+                result = self.backend.stop_mic_recording()
+            finally:
+                with self._state_lock:
+                    self._recording = False
+            if self.on_stop is not None:
+                try:
+                    self.on_stop(result)
+                except Exception:
+                    pass
+            wav = result.get("wav", b"")
+            pcm = result.get("pcm", b"")
+            if len(pcm) < self.min_pcm_bytes:
+                # 短すぎる (誤タップ or 発話なし)
+                return
+
+            # STT
+            r = stt_module.transcribe(wav, language=self.language)
+            text = r.get("text", "").strip()
+            if self.on_transcribed is not None:
+                try:
+                    self.on_transcribed(text, r)
+                except Exception:
+                    pass
+
+            # 履歴に追加 (STT 段階で記録 = 後段 POST 失敗時も text/STT 結果は残る)。
+            entry = {
+                "ts": time.time(),
+                "text": text,
+                "language": r.get("language"),
+                "language_probability": r.get("language_probability"),
+                "elapsed_seconds": r.get("elapsed_seconds"),
+                "stt_status": r.get("status"),
+                "duration_seconds": result.get("duration_seconds"),
+                "frames": result.get("frames"),
+                "sent_status": None,
+            }
+            self.history.append(entry)
+            while len(self.history) > HISTORY_MAX:
+                self.history.pop(0)
+
+            if not text:
+                return
+
+            # xangi POST /api/chat。base_url 空指定なら POST 自体を skip (単体テスト
+            # スクリプト / xangi 未起動の状態で STT 動作だけ確認したい場合用)。
+            if not self.xangi_base_url:
+                sent_info = {"skipped": True, "reason": "no xangi_base_url"}
+            else:
+                try:
+                    payload: dict = {"message": text}
+                    if self.app_session_id:
+                        payload["appSessionId"] = self.app_session_id
+                    response = requests.post(
+                        f"{self.xangi_base_url}/api/chat",
+                        json=payload,
+                        timeout=120,
+                        stream=True,
+                    )
+                    # SSE 応答は購読側 (events.py) で処理するのでここでは close。
+                    response.close()
+                    sent_info = {
+                        "status_code": response.status_code,
+                        "url": response.url,
+                    }
+                except Exception as exc:
+                    sent_info = {"error": str(exc)}
+            # 履歴に POST 結果を反映 (直前 entry を update)。
+            if self.history:
+                self.history[-1]["sent_status"] = (
+                    sent_info.get("status_code")
+                    or sent_info.get("error")
+                    or ("skipped" if sent_info.get("skipped") else None)
+                )
+
+            if self.on_sent is not None:
+                try:
+                    self.on_sent(text, sent_info)
+                except Exception:
+                    pass
         finally:
             with self._state_lock:
-                self._recording = False
-        if self.on_stop is not None:
-            try:
-                self.on_stop(result)
-            except Exception:
-                pass
-        wav = result.get("wav", b"")
-        pcm = result.get("pcm", b"")
-        if len(pcm) < self.min_pcm_bytes:
-            # 短すぎる (誤タップ or 発話なし)
-            return
-
-        # STT
-        r = stt_module.transcribe(wav, language=self.language)
-        text = r.get("text", "").strip()
-        if self.on_transcribed is not None:
-            try:
-                self.on_transcribed(text, r)
-            except Exception:
-                pass
-
-        # 履歴に追加 (STT 段階で記録 = 後段 POST 失敗時も text/STT 結果は残る)。
-        entry = {
-            "ts": time.time(),
-            "text": text,
-            "language": r.get("language"),
-            "language_probability": r.get("language_probability"),
-            "elapsed_seconds": r.get("elapsed_seconds"),
-            "stt_status": r.get("status"),
-            "duration_seconds": result.get("duration_seconds"),
-            "frames": result.get("frames"),
-            "sent_status": None,
-        }
-        self.history.append(entry)
-        while len(self.history) > HISTORY_MAX:
-            self.history.pop(0)
-
-        if not text:
-            return
-
-        # xangi POST /api/chat。base_url 空指定なら POST 自体を skip (単体テスト
-        # スクリプト / xangi 未起動の状態で STT 動作だけ確認したい場合用)。
-        if not self.xangi_base_url:
-            sent_info = {"skipped": True, "reason": "no xangi_base_url"}
-        else:
-            try:
-                payload: dict = {"message": text}
-                if self.app_session_id:
-                    payload["appSessionId"] = self.app_session_id
-                response = requests.post(
-                    f"{self.xangi_base_url}/api/chat",
-                    json=payload,
-                    timeout=120,
-                    stream=True,
-                )
-                # SSE 応答は購読側 (events.py) で処理するのでここでは close。
-                response.close()
-                sent_info = {"status_code": response.status_code, "url": response.url}
-            except Exception as exc:
-                sent_info = {"error": str(exc)}
-        # 履歴に POST 結果を反映 (直前 entry を update)。
-        if self.history:
-            self.history[-1]["sent_status"] = (
-                sent_info.get("status_code")
-                or sent_info.get("error")
-                or ("skipped" if sent_info.get("skipped") else None)
-            )
-
-        if self.on_sent is not None:
-            try:
-                self.on_sent(text, sent_info)
-            except Exception:
-                pass
+                self._processing = False
+                self._stopping = False

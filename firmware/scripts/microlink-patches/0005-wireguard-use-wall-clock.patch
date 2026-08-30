@@ -1,0 +1,34 @@
+diff --git a/components/microlink/components/wireguard_lwip/src/wireguard-platform-esp32.c b/components/microlink/components/wireguard_lwip/src/wireguard-platform-esp32.c
+index f974c67..15fcfe2 100644
+--- a/components/microlink/components/wireguard_lwip/src/wireguard-platform-esp32.c
++++ b/components/microlink/components/wireguard_lwip/src/wireguard-platform-esp32.c
+@@ -8,6 +8,7 @@
+ #include "esp_timer.h"
+ #include "lwip/sys.h"
+ #include <string.h>
++#include <sys/time.h>
+ 
+ /* ============================================================================
+  * Time Functions
+@@ -20,15 +21,15 @@ uint32_t wireguard_sys_now() {
+ 
+ void wireguard_tai64n_now(uint8_t *output) {
+     // TAI64N format: 8 bytes seconds + 4 bytes nanoseconds
+-    // For simplicity, use Unix epoch time
+-    uint64_t now_us = esp_timer_get_time();
+-    uint64_t seconds = now_us / 1000000ULL;
+-    uint32_t nanoseconds = (now_us % 1000000ULL) * 1000;
++    struct timeval now;
++    gettimeofday(&now, NULL);
++    uint64_t seconds = (uint64_t)now.tv_sec;
++    uint32_t nanoseconds = (uint32_t)now.tv_usec * 1000;
+ 
+-    // Log raw uptime before TAI offset (only every ~5s to avoid spam)
++    // Log raw Unix time before TAI offset (only every ~5s to avoid spam)
+     static uint64_t last_log_s = 0;
+     if (seconds - last_log_s >= 5) {
+-        printf("[TAI64N] uptime=%llu s, nano=%lu\n", (unsigned long long)seconds, (unsigned long)nanoseconds);
++        printf("[TAI64N] unix=%llu s, nano=%lu\n", (unsigned long long)seconds, (unsigned long)nanoseconds);
+         last_log_s = seconds;
+     }
+ 

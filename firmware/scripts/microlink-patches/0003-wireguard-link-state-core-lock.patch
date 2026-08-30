@@ -1,0 +1,61 @@
+diff --git a/components/microlink/components/wireguard_lwip/src/wireguardif.c b/components/microlink/components/wireguard_lwip/src/wireguardif.c
+index 6627fd0..3c80a77 100644
+--- a/components/microlink/components/wireguard_lwip/src/wireguardif.c
++++ b/components/microlink/components/wireguard_lwip/src/wireguardif.c
+@@ -66,7 +66,19 @@
+ static void wireguardif_tmr(void *arg);
+ 
+ // Flag to disable internal UDP socket binding (for magicsock mode)
+-static bool g_disable_socket_bind = false;
++static bool g_disable_socket_bind = false;
++
++static void wireguardif_set_link_state(struct netif *netif, bool up) {
++	if (sys_thread_tcpip(LWIP_CORE_LOCK_QUERY_HOLDER)) {
++		if (up) netif_set_link_up(netif);
++		else netif_set_link_down(netif);
++		return;
++	}
++	LOCK_TCPIP_CORE();
++	if (up) netif_set_link_up(netif);
++	else netif_set_link_down(netif);
++	UNLOCK_TCPIP_CORE();
++}
+ 
+ void wireguardif_disable_socket_bind(void) {
+ 	g_disable_socket_bind = true;
+@@ -391,7 +403,7 @@ static void wireguardif_process_response_message(struct wireguard_device *device
+ 		wireguardif_send_keepalive(device, peer);
+ 
+ 		// Set the IF-UP flag on netif
+-		netif_set_link_up(device->netif);
++		wireguardif_set_link_state(device->netif, true);
+ 		printf("[WG] *** WIREGUARD SESSION ESTABLISHED wg_idx=%u ***\n", wg_idx);
+ 	} else {
+ 		// Packet bad
+@@ -482,7 +494,7 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
+ 					}
+ 
+ 					// Make sure that link is reported as up
+-					netif_set_link_up(device->netif);
++					wireguardif_set_link_state(device->netif, true);
+ 
+ 					if (pbuf->tot_len > 0) {
+ 						//4a. Once the packet payload is decrypted, the interface has a plaintext packet. If this is not an IP packet, it is dropped.
+@@ -1155,7 +1167,7 @@ static void wireguardif_tmr(void *arg) {
+ 
+ 	if (!link_up) {
+ 		// Clear the IF-UP flag on netif
+-		netif_set_link_down(device->netif);
++		wireguardif_set_link_state(device->netif, false);
+ 	}
+ }
+ 
+@@ -1205,7 +1217,7 @@ void wireguardif_periodic(struct netif *netif) {
+ 		}
+ 	}
+ 	if (!link_up) {
+-		netif_set_link_down(device->netif);
++		wireguardif_set_link_state(device->netif, false);
+ 	}
+ }
+ 
