@@ -1,6 +1,6 @@
 [project]
 name = "xangi-stackchan"
-version = "0.1.0"
+version = "0.7.0"
 description = "Physical xangi pet bridge for stackchan family devices (K151 / stackchan-atama)"
 readme = "README.md"
 requires-python = ">=3.10"
