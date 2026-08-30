@@ -2,7 +2,7 @@
   "schemaVersion": 2,
   "id": "xangi-stackchan",
   "displayName": "xangi-stack-chan",
-  "version": "0.1.0",
+  "version": "0.7.0",
   "description": "xangiの状態と完了通知をスタックチャンで表現します",
   "permissions": [
     "USBシリアルまたはローカルネットワーク上のスタックチャンへ接続",

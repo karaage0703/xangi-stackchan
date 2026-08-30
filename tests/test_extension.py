@@ -3,11 +3,20 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import tomllib
 from test_settings import _base_config
 
+from xangi_stackchan import __version__
 from xangi_stackchan.extension import _xangi_url, build_state
 from xangi_stackchan.settings import RuntimeState
 from xangi_stackchan.settings_server import start_settings_server
+
+
+def test_manifest_and_package_versions_match():
+    root = Path(__file__).resolve().parent.parent
+    manifest = json.loads((root / "xangi-extension.json").read_text())
+    project = tomllib.loads((root / "pyproject.toml").read_text())
+    assert manifest["version"] == project["project"]["version"] == __version__
 
 
 def test_xangi_url_from_events_stream():
