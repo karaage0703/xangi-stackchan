@@ -2,6 +2,20 @@
 
 xangi-stackchan のセットアップから常駐起動・デモ・トラブルシュートまで。
 
+## 対応デバイス
+
+USB シリアル経由で Arduino (PlatformIO) ファームを焼く。機種ごとの本体ファームは `firmware/examples/<machine>/main/` に置かれていて、共通シリアルプロトコル (STATUS / VOLUME / WAV / FACE / IMAGE / MOVE / CAPTURE / PUZZLE) を実装する。未搭載のハードは graceful degradation で `unavailable` 応答。
+
+| デバイス | ファーム (PlatformIO env) | baud | MOVE | CAPTURE |
+|---------|---------|------|------|---------|
+| M5Stack 公式 K151 / K151-R (CoreS3 + サーボ + Remote) | `cores3-main` | 921600 | ✅ | ✅ |
+| M5Stack CoreS3 単体 (サーボ無し) | `cores3-main` | 921600 | 🚫 | ✅ |
+| M5Stack AtomS3R + Atomic Voice Base / Echo Base (ES8311) | `atoms3r-main` | 115200 | 🚫 | 🚫 |
+| M5Stack Basic + アールティ Ver.β (SCS0009 ×2) | `basic-main` | 115200 | ✅ | 🚫 |
+
+CoreS3 系の本体ファーム (`cores3-main`) はサーボ・カメラ有無を起動時に自動検出、`STATUS` の `servo` / `camera` フィールドで現状を取得できる。
+
+
 ## セットアップ
 
 ```bash
@@ -113,6 +127,47 @@ UI から以下を変更できる。
 
 設定 UI を LAN / Tailscale 経由でも開きたい場合は `--settings-bind 0.0.0.0` を付ける (既定は `127.0.0.1`)。
 
+### Wi-Fi・Tailnet接続（CoreS3、実験機能）
+
+CoreS3がWi-Fiに接続し、MicroLinkでTailscaleのネットワーク（Tailnet）へ参加して、ホストのTCP待受へ接続する方式。ホストと実機の間のUSB通信を置き換える。初回のファーム書き込みと電源の準備は別途必要。
+
+1. [ファームウェア手順](../firmware/README.md)に従い、MicroLink依存を準備する。
+2. `firmware/examples/cores3/main/tailnet_secrets.h.example`を同じ場所の`tailnet_secrets.h`へコピーし、Wi-FiのSSID・パスワード、Tailscale auth key、ホストのTailnet IPv4とportを設定する。このファイルはGit管理対象外。
+3. `cores3-main-tailnet`を書き込む。通常の`cores3-main`だけでは無線接続しない。
+4. Tailnetに参加したホストで待受を起動する。
+
+```bash
+uv run xangi-stackchan \
+  --xangi-url http://127.0.0.1:18888 \
+  --tailnet \
+  --tailnet-bind 0.0.0.0 \
+  --tailnet-port 18765 \
+  --tts piper
+```
+
+Managed Extensionでは設定画面の`device` → `WiFi / Tailnetで接続する`をONにして保存する。ファーム側の接続先と`Tailnet listen port`を合わせる。TCP待受へCoreS3から到達できることが必要で、Tailscale ACLやホストのファイアウォールも確認する。
+
+無線protocol v3は表情・首振り・音量・LEDに加え、WAV再生、LCDマイクイベントとPCM録音、画像顔・スプライトキャッシュ・差分矩形、カメラJPEG取得に対応する。実装上の対応と、各環境での無線実機確認は分けて判断する。
+
+接続確認は`GET /api/health`の`transport: "tailnet"`と`device_connected: true`、`ready: true`を確認する。待受が起動しただけでは実機接続完了ではない。USBへ戻すには設定画面でTailnetをOFFにし、USB接続先を指定して保存する。
+
+### 顔・アバターの切り替え
+
+LCDの表示には2つのモードがある。ブラウザ用の別製品`xangi-avatar`とは別の機能。
+
+- `avatar`: M5Stack Avatarによる通常のスタックチャン顔。画像ファイルは不要。
+- `sprite`（既定）: borotなどのキャラクター画像を切り出して表示し、まばたきや表情をアニメーションする。
+
+設定画面の`faces` → `mode`で選び、保存する。Managed Extensionではxangi Web UIの「拡張」から設定画面を開く。変更は実行中に反映される。
+
+画像キャラを使うには、実行している拡張のディレクトリへ`assets/pets/<name>/spritesheet.webp`を配置し、`sprite sheet`にそのパス（または絶対パス）を指定する。既定は`assets/pets/borot/spritesheet.webp`。画像はGit管理対象外で、cloneだけでは付属しない。シートの配置規則は[設計](design.md)を参照。
+
+画像が存在しない場合やバックエンドが画像転送に対応しない場合は、`sprite`を選んでいても通常の`avatar`へ自動で戻る。ログの`face_mode: "sprite->avatar fallback"`と`reason`で判別できる。設定値だけで画像キャラ表示中とは判断せず、実機の`STATUS`の`image_face`も確認する。
+
+単独起動では`--face-mode avatar`、または`--face-mode sprite --sprite-sheet /path/to/spritesheet.webp`で指定する。保存済み設定がある場合はその値が優先されるため、設定画面でも確認する。
+
+CoreS3では両モードの右上にバッテリー残量を表示する。思考中・発話中などの表情は`faces`内の`idle / thinking / talking / error`で変更できる。
+
 ### ブラウザシミュレータ
 
 実機が手元に無いときは `--simulator` で USB/WiFi に接続しないバックエンドを使う。xangi の SSE イベント処理、TTS 後の WAV 送信、FACE / MOVE / PUZZLE / STACKLED の状態遷移は通常バックエンドと同じ経路を通り、ブラウザで確認できる。
@@ -180,6 +235,9 @@ tail -f /tmp/xangi-stackchan.log
 
 ## 主なオプション
 
+- `--tailnet`: CoreS3からのMicroLink reverse TCP接続を待ち受ける
+- `--tailnet-bind` / `--tailnet-port`: 待受アドレスとport（既定`0.0.0.0` / `18765`）
+
 - `--xangi-url`: xangi base URL または `/api/events/stream` の完全 URL (既定 `http://127.0.0.1:18888`)
 - `--thread-id`: 対象 thread のみ処理 (複数台運用時の喋り分けに使う、後述「複数台で動かす」参照)
 - `--instance-id`: config.json の namespace 名 (既定 `default`、複数台で別 instance を持たせる)
@@ -193,6 +251,32 @@ tail -f /tmp/xangi-stackchan.log
 - `--firmware-head-pet-sound` / `--no-firmware-head-pet-sound`: firmware内蔵のなでなで音声をON/OFFする
 - `--completion-after-seconds`: 完了通知を行う最短作業時間 (既定 `30` 秒)
 - `--completion-summary-chars`: 完了要約の最大文字数 (既定 `100` 文字)
+
+- `--port --baud`: USB serial のポートと baudrate (XangiBridge ファーム既定値 `921600`)
+- `--volume`: デバイスの音量 (`0`〜`255`、既定 `255`)
+- `--tts`: `piper`, `voicevox`, `none`
+- `--piper-bin`: piper-plus 実行ファイル (既定 `tools/piper`)
+- `--piper-model`: piper-plus モデル (既定 `models/tsukuyomi-chan-6lang-fp16.onnx`)
+- `--piper-speaker`: マルチスピーカーモデル用の話者 ID (通常不要)
+- `--face-idle`, `--face-thinking`, `--face-talking`, `--face-error`: 状態ごとの表情
+- `--face-mode`: `avatar` / `sprite` (既定)。`sprite` はスプライトシートから状態ごとの画像を切り出して LCD に表示し、row/state + filled-frame tick でまばたき/表情アニメーションする
+- `--sprite-sheet`: `--face-mode sprite` 時に使う `spritesheet.webp`。既定 `assets/pets/borot/spritesheet.webp`。このファイルはローカル資産として `.gitignore` 対象 (`assets/pets/**/*.webp`)。別キャラクターを使う場合は `assets/pets/<name>/spritesheet.webp` に置いて指定する
+- `--sprite-jpeg-quality`: `--face-mode sprite` 時にデバイスへ送る JPEG 品質 (1〜95、既定 50)
+- `--move-enabled` / `--no-move-enabled`: 首振り (MOVE) 機能 ON/OFF (既定 ON、K151 SCServo 専用)
+- `--move-idle-yaw` / `--move-idle-pitch`: idle 時の首ポーズ (既定 `0` / `+5`、少し上向き)
+- `--move-thinking-yaw` / `--move-thinking-pitch`: 考え中の首ポーズ (既定 `-8` / `+5`、少し首かしげ)
+- `--move-error-yaw` / `--move-error-pitch`: エラー時の首ポーズ (既定 `0` / `-10`、首下げ)
+- `--move-talking-sway-yaw` / `--move-talking-sway-pitch`: 喋り中のランダム揺らぎ振り幅 (既定 `±4` / `±2`)
+- `--move-talking-sway-interval`: 喋り中のランダム揺らぎ更新間隔 (秒、既定 `1.5`)
+- `--puzzle-light-enabled` / `--no-puzzle-light-enabled`: 状態表示LEDを使う。ファーム `STATUS` が `puzzle:true` なら `PUZZLE:<pattern>`、`stack_led:true` なら `STACKLED:<pattern>` を送る。CoreS3 Grove PORT.B の Puzzle Unit WS2812E と K151 / K151-R 本体 12 RGB LED は自動検出
+- `--puzzle-idle`, `--puzzle-thinking`, `--puzzle-talking`, `--puzzle-error`: 状態ごとの LED pattern。既定は `off` / `thinking` / `talking` / `error`
+- `--stackchan-retry-seconds`: デバイス切断時の再接続間隔 (秒)。起動時だけでなく**稼働中の切断 (デバイス再起動 / USB 再列挙で `ttyACMx` が変わる) も自動検知して再接続**する。再接続成功時は音量・表情・首ポーズ・ファーム設定を自動で再初期化するので、ブリッジの手動再起動は不要。`--port` には番号非依存の固定パス (`/dev/serial/by-id/...` か udev の `/dev/stackchan`) を使うこと
+- `--lcd-mic-voice` / `--no-lcd-mic-voice`: LCD 下部のマイクボタンで録音 → STT → xangi 投入。K151 通常運用では既定で有効
+- `--voice-app-session-id`: 音声対話で xangi に投げる appSessionId。空ならアプリ起動時に専用 web session を自動作成
+- `--voice-silence-dbfs`: VAD 無音判定の dBFS 閾値 (既定 -40、静かな部屋なら -50、騒がしい環境なら -30)
+- `--voice-silence-seconds`: 無音判定後の自動停止までの秒数 (既定 1.5)
+- `--voice-max-seconds`: 最大録音時間 (既定 15、これを超えたら強制停止)
+- `--voice-initial-grace-seconds`: 録音開始から最初の発話までの猶予秒数 (既定 5)。この間の無音では録音を止めない。最初の有音で通常の無音判定 (`--voice-silence-seconds`) に切り替わる。
 
 ## xangi managed Extension
 
@@ -219,31 +303,6 @@ tail -f /tmp/xangi-stackchan.log
   }
 }
 ```
-- `--port --baud`: USB serial のポートと baudrate (XangiBridge ファーム既定値 `921600`)
-- `--volume`: デバイスの音量 (`0`〜`255`、既定 `255`)
-- `--tts`: `piper`, `voicevox`, `none`
-- `--piper-bin`: piper-plus 実行ファイル (既定 `tools/piper`)
-- `--piper-model`: piper-plus モデル (既定 `models/tsukuyomi-chan-6lang-fp16.onnx`)
-- `--piper-speaker`: マルチスピーカーモデル用の話者 ID (通常不要)
-- `--face-idle`, `--face-thinking`, `--face-talking`, `--face-error`: 状態ごとの表情
-- `--face-mode`: `avatar` (既定) / `sprite`。`sprite` はスプライトシートから状態ごとの画像を切り出して LCD に表示し、row/state + filled-frame tick でまばたき/表情アニメーションする
-- `--sprite-sheet`: `--face-mode sprite` 時に使う `spritesheet.webp`。既定 `assets/pets/borot/spritesheet.webp`。このファイルはローカル資産として `.gitignore` 対象 (`assets/pets/**/*.webp`)。別キャラクターを使う場合は `assets/pets/<name>/spritesheet.webp` に置いて指定する
-- `--sprite-jpeg-quality`: `--face-mode sprite` 時にデバイスへ送る JPEG 品質 (1〜95、既定 85)
-- `--move-enabled` / `--no-move-enabled`: 首振り (MOVE) 機能 ON/OFF (既定 ON、K151 SCServo 専用)
-- `--move-idle-yaw` / `--move-idle-pitch`: idle 時の首ポーズ (既定 `0` / `+5`、少し上向き)
-- `--move-thinking-yaw` / `--move-thinking-pitch`: 考え中の首ポーズ (既定 `-8` / `+5`、少し首かしげ)
-- `--move-error-yaw` / `--move-error-pitch`: エラー時の首ポーズ (既定 `0` / `-10`、首下げ)
-- `--move-talking-sway-yaw` / `--move-talking-sway-pitch`: 喋り中のランダム揺らぎ振り幅 (既定 `±4` / `±2`)
-- `--move-talking-sway-interval`: 喋り中のランダム揺らぎ更新間隔 (秒、既定 `1.5`)
-- `--puzzle-light-enabled` / `--no-puzzle-light-enabled`: 状態表示LEDを使う。ファーム `STATUS` が `puzzle:true` なら `PUZZLE:<pattern>`、`stack_led:true` なら `STACKLED:<pattern>` を送る。CoreS3 Grove PORT.B の Puzzle Unit WS2812E と K151 / K151-R 本体 12 RGB LED は自動検出
-- `--puzzle-idle`, `--puzzle-thinking`, `--puzzle-talking`, `--puzzle-error`: 状態ごとの LED pattern。既定は `off` / `thinking` / `talking` / `error`
-- `--stackchan-retry-seconds`: デバイス切断時の再接続間隔 (秒)。起動時だけでなく**稼働中の切断 (デバイス再起動 / USB 再列挙で `ttyACMx` が変わる) も自動検知して再接続**する。再接続成功時は音量・表情・首ポーズ・ファーム設定を自動で再初期化するので、ブリッジの手動再起動は不要。`--port` には番号非依存の固定パス (`/dev/serial/by-id/...` か udev の `/dev/stackchan`) を使うこと
-- `--lcd-mic-voice` / `--no-lcd-mic-voice`: LCD 下部のマイクボタンで録音 → STT → xangi 投入。K151 通常運用では既定で有効
-- `--voice-app-session-id`: 音声対話で xangi に投げる appSessionId。空ならアプリ起動時に専用 web session を自動作成
-- `--voice-silence-dbfs`: VAD 無音判定の dBFS 閾値 (既定 -40、静かな部屋なら -50、騒がしい環境なら -30)
-- `--voice-silence-seconds`: 無音判定後の自動停止までの秒数 (既定 1.5)
-- `--voice-max-seconds`: 最大録音時間 (既定 15、これを超えたら強制停止)
-- `--voice-initial-grace-seconds`: 録音開始から最初の発話までの猶予秒数 (既定 5)。この間の無音では録音を止めない。最初の有音で通常の無音判定 (`--voice-silence-seconds`) に切り替わる。
 
 ## LCDマイク音声入力
 
@@ -521,7 +580,7 @@ curl http://127.0.0.1:7897/api/camera/status
 
 #### 制約
 
-- **USB シリアル接続のみ対応**。WiFi MJPEG ストリームは将来別途実装予定
+- **USBとTailnet protocol v3に対応**。どちらもJPEGのオンデマンド撮影で、MJPEGストリームではない
 - **M5Stack CoreS3 系のみ** (K151 / K151-R / CoreS3 単体)。カメラ初期化に失敗した機種では `camera not ready` 応答
 - **オンデマンド撮影** (1 リクエスト 1 枚)。常時ストリーミングは将来検討
 
