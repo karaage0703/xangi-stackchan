@@ -46,6 +46,7 @@
 #include <Preferences.h>
 #include <esp_camera.h>
 #include <esp_system.h>
+#include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
@@ -58,6 +59,7 @@
 #include "SCServo.h"
 #include "Si12T.h"
 #include "nade_voices.h"
+#include "fresh_capture.h"
 
 #ifdef XANGI_STACKCHAN_TAILNET
 #include <WiFi.h>
@@ -977,14 +979,22 @@ static void handleCapture() {
         return;
     }
 
+    const int64_t requested_us = esp_timer_get_time();
     avatar.setSpeechText("capturing");
 
-    if (!CoreS3.Camera.get()) {
+    unsigned discarded_frames = 0;
+    camera_fb_t* fb = getFreshCameraFrame(
+        requested_us,
+        []() -> camera_fb_t* {
+            return CoreS3.Camera.get() ? CoreS3.Camera.fb : nullptr;
+        },
+        [](camera_fb_t*) { CoreS3.Camera.free(); },
+        discarded_frames);
+    if (!fb) {
         avatar.setSpeechText("");
-        sendAckError("Camera.get failed");
+        sendAckError("fresh camera frame unavailable");
         return;
     }
-    camera_fb_t* fb = CoreS3.Camera.fb;
     if (!fb || !fb->buf || fb->len == 0) {
         CoreS3.Camera.free();
         avatar.setSpeechText("");
@@ -997,7 +1007,10 @@ static void handleCapture() {
     bool ok = frame2jpg(fb, JPEG_QUALITY, &out_jpg, &out_jpg_len);
     int width  = fb->width;
     int height = fb->height;
-    uint32_t captured_at_ms = millis();
+    const int64_t frame_us = int64_t(fb->timestamp.tv_sec) * 1000000
+                           + fb->timestamp.tv_usec;
+    uint32_t captured_at_ms = static_cast<uint32_t>(frame_us / 1000);
+    uint32_t frame_after_request_us = static_cast<uint32_t>(frame_us - requested_us);
     CoreS3.Camera.free();
 
     if (!ok || !out_jpg || out_jpg_len == 0) {
@@ -1032,11 +1045,13 @@ static void handleCapture() {
         free(out_jpg);
     }
 
-    char extra[160];
+    char extra[240];
     snprintf(extra, sizeof(extra),
-             "\"size\":%u,\"format\":\"jpeg\",\"width\":%d,\"height\":%d,\"captured_at\":%lu",
+             "\"size\":%u,\"format\":\"jpeg\",\"width\":%d,\"height\":%d,\"captured_at\":%lu,"
+             "\"discarded_frames\":%u,\"frame_after_request_us\":%lu",
              static_cast<unsigned>(out_jpg_len), width, height,
-             static_cast<unsigned long>(captured_at_ms));
+             static_cast<unsigned long>(captured_at_ms), discarded_frames,
+             static_cast<unsigned long>(frame_after_request_us));
     sendAckOk(extra);
 
     avatar.setSpeechText("");

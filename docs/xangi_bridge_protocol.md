@@ -334,12 +334,12 @@ host                                device
 
 1. `g_camera_ready=false` の場合は即エラー応答
 2. `avatar.setSpeechText("capturing")` で撮影中表示 (UX)
-3. `CoreS3.Camera.get()` でフレーム取得 (camera_fb_t*)、`fb`/`fb->buf` チェック
+3. `CoreS3.Camera.get()` でフレーム取得 (camera_fb_t*)。ドライバの最初のDMA時刻が撮影要求より古いフレームは `free()` して取り直す（最大8回）。取得失敗・新しいフレームが得られない場合は `fresh camera frame unavailable` を返し、古い画像で成功扱いにしない。`fb->buf`/長さもチェック
 4. `frame2jpg(fb, 80, &out_jpg, &out_jpg_len)` で JPEG エンコード
 5. `CoreS3.Camera.free()` でフレーム解放 (JPEG バッファは別途保持)
 6. `MAX_JPEG_BYTES` (256KB) 超過チェック
 7. `IMG:<size>\n` 書き出し + `Serial.flush()` → JPEG 本体 1 chunk write
-8. ack JSON 書き出し (`size`/`format`/`width`/`height`/`captured_at`)
+8. ack JSON 書き出し (`size`/`format`/`width`/`height`/`captured_at`/`discarded_frames`/`frame_after_request_us`)。`captured_at` はJPEG変換後ではなくフレームの最初のDMA時刻（起動後ms、uint32）。`discarded_frames` は破棄枚数、`frame_after_request_us` は撮影要求から採用フレームの最初のDMAまでの時間。USB/Tailnet共通。固定待機は追加せず、ドライバの取得待ち時間に従う（8回は壁時計時間の上限ではない）
 9. JPEG バッファ `free()`、`setSpeechText("")` で撮影中表示クリア
 
 ### 5.4.4 カメラ仕様 (CoreS3 GC0308)
