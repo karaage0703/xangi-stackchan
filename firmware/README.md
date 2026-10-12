@@ -79,7 +79,7 @@ xangi シリアル経由で WAV 再生 + Avatar 表情・口パク + サーボ�
 
 Python 側は `src/xangi_stackchan/stackchan.py` の `StackchanSerial` がそのまま使える (baud 921600 一致)。テストは `scripts/test_xangi_bridge.py`。
 
-`cores3-main-tailnet` は同じ `main.cpp` にMicroLinkを追加した実験env。CoreS3がWi-FiからTailnetへ参加し、DGX Spark上のreverse TCP listenerへ自発接続する。接続先にはpeer slotを確実に予約できるTailnet IPv4（`100.x.y.z`）の指定を推奨。`STATUS / VOLUME / FACE / MOVE`、WAV再生、LCDマイクイベント、16kHz PCM録音を無線化し、USBシリアルはフォールバックとして同時に残す。画像・カメラ転送は未対応。
+`cores3-main-tailnet` は同じ `main.cpp` にMicroLinkを追加した実験env。CoreS3がWi-FiからTailnetへ参加し、DGX Spark上のreverse TCP listenerへ自発接続する。接続先にはpeer slotを確実に予約できるTailnet IPv4（`100.x.y.z`）の指定を推奨。`STATUS / VOLUME / FACE / MOVE`、WAV再生、LCDマイクイベント、16kHz PCM録音を無線化し、USBシリアルはフォールバックとして同時に残す。protocol v3では画像顔・スプライトキャッシュ・差分矩形・カメラJPEG転送にも対応する。接続手順は[使い方](../docs/usage.md)を参照。
 
 認証情報はgitignore対象の `tailnet_secrets.h` にだけ置く。初回登録用のTailscale auth keyは短命・再利用不可を推奨し、登録後のmachine/WireGuard keyはMicroLinkがNVSへ保存する。
 
